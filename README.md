@@ -62,7 +62,18 @@ node --test "tools/**/*.test.mjs"
 two stop agreeing, the generated file churns on every export and its diff stops
 meaning "the roadmap changed".
 
+## `tools/mcp/`
+
+The MCP server an agent talks to — one zero-dependency file, stdio JSON-RPC.
+`tools/mcp/README.md` covers setting it up in a repository, and is also written
+for the agent that reads it: it teaches the working method (branch first,
+`CODING` names the branch before the first commit, `roadmap_where` when in
+doubt).
+
+`tools/mcp/smoke.mjs` drives the server the way a client does — spawn, write
+lines to stdin, read lines from stdout — because the parts most likely to break
+are the transport and the framing. CI runs it against the compose stack.
+
 ## Still to come
 
-- `tools/mcp/server.mjs` — the MCP server (R8)
 - `tools/runner/runner.mjs` — the runner daemon (R11)
