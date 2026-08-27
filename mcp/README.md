@@ -113,8 +113,12 @@ what you are allowed to do.
 ## Checking it works
 
 ```sh
-CAWDEV_URL=http://localhost:8091 CAWDEV_TOKEN=cawd_… node tools/mcp/smoke.mjs cawdev
+CAWDEV_URL=http://localhost:8091 CAWDEV_TOKEN=cawd_… node tools/mcp/smoke.mjs scratch-project
 ```
+
+**Name a scratch project.** The smoke test creates a roadmap entry and declines
+it, and entries cannot be deleted — so it refuses to guess which project you
+meant. It left two declined entries in cawdev's own roadmap before it did.
 
 It drives the server the way a client does — spawn, write lines to stdin, read
 lines from stdout — rather than importing its functions, because the parts most

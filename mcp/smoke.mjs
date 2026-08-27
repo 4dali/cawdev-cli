@@ -13,7 +13,20 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+// The project must be named explicitly. This test CREATES an entry and then
+// declines it, and entries cannot be deleted — so falling back to
+// CAWDEV_PROJECT would quietly leave test artifacts in whatever real roadmap
+// the environment happened to point at. It did exactly that once.
 const project = process.argv[2];
+if (!project) {
+  console.error(
+    'Usage: node tools/mcp/smoke.mjs <project>\n\n' +
+      'Name the project explicitly: this test creates a roadmap entry and declines it, and\n' +
+      'entries cannot be deleted. Use a scratch project, not one whose roadmap you care about.',
+  );
+  process.exit(2);
+}
 
 const server = spawn(process.execPath, [join(here, 'server.mjs')], {
   stdio: ['pipe', 'pipe', 'inherit'],
@@ -102,7 +115,7 @@ try {
 
   const listed = await request('tools/call', {
     name: 'roadmap_list',
-    arguments: { ...(project ? { project } : {}), brief: true },
+    arguments: { project, brief: true },
   });
   check('roadmap_list returns entries', !listed.result?.isError && textOf(listed.result).includes('R1'),
     textOf(listed.result));
@@ -110,7 +123,7 @@ try {
   const created = await request('tools/call', {
     name: 'roadmap_create',
     arguments: {
-      ...(project ? { project } : {}),
+      project,
       title: 'smoke test entry (safe to decline)',
       body: 'Created by tools/mcp/smoke.mjs.',
     },
@@ -124,7 +137,7 @@ try {
   // refusal, not a crash — and the message should say what is missing.
   const refused = await request('tools/call', {
     name: 'roadmap_set_status',
-    arguments: { ...(project ? { project } : {}), number, status: 'CODING' },
+    arguments: { project, number, status: 'CODING' },
   });
   check('CODING without a branch is refused, readably',
     refused.result?.isError && /branch/i.test(textOf(refused.result)),
@@ -132,7 +145,7 @@ try {
 
   const moved = await request('tools/call', {
     name: 'roadmap_set_status',
-    arguments: { ...(project ? { project } : {}), number, status: 'CODING', branch: 'smoke-test' },
+    arguments: { project, number, status: 'CODING', branch: 'smoke-test' },
   });
   check('CODING with a branch is accepted', !moved.result?.isError
     && textOf(moved.result).includes('smoke-test'), textOf(moved.result));
@@ -140,7 +153,7 @@ try {
   const declined = await request('tools/call', {
     name: 'roadmap_decline',
     arguments: {
-      ...(project ? { project } : {}),
+      project,
       number,
       reason: 'A smoke-test entry. Declined so it leaves a trace rather than vanishing.',
     },
@@ -150,7 +163,7 @@ try {
 
   const changelog = await request('tools/call', {
     name: 'changelog_list',
-    arguments: { ...(project ? { project } : {}) },
+    arguments: { project },
   });
   check('changelog_list works', !changelog.result?.isError, textOf(changelog.result));
 
