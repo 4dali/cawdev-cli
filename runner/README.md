@@ -159,6 +159,13 @@ Do **not** reach for `agentArgs` to add a permission: it replaces the whole
 default list, so you would have to repeat all sixteen MCP tool names to add one
 `Bash` pattern.
 
+### The model
+
+A run may name one, chosen when it is started. The runner passes it through as
+`--model`, **before** `--allowedTools` — that option is variadic and would
+swallow it otherwise. A run that names no model is spawned exactly as it was
+before R23, so `agentArgs` may still pin one for every run on this machine.
+
 ### The project's own MCP servers
 
 A repository that ships its own `.mcp.json` means it. Those servers are

@@ -161,8 +161,12 @@ try {
 
   const started = await console_(`/api/projects/${project}/runs`, {
     method: 'POST',
-    body: JSON.stringify({ entryNumber: entry.number, branch }),
+    // Blank rather than absent: the console sends '' when the picker is left
+    // on "the runner's default", and that must mean the same as omitting it.
+    body: JSON.stringify({ entryNumber: entry.number, branch, model: '   ' }),
   });
+  check('a blank model means the runner default, not a model called "   "',
+    started.model === null, JSON.stringify(started.model));
   runId = started.id;
   check('start returns a queued run on the entry', started.state === 'QUEUED'
     && started.entryNumber === entry.number && started.branch === branch, JSON.stringify(started));
@@ -296,8 +300,13 @@ try {
 
   const session = await console_(`/api/projects/${project}/runs/sessions`, {
     method: 'POST',
-    body: JSON.stringify({ prompt: 'Look at the README and tell me what this is.' }),
+    body: JSON.stringify({
+      prompt: 'Look at the README and tell me what this is.',
+      model: 'sonnet',
+    }),
   });
+  check('a session carries the model it was started with', session.model === 'sonnet',
+    JSON.stringify(session.model));
   check('a session starts with a prompt and no entry',
     session.kind === 'MANUAL' && session.entryNumber === null
       && session.label.startsWith('Look at the README'),

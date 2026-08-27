@@ -663,6 +663,14 @@ async function spawnAgent(config, run, runToken, cwd) {
     ...(config.projects[run.projectSlug]?.allowedTools ?? []),
   ];
   const agentArgs = [...config.agentArgs];
+
+  // Which model answers. Passed through verbatim — the CLI validates it, and a
+  // run that names none is spawned exactly as it was before R23.
+  //
+  // Before --allowedTools, which is variadic and would swallow it.
+  if (run.model) {
+    agentArgs.unshift('--model', run.model);
+  }
   if (extras.length) {
     if (!agentArgs.includes('--allowedTools')) {
       agentArgs.push('--allowedTools');
