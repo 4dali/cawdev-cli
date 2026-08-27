@@ -92,8 +92,25 @@ the stub possible, and it is also how R17's second CLI would arrive.
 The defaults are for Claude Code, verified against 2.1.247:
 
 ```json
-{ "agentCommand": "claude", "agentArgs": ["-p", "--output-format", "stream-json", "--verbose"] }
+{
+  "agentCommand": "claude",
+  "agentArgs": [
+    "-p", "--output-format", "stream-json", "--verbose",
+    "--permission-mode", "acceptEdits"
+  ]
+}
 ```
+
+### About that permission mode
+
+**A spawned agent has no terminal**, so anything that stops to ask a human for
+permission stops forever. `acceptEdits` lets it write files without that.
+
+It does **not** cover running commands, so a task that needs to run tests or
+`git commit` will stall. A machine dedicated to this can use
+`bypassPermissions` instead — but that is a real decision about what an
+unattended agent may do in your checkout, and it should be yours to make rather
+than a default you inherit without noticing.
 
 The prompt deliberately teaches the **method**, not the task. The task is in the
 roadmap entry, which the agent reads for itself with `task_current` — putting it

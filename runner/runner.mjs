@@ -27,7 +27,27 @@ const DEFAULTS = {
    * config change rather than a code change.
    */
   agentCommand: 'claude',
-  agentArgs: ['-p', '--output-format', 'stream-json', '--verbose'],
+  /**
+   * Verified against Claude Code 2.1.247.
+   *
+   * `--permission-mode acceptEdits` matters more than it looks: a spawned agent
+   * has no terminal, so anything that stops to ask a human for permission stops
+   * forever. acceptEdits lets it write files without that.
+   *
+   * It does NOT cover running commands, so a task needing tests or git will
+   * still stall. A machine dedicated to this can set `bypassPermissions`
+   * instead — that is a real decision about what an unattended agent may do in
+   * your checkout, so it is yours to make rather than a default someone
+   * inherits without noticing.
+   */
+  agentArgs: [
+    '-p',
+    '--output-format',
+    'stream-json',
+    '--verbose',
+    '--permission-mode',
+    'acceptEdits',
+  ],
   pollSeconds: 25,
   heartbeatSeconds: 30,
 };
