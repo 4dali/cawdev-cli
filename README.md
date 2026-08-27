@@ -74,6 +74,23 @@ doubt).
 lines to stdin, read lines from stdout — because the parts most likely to break
 are the transport and the framing. CI runs it against the compose stack.
 
-## Still to come
+## `tools/runner/`
 
-- `tools/runner/runner.mjs` — the runner daemon (R11)
+The daemon that claims queued runs and spawns a real agent CLI in a working
+copy. `tools/runner/README.md` covers running one.
+
+## `tools/console/`
+
+`console-smoke.mjs` is the end-to-end test for the console's half of the loop
+(R12): start a run on an entry, watch the messages, answer the question from the
+inbox, see the finish report carrying the branch — all over the endpoints the
+browser calls, on a real session cookie. Point it at a **scratch project**: it
+creates an entry, cancels any live run, and declines the entry afterwards.
+
+```sh
+node tools/console/console-smoke.mjs scratch
+```
+
+Unlike everything else here it signs in rather than using `CAWDEV_TOKEN`, because
+starting a run and answering a question are both a *person's* acts — an agent
+cannot do either, so the test cannot bootstrap itself from a token.
