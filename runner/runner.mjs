@@ -44,6 +44,14 @@ const DEFAULTS = {
     '-p',
     '--output-format',
     'stream-json',
+    // R22. Realtime streaming input: the session's stdin stays OPEN, so a
+    // person can prompt it again without a second process. Verified against
+    // 2.1.247 — one process, one session id, many turns.
+    //
+    // The cost of this is that the session no longer ends by itself when the
+    // first turn finishes, which is why endSession() exists below.
+    '--input-format',
+    'stream-json',
     '--verbose',
     '--permission-mode',
     'acceptEdits',
@@ -225,6 +233,23 @@ async function prepareWorkingCopy(path, branch, defaultBranch) {
  * it the task here would be a second copy that can disagree with the entry.
  */
 function promptFor(run) {
+  if (run.kind === 'MANUAL') {
+    // A manual session has no entry to read and no "Done when" to satisfy.
+    // What it has is what the person typed, and the branch it is on — so say
+    // that and get out of the way. Teaching it the roadmap method here would
+    // be instructions for work it has not been asked to do.
+    return `You are in a working copy on branch ${run.branch}, in a session somebody started
+from the cawdev console. They are watching this session and can send you more
+instructions while you work, so finish a thought and stop rather than guessing
+at what they might want next.
+
+If a decision is genuinely theirs, use the cawdev MCP tool \`ask_user\` and wait.
+
+Their instruction:
+
+${run.openingPrompt}`;
+  }
+
   return `You are working on a roadmap entry in the cawdev platform, on branch ${run.branch}.
 
 Start by calling the cawdev MCP tool \`task_current\`. It gives you the entry, its
@@ -251,6 +276,221 @@ The working method here:
 Commit your work. Never push to main.`;
 }
 
+// --- the transcript ----------------------------------------------------------
+
+/**
+ * A stream-json event, as lines worth keeping.
+ *
+ * The session emits far more than a person wants to read: the `init` event
+ * alone is several kilobytes of tool inventory. What belongs in a transcript is
+ * what the agent said, what it ran, and how a turn ended — so this summarises
+ * rather than forwards, and anything unrecognised is dropped rather than
+ * dumped. R17's second CLI plugs in here and nowhere else.
+ */
+function linesOf(event, raw) {
+  if (!event) {
+    // Not JSON at all. A CLI that writes plain text to stdout still deserves to
+    // be readable, so it goes in verbatim.
+    return raw ? [{ kind: 'SYSTEM', body: raw.slice(0, 4000) }] : [];
+  }
+
+  switch (event.type) {
+    case 'system':
+      // The init event names the model and the session; the rest of what it
+      // carries is inventory nobody reads.
+      if (event.subtype === 'init') {
+        return [{
+          kind: 'SYSTEM',
+          body: `session ${short(event.session_id)} started on ${event.model ?? 'an unknown model'}`
+            + ` in ${event.cwd ?? 'an unknown directory'}`,
+        }];
+      }
+      return [];
+
+    case 'assistant': {
+      const lines = [];
+      for (const part of event.message?.content ?? []) {
+        if (part.type === 'text' && part.text?.trim()) {
+          lines.push({ kind: 'ASSISTANT', body: part.text.trim() });
+        } else if (part.type === 'thinking' && part.thinking?.trim()) {
+          lines.push({ kind: 'THINKING', body: part.thinking.trim() });
+        } else if (part.type === 'tool_use') {
+          lines.push({ kind: 'TOOL', body: `${part.name} ${describeInput(part.input)}`.trim() });
+        }
+      }
+      return lines;
+    }
+
+    case 'user': {
+      // Tool results come back as a user message. The agent's own prompts do
+      // too, but those are already in the transcript from the console side.
+      const lines = [];
+      for (const part of event.message?.content ?? []) {
+        if (part.type === 'tool_result') {
+          lines.push({ kind: 'TOOL_RESULT', body: flatten(part.content) });
+        }
+      }
+      return lines;
+    }
+
+    case 'result':
+      return [{
+        kind: event.is_error ? 'ERROR' : 'SYSTEM',
+        body: `turn ended (${event.subtype ?? 'done'})`
+          + (event.duration_ms ? ` in ${Math.round(event.duration_ms / 1000)}s` : '')
+          + (typeof event.total_cost_usd === 'number'
+            ? `, $${event.total_cost_usd.toFixed(4)} so far`
+            : ''),
+      }];
+
+    default:
+      return [];
+  }
+}
+
+/** A tool's input as one short line — the arguments that identify the call. */
+function describeInput(input) {
+  if (!input || typeof input !== 'object') return '';
+  const interesting = ['file_path', 'path', 'command', 'pattern', 'url', 'query', 'number', 'kind'];
+  for (const key of interesting) {
+    if (typeof input[key] === 'string' || typeof input[key] === 'number') {
+      return String(input[key]).slice(0, 300);
+    }
+  }
+  const json = JSON.stringify(input);
+  return json.length > 200 ? `${json.slice(0, 199)}…` : json;
+}
+
+/** Tool results arrive as a string or as content parts. */
+function flatten(content) {
+  const text = typeof content === 'string'
+    ? content
+    : (content ?? []).map((part) => part?.text ?? '').join('\n');
+  return text.trim().slice(0, 4000) || '(no output)';
+}
+
+function short(id) {
+  return typeof id === 'string' ? id.slice(0, 8) : '?';
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Batches transcript lines to the platform.
+ *
+ * A session can emit dozens of events in a second, and one HTTP request each
+ * would spend more time in the network than the agent spends thinking. Lines
+ * are held for a beat and sent together, in order, one request at a time —
+ * because two batches in flight can arrive out of order, and a transcript out
+ * of order is worse than a transcript a half-second late.
+ */
+class Transcript {
+  constructor(config, run, { every = 400, max = 100 } = {}) {
+    this.config = config;
+    this.run = run;
+    this.every = every;
+    this.max = max;
+    this.pending = [];
+    this.sending = null;
+    this.timer = null;
+  }
+
+  push(line) {
+    if (!line?.body) return;
+    this.pending.push(line);
+    if (this.pending.length >= this.max) {
+      void this.flush();
+    } else if (!this.timer) {
+      this.timer = setTimeout(() => void this.flush(), this.every);
+      this.timer.unref?.();
+    }
+  }
+
+  async flush() {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    // One request at a time: awaiting the previous send is what keeps the
+    // transcript in the order the session produced it.
+    this.sending = (this.sending ?? Promise.resolve()).then(() => this.send());
+    await this.sending;
+  }
+
+  async send() {
+    const lines = this.pending.splice(0, this.pending.length);
+    if (!lines.length) return;
+    await api(this.config, `/api/projects/${this.run.projectSlug}/runs/${this.run.id}/output`, {
+      method: 'POST',
+      body: { lines },
+      // A dropped line is not worth failing a run over. Say so and carry on:
+      // the session is still working, and the person watching would rather see
+      // the rest than nothing.
+    }).catch((failure) => log(`  could not record output: ${failure.message}`));
+  }
+}
+
+// --- talking to a live session -----------------------------------------------
+
+/** One user message, in the shape `--input-format stream-json` expects. */
+function writeUserMessage(child, text) {
+  child.stdin.write(
+    `${JSON.stringify({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'text', text }] },
+    })}\n`,
+  );
+}
+
+/**
+ * Long-polls for prompts typed in the console and writes them into the session.
+ *
+ * Delivery is acknowledged only after the write, so a prompt that never reached
+ * stdin stays queued and is retried rather than being silently lost.
+ */
+function deliverPrompts(config, run, child) {
+  let stopped = false;
+
+  (async () => {
+    while (!stopped) {
+      const pending = await api(
+        config,
+        `/api/projects/${run.projectSlug}/runs/${run.id}/prompts/pending?wait=20`,
+      ).catch((failure) => {
+        log(`  could not read prompts: ${failure.message}`);
+        return null;
+      });
+
+      if (stopped) return;
+      if (!pending?.length) {
+        // A refusal or an empty poll: pause briefly so a persistent failure
+        // does not become a busy loop.
+        if (!pending) await sleep(2000);
+        continue;
+      }
+
+      const delivered = [];
+      for (const prompt of pending) {
+        if (stopped || child.stdin.destroyed) break;
+        log(`  prompt from the console: ${prompt.body.slice(0, 80)}`);
+        writeUserMessage(child, prompt.body);
+        delivered.push(prompt.id);
+      }
+      if (delivered.length) {
+        await api(
+          config,
+          `/api/projects/${run.projectSlug}/runs/${run.id}/prompts/delivered`,
+          { method: 'POST', body: { promptIds: delivered } },
+        ).catch((failure) => log(`  could not acknowledge prompts: ${failure.message}`));
+      }
+    }
+  })();
+
+  return { stop: () => { stopped = true; } };
+}
+
 // --- running one run ---------------------------------------------------------
 
 const running = new Map();
@@ -272,7 +512,7 @@ async function startRun(config, offered) {
   let defaultBranch;
 
   try {
-    log(`claiming ${run.projectSlug} R${run.entryNumber} on ${run.branch}`);
+    log(`claiming ${run.projectSlug} ${run.label} on ${run.branch}`);
     // The claim is where the run token comes from. It appears once, here, and
     // goes straight into the child's environment — never into a file that
     // outlives the run, and never near the operator's own token.
@@ -377,27 +617,55 @@ async function spawnAgent(config, run, runToken, cwd) {
     child.cawdevProjectSlug = run.projectSlug;
     running.set(run.id, child);
 
-    child.stdin.write(promptFor(run));
-    child.stdin.end();
+    // The opening instruction, as a user message. stdin is NOT closed: the
+    // session stays open for whatever a person types next.
+    writeUserMessage(child, promptFor(run));
 
     let lastText = '';
+    const transcript = new Transcript(config, run);
+
+    // stream-json arrives in chunks that split mid-line, so buffer until a
+    // newline rather than assuming one chunk is one event.
+    let buffer = '';
     child.stdout.on('data', (chunk) => {
-      for (const line of String(chunk).split('\n')) {
-        const event = safeJson(line.trim());
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line) continue;
+        const event = safeJson(line);
         if (event?.type === 'result' && typeof event.result === 'string') {
           lastText = event.result;
         }
+        for (const recorded of linesOf(event, line)) {
+          transcript.push(recorded);
+        }
       }
     });
-    child.stderr.on('data', (chunk) => log(`  agent stderr: ${String(chunk).trim().slice(0, 400)}`));
+    child.stderr.on('data', (chunk) => {
+      const text = String(chunk).trim();
+      if (!text) return;
+      log(`  agent stderr: ${text.slice(0, 400)}`);
+      transcript.push({ kind: 'ERROR', body: text.slice(0, 4000) });
+    });
+
+    // Prompts typed in the console, written into the live session.
+    const prompts = deliverPrompts(config, run, child);
 
     child.on('error', async (failure) => {
+      prompts.stop();
+      await transcript.flush();
       await finish(config, run, 'FAILED', `Could not spawn the agent: ${failure.message}`);
       await rm(mcpDirectory, { recursive: true, force: true });
       resolvePromise();
     });
 
     child.on('exit', async (code, signal) => {
+      prompts.stop();
+      // Flushed before the transition, so the last thing the session said is
+      // already readable when its state changes to FINISHED.
+      await transcript.flush();
       await rm(mcpDirectory, { recursive: true, force: true });
       log(`  agent exited (code ${code}, signal ${signal ?? 'none'})`);
 
@@ -524,7 +792,7 @@ async function main() {
           continue; // Already being claimed or prepared by us.
         }
         if (busy.has(slug)) {
-          log(`${slug} already has a run here; leaving R${offered.entryNumber} queued`);
+          log(`${slug} already has a run here; leaving "${offered.run.label}" queued`);
           continue;
         }
         busy.add(slug);

@@ -196,6 +196,19 @@ try {
     body: 'Read the entry. Nothing to build.',
   });
 
+  // What the runner streams: the session's own output, not the agent's reports.
+  await asToken(runnerToken, `${runPath}/output`, {
+    lines: [
+      { kind: 'SYSTEM', body: 'session 1a2b3c4d started on claude-opus-5' },
+      { kind: 'ASSISTANT', body: 'Reading the entry.' },
+      { kind: 'TOOL', body: 'Read README.md' },
+    ],
+  });
+  await console_(`${runPath}/prompts`, {
+    method: 'POST',
+    body: JSON.stringify({ prompt: 'A prompt from the console smoke.' }),
+  });
+
   const watching = await console_(`/api/projects/${project}/runs/${runId}`);
   check('the run detail shows it running on the runner that claimed it',
     watching.state === 'RUNNING' && watching.runnerName === runner.name, JSON.stringify(watching));
@@ -262,6 +275,75 @@ try {
   const listed = (await console_(`/api/projects/${project}/runs`)).find((run) => run.id === runId);
   check('the runs page lists it as finished, newest first',
     listed?.state === 'FINISHED' && listed.entryTitle === entry.title, JSON.stringify(listed));
+
+  // --- R22: the transcript, and talking to a live session -------------------
+
+  const transcript = await console_(`${runPath}/output`);
+  check('the transcript carries what the runner streamed, in order',
+    transcript.length >= 2
+      && transcript.every((line, i) => i === 0 || line.seq > transcript[i - 1].seq),
+    JSON.stringify(transcript));
+  check('the prompt the console sent is in the transcript, attributed to a person',
+    transcript.some((line) => line.kind === 'USER' && line.body.includes('the console smoke')),
+    JSON.stringify(transcript.filter((line) => line.kind === 'USER')));
+
+  const afterFirst = await console_(`${runPath}/output?after=${transcript[0].seq}`);
+  check('a reader resumes from a sequence number rather than re-reading everything',
+    afterFirst.length === transcript.length - 1 && afterFirst[0].seq === transcript[1].seq,
+    `${afterFirst.length} vs ${transcript.length}`);
+
+  // --- a manual session: a prompt instead of an entry -----------------------
+
+  const session = await console_(`/api/projects/${project}/runs/sessions`, {
+    method: 'POST',
+    body: JSON.stringify({ prompt: 'Look at the README and tell me what this is.' }),
+  });
+  check('a session starts with a prompt and no entry',
+    session.kind === 'MANUAL' && session.entryNumber === null
+      && session.label.startsWith('Look at the README'),
+    JSON.stringify(session));
+  check('a session takes the project default branch when none is given',
+    typeof session.branch === 'string' && session.branch.length > 0, session.branch);
+
+  const sessionPath = `/api/projects/${project}/runs/${session.id}`;
+  const queued = await asToken(runnerToken, `${sessionPath}/prompts`, undefined, 'GET');
+  check('the opening prompt is not queued as a message — it is the spawn argument',
+    queued.length === 0, JSON.stringify(queued));
+
+  await console_(`${sessionPath}/prompts`, {
+    method: 'POST',
+    body: JSON.stringify({ prompt: 'And now the second turn.' }),
+  });
+  const pending = await asToken(runnerToken, `${sessionPath}/prompts/pending`, undefined, 'GET');
+  check('a prompt typed in the console reaches the runner\'s delivery queue',
+    pending.length === 1 && pending[0].body === 'And now the second turn.',
+    JSON.stringify(pending));
+
+  await asToken(runnerToken, `${sessionPath}/prompts/delivered`,
+    { promptIds: [pending[0].id] });
+  const afterDelivery =
+    await asToken(runnerToken, `${sessionPath}/prompts/pending`, undefined, 'GET');
+  check('an acknowledged prompt leaves the queue', afterDelivery.length === 0,
+    JSON.stringify(afterDelivery));
+
+  const sessionThread = await console_(`${sessionPath}/prompts`);
+  check('the thread says who sent the prompt and that it was delivered',
+    sessionThread[0]?.sentByEmail === EMAIL && sessionThread[0].delivered === true,
+    JSON.stringify(sessionThread));
+
+  const liveNow = await console_('/api/runs/live');
+  const thisOne = liveNow.find((each) => each.run.id === session.id);
+  check('the live page shows the session across projects, with its tail',
+    thisOne && Array.isArray(thisOne.tail)
+      && thisOne.tail.some((line) => line.body.includes('And now the second turn.')),
+    JSON.stringify(thisOne?.tail));
+
+  await console_(`${sessionPath}/transition`, {
+    method: 'POST',
+    body: JSON.stringify({ state: 'CANCELLED', summary: 'Ended by the console smoke.' }),
+  });
+  check('ending a session drops it off the live page',
+    (await console_('/api/runs/live')).every((each) => each.run.id !== session.id));
 } finally {
   if (runId) {
     await console_(`/api/projects/${project}/runs/${runId}/transition`, {

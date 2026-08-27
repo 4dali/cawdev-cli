@@ -47,7 +47,16 @@ runner rather than a third entry in the list.
 3. **Spawns the agent** in that directory, in its own process group, with the
    run token in its environment and an `.mcp.json` pointing at cawdev's MCP
    server. **Your own token never reaches the child.**
-4. **Reports the lifecycle back** and, if the session dies without saying
+4. **Streams the transcript.** Every stream-json event the session emits is
+   summarised into a line and batched to the platform, which is what the
+   console's live terminal reads. It summarises rather than forwards — the
+   `init` event alone is kilobytes of tool inventory nobody reads.
+5. **Delivers prompts.** It long-polls for prompts typed in the console and
+   writes them into the session's stdin, which stays **open** for exactly this
+   reason (`--input-format stream-json`). One process, one session, many turns.
+   A prompt is acknowledged only after the write, so one that never landed is
+   retried rather than lost.
+6. **Reports the lifecycle back** and, if the session dies without saying
    anything, ends the run rather than leaving it `RUNNING` forever.
 
 Cancelling a run reaches the daemon on its next poll and takes down the child's
