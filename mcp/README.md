@@ -110,7 +110,36 @@ what you are allowed to do.
 | `changelog_add` | Add an entry; no version means `Unreleased`. |
 | `changelog_update` | Edit one, including moving it to a release when it ships. |
 
+### Inside a run
+
+These four only work when the token is a **run token** (`cawdr_`), which the
+runner mints when a run starts and hands to the session it spawns. A plain
+`cawd_` token gets a refusal saying so.
+
+| Tool | What it does |
+|---|---|
+| `task_current` | The entry you are working on, its branch, and everything already said and asked on this run. **Call it first**, and again whenever you are unsure where you are. |
+| `report` | `progress` as often as useful; `done` when finished, naming the branch and any PR; `blocked` when a person must resolve something. `done` and `blocked` end the run. |
+| `ask_user` | Ask the person who started the run, and wait. Blocks up to ten minutes, then hands back a `question_id`. |
+| `await_answer` | Resume waiting for a question `ask_user` handed back. |
+
+**`ask_user` is for decisions that are genuinely theirs** — an architectural
+choice, a trade-off with no right answer, something the entry does not settle.
+Not for checking work you can check yourself. Every question stops the run and
+costs somebody's attention.
+
+When `ask_user` returns without an answer, **do not guess and carry on.** You
+asked because the decision was not yours. Call `await_answer`, or `report`
+`blocked` and stop.
+
+After `report done` or `report blocked`, the run is over and your token has
+expired with it. There is nothing further to do.
+
 ## Checking it works
+
+Two smoke tests, both driving the server over real stdio.
+
+
 
 ```sh
 CAWDEV_URL=http://localhost:8091 CAWDEV_TOKEN=cawd_… node tools/mcp/smoke.mjs scratch-project
@@ -124,6 +153,17 @@ It drives the server the way a client does — spawn, write lines to stdin, read
 lines from stdout — rather than importing its functions, because the parts most
 likely to break are the transport and the framing. CI runs it against the
 compose stack.
+
+The orchestration tools, including the case R10 exists for — the agent blocks
+on `ask_user`, something else answers, and the tool call returns the answer:
+
+```sh
+node tools/mcp/orchestration-smoke.mjs scratch-project
+```
+
+It starts a real run (which needs a session, since an agent cannot start another
+agent), drives it through a runner, and exercises the pending path on a
+shortened `CAWDEV_ASK_TIMEOUT_SECONDS`.
 
 A single call, by hand:
 

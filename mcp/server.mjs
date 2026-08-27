@@ -175,6 +175,66 @@ async function resolveProject(config, requested) {
   );
 }
 
+/**
+ * The run this token belongs to, for the orchestration tools.
+ *
+ * A plain `cawd_` token gets a refusal that says what it is missing rather than
+ * a confusing 404: these tools only mean anything inside a run, and an agent
+ * holding the wrong token should be told so plainly.
+ */
+async function requireRun(config) {
+  const identity = await api(config, '/api/agent/whoami');
+  if (!identity.runId) {
+    throw new CawdevError(
+      'This tool needs a run. The token in use is a plain cawd_ token, which can read and write ' +
+        'the roadmap and changelog but is not attached to any run. A run token (cawdr_) is ' +
+        'minted by the runner when a run starts and handed to the session it spawns.',
+    );
+  }
+  const project = identity.projects[0]?.slug;
+  if (!project) {
+    throw new CawdevError('This run token has no project. Its run may have ended.');
+  }
+  return { runId: identity.runId, project };
+}
+
+/** How long ask_user waits before handing back a pending question. */
+function askTimeoutSeconds() {
+  // Overridable so a test does not have to wait ten minutes to exercise the
+  // pending path.
+  const configured = Number(process.env.CAWDEV_ASK_TIMEOUT_SECONDS);
+  return Number.isFinite(configured) && configured > 0 ? configured : 600;
+}
+
+/**
+ * Waits for an answer, re-polling quietly.
+ *
+ * The platform's long poll returns after at most 25 seconds, so a genuine wait
+ * is many polls. Doing that here rather than in the agent means the agent
+ * experiences one natural blocking ask, while the person experiences an inbox
+ * item — which is the whole shape R10 is after.
+ */
+async function pollForAnswer(config, project, runId, questionId, seconds) {
+  const deadline = Date.now() + seconds * 1000;
+  while (Date.now() < deadline) {
+    const remaining = Math.ceil((deadline - Date.now()) / 1000);
+    const response = await fetch(
+      `${config.url}/api/projects/${project}/runs/${runId}/questions/${questionId}/answer` +
+        `?wait=${Math.min(25, Math.max(1, remaining))}`,
+      { headers: { authorization: `Bearer ${config.token}` } },
+    );
+    if (response.status === 200) {
+      return await response.json();
+    }
+    if (response.status !== 204) {
+      const text = await response.text();
+      throw new CawdevError(safeJson(text)?.message ?? `waiting failed: HTTP ${response.status}`);
+    }
+    // 204 means "not yet" — ask again.
+  }
+  return null;
+}
+
 // --- the tools --------------------------------------------------------------
 
 const PROJECT_ARGUMENT = {
@@ -484,6 +544,153 @@ const TOOLS = [
         body: pick(args, ['category', 'text', 'version', 'breaking']),
       });
       return `Updated changelog entry ${entry.number}.\n\n${formatChangelogEntry(entry)}`;
+    },
+  },
+
+  // --- orchestration: only meaningful inside a run -------------------------
+
+  {
+    name: 'task_current',
+    description:
+      'What you are working on: the roadmap entry, its branch, and everything already said and ' +
+      'asked on this run. Call it first, and again whenever you are unsure where you are — a ' +
+      'resumed or confused session re-orients from this alone.',
+    inputSchema: { type: 'object', properties: {} },
+    handler: async (config) => {
+      const { runId, project } = await requireRun(config);
+      const run = await api(config, `/api/projects/${project}/runs/${runId}`);
+      const entry = await api(config, `/api/projects/${project}/roadmap/${run.entryNumber}`);
+      const messages = await api(config, `/api/projects/${project}/runs/${runId}/messages`);
+      const questions = await api(config, `/api/projects/${project}/runs/${runId}/questions`);
+
+      const lines = [
+        `project: ${project}`,
+        `branch:  ${run.branch}`,
+        `run:     ${run.state}${run.runnerName ? ` on ${run.runnerName}` : ''}`,
+        `started by ${run.startedByEmail}`,
+        '',
+        formatEntry(entry, {}),
+      ];
+
+      if (messages.length) {
+        lines.push('', '--- what you have reported so far ---');
+        for (const message of messages) {
+          lines.push(`[${message.kind}] ${message.body}`);
+        }
+      }
+      if (questions.length) {
+        lines.push('', '--- what you have asked ---');
+        for (const question of questions) {
+          lines.push(
+            `Q: ${question.question}`,
+            question.answered
+              ? `A: ${question.answer}  (${question.answeredByEmail})`
+              : `A: still waiting  (question_id ${question.id})`,
+          );
+        }
+      }
+      return lines.join('\n');
+    },
+  },
+
+  {
+    name: 'report',
+    description:
+      'Say what is happening. `progress` as often as useful; `done` when the work is finished, ' +
+      'naming the branch and any PR; `blocked` when something stops you that a person must ' +
+      'resolve. done and blocked also end the run — you do not need a separate step.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['progress', 'done', 'blocked'] },
+        body: { type: 'string', description: 'Markdown. Say what actually happened.' },
+      },
+      required: ['kind', 'body'],
+    },
+    handler: async (config, args) => {
+      const { runId, project } = await requireRun(config);
+      const message = await api(config, `/api/projects/${project}/runs/${runId}/messages`, {
+        method: 'POST',
+        body: { kind: args.kind.toUpperCase(), body: args.body },
+      });
+
+      // done and blocked END the run, and a run's token expires with it — so
+      // there is no reading the run back afterwards. Say what happened from
+      // what we know, and tell the agent its token is now spent, which is the
+      // thing it most needs to hear.
+      const ended = { DONE: 'FINISHED', BLOCKED: 'FAILED' }[message.kind];
+      if (ended) {
+        return (
+          `Reported ${message.kind}. The run is ${ended} and this token has expired with it — ` +
+          `there is nothing further to do here.`
+        );
+      }
+
+      const run = await api(config, `/api/projects/${project}/runs/${runId}`);
+      return `Reported ${message.kind}. The run is ${run.state}.`;
+    },
+  },
+
+  {
+    name: 'ask_user',
+    description:
+      'Ask the person who started this run, and wait for their answer. Use it when a decision is ' +
+      'genuinely theirs — not to check work you can check yourself. Blocks for up to ten ' +
+      'minutes; if nobody has answered by then it returns a question_id for await_answer.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: { type: 'string' },
+        options: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional one-click choices. They can still answer in free text.',
+        },
+      },
+      required: ['question'],
+    },
+    handler: async (config, args) => {
+      const { runId, project } = await requireRun(config);
+      const asked = await api(config, `/api/projects/${project}/runs/${runId}/questions`, {
+        method: 'POST',
+        body: { question: args.question, options: args.options },
+      });
+
+      const answered = await pollForAnswer(config, project, runId, asked.id, askTimeoutSeconds());
+      if (answered) {
+        return `${answered.answeredByEmail} answered:\n\n${answered.answer}`;
+      }
+      return (
+        `Nobody has answered yet. The run is WAITING_ON_USER and the question is in their ` +
+        `inbox.\n\nCall await_answer with question_id ${asked.id} to keep waiting. Do not ` +
+        `guess an answer and carry on — you asked because the decision was theirs.`
+      );
+    },
+  },
+
+  {
+    name: 'await_answer',
+    description:
+      'Resume waiting for a question ask_user handed back. Between the two you experience one ' +
+      'natural blocking ask; the person experiences an inbox item.',
+    inputSchema: {
+      type: 'object',
+      properties: { question_id: { type: 'string' } },
+      required: ['question_id'],
+    },
+    handler: async (config, args) => {
+      const { runId, project } = await requireRun(config);
+      const answered = await pollForAnswer(
+        config,
+        project,
+        runId,
+        args.question_id,
+        askTimeoutSeconds(),
+      );
+      if (answered) {
+        return `${answered.answeredByEmail} answered:\n\n${answered.answer}`;
+      }
+      return `Still nothing. Call await_answer again with question_id ${args.question_id}.`;
     },
   },
 ];
