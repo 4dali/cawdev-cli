@@ -86,7 +86,7 @@ const started = await session(`/api/projects/${project}/runs`, {
   method: 'POST',
   body: JSON.stringify({ entryNumber: entry.number, branch: `r${entry.number}-smoke` }),
 });
-const runId = started.run.id;
+const runId = started.id;
 
 // The runner's part: claim it and set it running, so the agent's token is
 // working on a run that is actually going.
@@ -116,7 +116,9 @@ async function asRunner(path, body) {
 }
 
 const runner = await asRunner('/api/runners', { name: `smoke-${Date.now()}` });
-await asRunner(`/api/runners/${runner.id}/claim/${runId}`);
+// The claim is where the run token comes from — it goes straight to the runner,
+// never to the person who started the run.
+const claimed = await asRunner(`/api/runners/${runner.id}/claim/${runId}`);
 await asRunner(`/api/projects/${project}/runs/${runId}/transition`, { state: 'RUNNING' });
 
 // --- the agent's side, over real stdio ---------------------------------------
@@ -126,7 +128,7 @@ const server = spawn(process.execPath, [join(here, 'server.mjs')], {
   env: {
     ...process.env,
     CAWDEV_URL: BASE,
-    CAWDEV_TOKEN: started.runToken,
+    CAWDEV_TOKEN: claimed.runToken,
     // Short, so the pending path can be exercised without waiting ten minutes.
     CAWDEV_ASK_TIMEOUT_SECONDS: '3',
   },
