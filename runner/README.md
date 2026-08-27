@@ -71,11 +71,23 @@ happening is correct: it is stalled on a person, who may reasonably take a day.
 the platform through the same API, and follows a fixed script instead of
 thinking:
 
+Point `agentCommand` straight at it — an **absolute path, with no `agentArgs`**:
+
+```json
+{ "agentCommand": "/…/cawdev/tools/runner/stub-agent.mjs", "agentArgs": [] }
+```
+
 ```sh
 CAWDEV_STUB_SCRIPT=ask-then-finish \
 CAWDEV_TOKEN=cawd_… \
   node tools/runner/runner.mjs --config runner.config.json
 ```
+
+Not `"agentCommand": "node"` with the script in `agentArgs`: the runner puts
+`--mcp-config` first, so node gets a flag it does not know and exits with `bad
+option` before the script runs. The shebang avoids that, and the flags land in
+the stub's argv where it ignores them. Absolute, because the child's cwd is the
+working copy rather than this repository.
 
 | `CAWDEV_STUB_SCRIPT` | What it does |
 |---|---|

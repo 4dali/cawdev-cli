@@ -2,9 +2,17 @@
 // A stand-in for `claude`, for exercising the runner without spending anybody's
 // Claude usage.
 //
-// Point the runner at it with:
+// Point the runner at it with an ABSOLUTE path and no args:
 //
-//   { "agentCommand": "node", "agentArgs": ["tools/runner/stub-agent.mjs"] }
+//   { "agentCommand": "/…/tools/runner/stub-agent.mjs", "agentArgs": [] }
+//
+// Not `node` with the script as an argument: the runner puts `--mcp-config`
+// first (see runner.mjs), so node would be handed a flag it does not know and
+// exit with "bad option". The shebang runs it instead, and the cawdev flags
+// land in its argv where it ignores them — which is exactly what `claude` does
+// with the ones it does not need either.
+//
+// Absolute, because the child's cwd is the working copy, not this repository.
 //
 // It behaves like the real thing in the ways that matter to the runner: it is
 // spawned in the working copy with CAWDEV_TOKEN in its environment, it talks to
