@@ -136,7 +136,40 @@ nothing here should imply the agent may run arbitrary commands.
   could not commit, and reported `blocked`: correct behaviour, avoidable cause.
 
 **Nothing else runs.** A task needing tests or a build will stall waiting for
-permission that never comes, so add what that project needs. On a machine
+permission that never comes, so add what that project needs — with
+`allowedTools`, which **adds to** the defaults rather than replacing them:
+
+```json
+{
+  "allowedTools": ["Bash(node *)"],
+  "projects": {
+    "dycrypt": {
+      "path": "/Users/you/code/dycrypt",
+      "allowedTools": ["Bash(mvn *)", "Bash(gh *)", "mcp__roadmap"]
+    },
+    "medymo": "/Users/you/code/medymo"
+  }
+}
+```
+
+A project is a path, or a path with permissions of its own; both forms work, so
+the one project that runs Maven does not force the long form on the rest.
+
+Do **not** reach for `agentArgs` to add a permission: it replaces the whole
+default list, so you would have to repeat all sixteen MCP tool names to add one
+`Bash` pattern.
+
+### The project's own MCP servers
+
+A repository that ships its own `.mcp.json` means it. Those servers are
+**passed through** into the config the runner generates, because a server
+merely *discovered* in a repository is project-scoped — Claude Code asks whether
+you trust it, and a spawned session has no terminal to answer with, so it
+auto-denies and the repository's own tooling is silently missing.
+
+Their tools still need naming in `allowedTools`, as `mcp__<server>__<tool>`.
+cawdev's own entry is written last, so a project cannot shadow it with a server
+of the same name and intercept the run's token. On a machine
 dedicated to this, `bypassPermissions` covers everything — but that is a real
 decision about what an unattended agent may do in your checkout, and it should
 be yours to make rather than a default you inherit without noticing.

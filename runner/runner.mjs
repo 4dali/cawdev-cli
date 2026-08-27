@@ -116,7 +116,15 @@ async function readConfig() {
     name: process.env.CAWDEV_RUNNER_NAME ?? file.name ?? DEFAULTS.name,
     agentCommand: process.env.CAWDEV_AGENT_COMMAND ?? file.agentCommand ?? DEFAULTS.agentCommand,
     // Which projects this runner serves, and where their working copies are.
-    projects: file.projects ?? {},
+    projects: normaliseProjects(file.projects ?? {}),
+    /**
+     * Permissions ADDED to the defaults, not replacing them.
+     *
+     * `agentArgs` replaces the whole default array, which means adding one
+     * permission used to mean repeating all sixteen MCP tool names. Nobody
+     * should have to do that to let a project run its own build.
+     */
+    allowedTools: file.allowedTools ?? [],
   };
 
   if (!config.token) {
@@ -132,6 +140,26 @@ async function readConfig() {
     );
   }
   return config;
+}
+
+/**
+ * A project is a path, or a path with permissions of its own.
+ *
+ * Both forms are accepted because most projects only need a path, and a config
+ * that forces the long form on everybody to accommodate the one project that
+ * runs Maven is a worse config.
+ *
+ *   "dycrypt": "/Users/you/code/dycrypt"
+ *   "dycrypt": { "path": "…", "allowedTools": ["Bash(mvn *)", "mcp__roadmap"] }
+ */
+function normaliseProjects(projects) {
+  const normalised = {};
+  for (const [slug, value] of Object.entries(projects)) {
+    normalised[slug] = typeof value === 'string'
+      ? { path: value, allowedTools: [] }
+      : { path: value.path, allowedTools: value.allowedTools ?? [] };
+  }
+  return normalised;
 }
 
 // --- talking to cawdev -------------------------------------------------------
@@ -378,6 +406,33 @@ function sleep(ms) {
 }
 
 /**
+ * The MCP servers a working copy declares for itself.
+ *
+ * Read rather than ignored, because a repository that ships its own agent
+ * tooling means it: dycrypt's roadmap server is how an agent working there is
+ * expected to touch its roadmap. A malformed file is skipped with a note — it
+ * is the project's business, and it should not stop a run.
+ */
+async function projectMcpServers(cwd) {
+  try {
+    const raw = await readFile(join(cwd, '.mcp.json'), 'utf8');
+    const parsed = JSON.parse(raw);
+    const servers = parsed?.mcpServers ?? {};
+    const names = Object.keys(servers).filter((name) => name !== 'cawdev');
+    if (names.length) {
+      log(`  passing through the project's own MCP servers: ${names.join(', ')}`);
+      log('    their tools need naming in allowedTools, as mcp__<server>__<tool>');
+    }
+    return Object.fromEntries(names.map((name) => [name, servers[name]]));
+  } catch (failure) {
+    if (failure.code !== 'ENOENT') {
+      log(`  ignoring the project's .mcp.json: ${failure.message}`);
+    }
+    return {};
+  }
+}
+
+/**
  * Batches transcript lines to the platform.
  *
  * A session can emit dozens of events in a second, and one HTTP request each
@@ -507,7 +562,8 @@ const taken = new Set();
 
 async function startRun(config, offered) {
   const run = offered.run;
-  const path = config.projects[run.projectSlug];
+  const project = config.projects[run.projectSlug];
+  const path = project?.path;
   let runToken;
   let defaultBranch;
 
@@ -567,26 +623,28 @@ async function spawnAgent(config, run, runToken, cwd) {
   const mcpConfigPath = join(mcpDirectory, 'mcp.json');
 
   const serverPath = new URL('../mcp/server.mjs', import.meta.url).pathname;
-  await writeFile(
-    mcpConfigPath,
-    JSON.stringify(
-      {
-        mcpServers: {
-          cawdev: {
-            command: process.execPath,
-            args: [serverPath],
-            env: {
-              CAWDEV_URL: config.url,
-              CAWDEV_TOKEN: runToken,
-              CAWDEV_PROJECT: run.projectSlug,
-            },
-          },
-        },
-      },
-      null,
-      2,
-    ),
-  );
+
+  // The project's own MCP servers, folded into the config we pass.
+  //
+  // A server discovered from a repository's .mcp.json is project-scoped, and
+  // Claude Code asks whether you trust it — a question a spawned session has no
+  // terminal to answer, so it auto-denies and the repository's own tooling is
+  // simply missing. Passing them through --mcp-config instead makes them
+  // trusted the same way cawdev's own server is.
+  //
+  // cawdev's entry is written last, so a project cannot shadow it with a server
+  // of the same name and intercept the run's own token.
+  const mcpServers = { ...(await projectMcpServers(cwd)) };
+  mcpServers.cawdev = {
+    command: process.execPath,
+    args: [serverPath],
+    env: {
+      CAWDEV_URL: config.url,
+      CAWDEV_TOKEN: runToken,
+      CAWDEV_PROJECT: run.projectSlug,
+    },
+  };
+  await writeFile(mcpConfigPath, JSON.stringify({ mcpServers }, null, 2));
 
   // The prompt goes on stdin, NOT as an argument.
   //
@@ -596,7 +654,22 @@ async function spawnAgent(config, run, runToken, cwd) {
   // argument-length limits, and prompts are not short.
   // --mcp-config goes FIRST: both it and --allowedTools are variadic, and a
   // variadic option swallows whatever follows it.
-  const args = ['--mcp-config', mcpConfigPath, ...config.agentArgs];
+  // Extra permissions land at the END, inside the variadic --allowedTools the
+  // defaults finish with. If a custom agentArgs has no --allowedTools at all,
+  // the flag is added rather than the extras being silently swallowed by
+  // whatever option happened to come last.
+  const extras = [
+    ...(config.allowedTools ?? []),
+    ...(config.projects[run.projectSlug]?.allowedTools ?? []),
+  ];
+  const agentArgs = [...config.agentArgs];
+  if (extras.length) {
+    if (!agentArgs.includes('--allowedTools')) {
+      agentArgs.push('--allowedTools');
+    }
+    agentArgs.push(...extras);
+  }
+  const args = ['--mcp-config', mcpConfigPath, ...agentArgs];
   log(`  spawning: ${config.agentCommand} ${args.join(' ')} (prompt on stdin)`);
 
   return new Promise((resolvePromise) => {
@@ -743,7 +816,7 @@ async function main() {
   config.runnerId = runner.id;
 
   log(`registered as "${runner.name}" (${runner.id}) against ${config.url}`);
-  log(`serving: ${Object.entries(config.projects).map(([s, p]) => `${s} -> ${p}`).join(', ')}`);
+  log(`serving: ${Object.entries(config.projects).map(([s, p]) => `${s} -> ${p.path}`).join(', ')}`);
 
   const heartbeat = setInterval(() => {
     api(config, `/api/runners/${config.runnerId}/heartbeat`, { method: 'POST' })
