@@ -47,6 +47,40 @@ const DEFAULTS = {
     '--verbose',
     '--permission-mode',
     'acceptEdits',
+    // acceptEdits covers writing files. It does NOT cover MCP tools — and
+    // without these the agent cannot read its task, move the entry, report, or
+    // ask, which is the entire loop. A real session found this by being
+    // denied `task_current` and stopping, correctly, rather than guessing what
+    // it had been asked to do.
+    //
+    // Named explicitly rather than reached with bypassPermissions: these are
+    // the tools the run needs, and nothing here should imply the agent may run
+    // arbitrary commands.
+    '--allowedTools',
+    // The prompt tells the agent to commit its work, so the default must let
+    // it: a default configuration that forbids what the default prompt asks
+    // for is a broken default. A real session wrote the file, could not commit,
+    // and reported blocked — correctly, and avoidably.
+    //
+    // git only. Tests and builds are per-project decisions, so a project that
+    // needs them adds them.
+    'Bash(git *)',
+    'mcp__cawdev__task_current',
+    'mcp__cawdev__report',
+    'mcp__cawdev__ask_user',
+    'mcp__cawdev__await_answer',
+    'mcp__cawdev__roadmap_where',
+    'mcp__cawdev__roadmap_statuses',
+    'mcp__cawdev__roadmap_list',
+    'mcp__cawdev__roadmap_get',
+    'mcp__cawdev__roadmap_create',
+    'mcp__cawdev__roadmap_update',
+    'mcp__cawdev__roadmap_set_status',
+    'mcp__cawdev__roadmap_decline',
+    'mcp__cawdev__changelog_list',
+    'mcp__cawdev__changelog_get',
+    'mcp__cawdev__changelog_add',
+    'mcp__cawdev__changelog_update',
   ],
   pollSeconds: 25,
   heartbeatSeconds: 30,
@@ -314,8 +348,16 @@ async function spawnAgent(config, run, runToken, cwd) {
     ),
   );
 
-  const args = [...config.agentArgs, '--mcp-config', mcpConfigPath, promptFor(run)];
-  log(`  spawning: ${config.agentCommand} ${config.agentArgs.join(' ')} …`);
+  // The prompt goes on stdin, NOT as an argument.
+  //
+  // `--mcp-config <configs...>` is variadic, so a prompt after it is swallowed
+  // as a second config file — which fails with "ENAMETOOLONG: name too long"
+  // and names neither the flag nor the prompt. Stdin also sidesteps
+  // argument-length limits, and prompts are not short.
+  // --mcp-config goes FIRST: both it and --allowedTools are variadic, and a
+  // variadic option swallows whatever follows it.
+  const args = ['--mcp-config', mcpConfigPath, ...config.agentArgs];
+  log(`  spawning: ${config.agentCommand} ${args.join(' ')} (prompt on stdin)`);
 
   return new Promise((resolvePromise) => {
     const child = spawn(config.agentCommand, args, {
@@ -323,7 +365,7 @@ async function spawnAgent(config, run, runToken, cwd) {
       // Its own process group, so cancelling can take down the whole tree
       // rather than leaving orphaned children behind.
       detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env,
         CAWDEV_URL: config.url,
@@ -334,6 +376,9 @@ async function spawnAgent(config, run, runToken, cwd) {
 
     child.cawdevProjectSlug = run.projectSlug;
     running.set(run.id, child);
+
+    child.stdin.write(promptFor(run));
+    child.stdin.end();
 
     let lastText = '';
     child.stdout.on('data', (chunk) => {

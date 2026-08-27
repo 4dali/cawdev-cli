@@ -91,26 +91,40 @@ the stub possible, and it is also how R17's second CLI would arrive.
 
 The defaults are for Claude Code, verified against 2.1.247:
 
-```json
-{
-  "agentCommand": "claude",
-  "agentArgs": [
-    "-p", "--output-format", "stream-json", "--verbose",
-    "--permission-mode", "acceptEdits"
-  ]
-}
-```
+See `DEFAULTS` in `runner.mjs` for the full list — it is long because the
+cawdev MCP tools are named individually.
 
-### About that permission mode
+### About permissions
 
 **A spawned agent has no terminal**, so anything that stops to ask a human for
-permission stops forever. `acceptEdits` lets it write files without that.
+permission stops forever.
 
-It does **not** cover running commands, so a task that needs to run tests or
-`git commit` will stall. A machine dedicated to this can use
-`bypassPermissions` instead — but that is a real decision about what an
-unattended agent may do in your checkout, and it should be yours to make rather
-than a default you inherit without noticing.
+- `--permission-mode acceptEdits` lets it write files.
+- `--allowedTools mcp__cawdev__…` lets it use the cawdev tools. **Without this
+  the entire loop is unreachable** — no reading the task, no moving the entry,
+  no reporting, no asking. A real session found this by being denied
+  `task_current` and stopping rather than guessing, which was the right call
+  and a good sign for the prompt.
+
+They are named explicitly rather than reached with `bypassPermissions`, because
+nothing here should imply the agent may run arbitrary commands.
+
+- `Bash(git *)` lets it commit. The prompt tells it to commit its work, so the
+  default has to allow that — a default configuration that forbids what the
+  default prompt asks for is a broken default. A real session wrote the file,
+  could not commit, and reported `blocked`: correct behaviour, avoidable cause.
+
+**Nothing else runs.** A task needing tests or a build will stall waiting for
+permission that never comes, so add what that project needs. On a machine
+dedicated to this, `bypassPermissions` covers everything — but that is a real
+decision about what an unattended agent may do in your checkout, and it should
+be yours to make rather than a default you inherit without noticing.
+
+**Both `--mcp-config` and `--allowedTools` are variadic**, so whatever follows
+them is swallowed as another value. The runner puts `--mcp-config` first and the
+prompt on **stdin** for exactly this reason — passing the prompt as an argument
+after `--mcp-config` fails with `ENAMETOOLONG`, which names neither the flag nor
+the prompt.
 
 The prompt deliberately teaches the **method**, not the task. The task is in the
 roadmap entry, which the agent reads for itself with `task_current` — putting it
