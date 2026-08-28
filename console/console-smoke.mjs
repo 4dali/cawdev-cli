@@ -410,6 +410,47 @@ try {
     (await console_(`/api/projects/${project}/roadmap?brief=true`))
       .every((e) => e.title !== 'should never exist'));
 
+  // --- R25: what the run committed, and whether it left --------------------
+
+  await asToken(runnerToken, `${sessionPath}/commits`, {
+    baseCommit: '0000000000000000000000000000000000000000',
+    pushState: 'NOT_PUSHED',
+    commits: [
+      { sha: 'aaa1111', subject: 'the first thing', author: 'agent',
+        files: 2, insertions: 30, deletions: 4 },
+      { sha: 'bbb2222', subject: 'the second thing', author: 'agent',
+        files: 1, insertions: 5, deletions: 0 },
+    ],
+  });
+  const recorded = await console_(`${sessionPath}/commits`);
+  check('the run records what it committed, oldest first',
+    recorded.length === 2 && recorded[0].sha === 'aaa1111' && recorded[1].insertions === 5,
+    JSON.stringify(recorded));
+  check('and how far it got out of the machine',
+    (await console_(sessionPath)).pushState === 'NOT_PUSHED');
+
+  // The runner reports as commits land, so the same sha arrives again.
+  await asToken(runnerToken, `${sessionPath}/commits`, {
+    pushState: 'PUSHED',
+    prUrl: 'https://github.com/example/repo/pull/7',
+    commits: [
+      { sha: 'aaa1111', subject: 'the first thing, reworded', author: 'agent',
+        files: 2, insertions: 31, deletions: 4 },
+      { sha: 'bbb2222', subject: 'the second thing', author: 'agent',
+        files: 1, insertions: 5, deletions: 0 },
+      { sha: 'ccc3333', subject: 'a third', author: 'agent',
+        files: 1, insertions: 1, deletions: 1 },
+    ],
+  });
+  const again = await console_(`${sessionPath}/commits`);
+  check('re-reporting updates rather than duplicating',
+    again.length === 3 && again[0].subject === 'the first thing, reworded',
+    JSON.stringify(again.map((c) => c.sha)));
+  const pushed = await console_(sessionPath);
+  check('push state and the PR link are carried on the run',
+    pushed.pushState === 'PUSHED' && pushed.prUrl?.endsWith('/pull/7'),
+    JSON.stringify([pushed.pushState, pushed.prUrl]));
+
   const liveNow = await console_('/api/runs/live');
   const thisOne = liveNow.find((each) => each.run.id === session.id);
   check('the live page shows the session across projects, with its tail',
@@ -423,6 +464,10 @@ try {
   });
   check('ending a session drops it off the live page',
     (await console_('/api/runs/live')).every((each) => each.run.id !== session.id));
+
+  // The record is the point: it must survive the run ending.
+  check('what it committed outlives the run',
+    (await console_(`${sessionPath}/commits`)).length === 3);
 } finally {
   if (runId) {
     await console_(`/api/projects/${project}/runs/${runId}/transition`, {

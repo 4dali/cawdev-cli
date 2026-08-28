@@ -249,7 +249,14 @@ async function prepareWorkingCopy(path, branch, defaultBranch) {
       .catch(() => base);
     await git(path, ['checkout', '-b', branch, startPoint]);
   }
-  return git(path, ['rev-parse', '--abbrev-ref', 'HEAD']);
+
+  // HEAD *now* is the base: "what did this run produce" means what it added,
+  // not everything on the branch. A resumed branch already carries a previous
+  // run's commits, and attributing those to this one would be a lie.
+  return {
+    branch: await git(path, ['rev-parse', '--abbrev-ref', 'HEAD']),
+    base: await git(path, ['rev-parse', 'HEAD']).catch(() => null),
+  };
 }
 
 // --- the prompt --------------------------------------------------------------
@@ -551,8 +558,9 @@ async function countLines(path) {
  * commit changes the working copy, so reporting immediately after one is how
  * the counts drop to zero in the console without waiting for the next tick.
  */
-function watchWorkingCopy(config, run, cwd) {
+function watchWorkingCopy(config, run, cwd, baseCommit) {
   let stopped = false;
+  let lastHead = baseCommit;
 
   (async () => {
     let last = null;
@@ -573,6 +581,14 @@ function watchWorkingCopy(config, run, cwd) {
           method: 'POST',
           body: state,
         }).catch((failure) => log(`  could not report the working copy: ${failure.message}`));
+      }
+
+      // Commits as they land, not only at the end: an hour-long run should
+      // show its work while it works.
+      const head = await git(cwd, ['rev-parse', 'HEAD']).catch(() => null);
+      if (head && head !== lastHead) {
+        lastHead = head;
+        await reportCommits(config, run, cwd, baseCommit);
       }
 
       const actions = await api(
@@ -624,6 +640,138 @@ async function perform(config, run, cwd, action) {
     `/api/projects/${run.projectSlug}/runs/${run.id}/actions/${action.id}/finished`,
     { method: 'POST', body: { ok, result: String(result).slice(0, 4000) } },
   ).catch((failure) => log(`  could not report the action: ${failure.message}`));
+}
+
+// --- what the run committed --------------------------------------------------
+
+/**
+ * The commits this run produced, from where its branch was cut.
+ *
+ * A record separator rather than newlines between fields: a commit subject can
+ * contain anything, and splitting on something a human can type is how a parser
+ * meets its first "fix: handle \n in input" and breaks.
+ */
+async function readCommits(cwd, base) {
+  if (!base) {
+    return [];
+  }
+  const SEP = '';
+  const format = ['%H', '%s', '%an', '%aI'].join(SEP);
+  const log = await git(cwd, ['log', '--reverse', `--format=${format}`, `${base}..HEAD`])
+    .catch(() => '');
+
+  const commits = [];
+  for (const line of log.split('\n')) {
+    if (!line.trim()) continue;
+    const [sha, subject, author, committedAt] = line.split(SEP);
+    if (!sha) continue;
+    commits.push({
+      sha,
+      subject: subject ?? '(no subject)',
+      author: author ?? null,
+      committedAt: committedAt ?? null,
+      ...(await statOf(cwd, sha)),
+    });
+  }
+  return commits;
+}
+
+/** One commit's diffstat. A merge or a root commit reports nothing, not zero-ish. */
+async function statOf(cwd, sha) {
+  const numstat = await git(cwd, ['show', '--numstat', '--format=', sha]).catch(() => '');
+  let files = 0;
+  let insertions = 0;
+  let deletions = 0;
+  for (const line of numstat.split('\n')) {
+    if (!line.trim()) continue;
+    const [added, removed] = line.split('\t');
+    files += 1;
+    insertions += Number(added) || 0;
+    deletions += Number(removed) || 0;
+  }
+  return { files, insertions, deletions };
+}
+
+/**
+ * Whether the work left the machine.
+ *
+ * Four answers rather than a boolean, because "on the remote but behind what
+ * the run committed" is exactly how somebody ships nothing while believing they
+ * shipped — and it is the state a run that could not push ends in.
+ */
+async function readPushState(cwd, branch) {
+  const remotes = await git(cwd, ['remote']).catch(() => '');
+  if (!remotes.trim()) {
+    return 'NO_REMOTE';
+  }
+  const remote = remotes.split('\n')[0].trim();
+
+  // Ask the remote rather than trusting a stale remote-tracking ref: the branch
+  // may have been pushed from elsewhere since this checkout last fetched.
+  const remoteHead = await git(cwd, ['ls-remote', '--heads', remote, branch])
+    .catch(() => '')
+    .then((out) => out.split('\t')[0]?.trim() ?? '');
+
+  if (!remoteHead) {
+    return 'NOT_PUSHED';
+  }
+  const localHead = await git(cwd, ['rev-parse', 'HEAD']).catch(() => '');
+  return remoteHead === localHead ? 'PUSHED' : 'AHEAD';
+}
+
+/**
+ * A pull request for this branch, if one exists.
+ *
+ * **Found, never created.** `gh` answers when it is installed and authenticated;
+ * otherwise a compare URL is built from the remote, which is a link somebody can
+ * click to open a PR themselves rather than a claim that one exists.
+ *
+ * This is where R15's open question — credential custody — settles: the runner
+ * already holds the credentials, so the runner answers and the platform never
+ * needs a token of its own.
+ */
+async function findPullRequest(cwd, branch) {
+  const viaGh = await new Promise((resolvePromise) => {
+    const child = spawn('gh', ['pr', 'view', branch, '--json', 'url', '--jq', '.url'], {
+      cwd,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    let out = '';
+    child.stdout.on('data', (chunk) => (out += chunk));
+    child.on('error', () => resolvePromise(null));
+    child.on('exit', (code) => resolvePromise(code === 0 ? out.trim() : null));
+  });
+  if (viaGh) {
+    return viaGh;
+  }
+
+  // No gh, or no PR yet. A compare URL is honest: it is where you would go to
+  // open one, and it is obviously not a claim that one exists.
+  const origin = await git(cwd, ['remote', 'get-url', 'origin']).catch(() => '');
+  const github = /github\.com[:/](.+?)(?:\.git)?$/.exec(origin.trim());
+  return github ? `https://github.com/${github[1]}/compare/${encodeURIComponent(branch)}` : null;
+}
+
+/** Reads the run's history out of git and tells the platform. */
+async function reportCommits(config, run, cwd, base) {
+  const commits = await readCommits(cwd, base).catch((failure) => {
+    log(`  could not read the commits: ${failure.message}`);
+    return null;
+  });
+  if (!commits) {
+    return;
+  }
+  const pushState = await readPushState(cwd, run.branch).catch(() => null);
+  // Only worth looking for a PR once something has been pushed: a branch that
+  // has never left the machine cannot have one.
+  const prUrl = pushState === 'PUSHED' || pushState === 'AHEAD'
+    ? await findPullRequest(cwd, run.branch).catch(() => null)
+    : null;
+
+  await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/commits`, {
+    method: 'POST',
+    body: { commits, pushState, prUrl, baseCommit: base },
+  }).catch((failure) => log(`  could not record the commits: ${failure.message}`));
 }
 
 // --- talking to a live session -----------------------------------------------
@@ -705,6 +853,8 @@ async function startRun(config, offered) {
   const path = project?.path;
   let runToken;
   let defaultBranch;
+  // Where the branch stood when this run took it over.
+  let baseCommit;
 
   try {
     log(`claiming ${run.projectSlug} ${run.label} on ${run.branch}`);
@@ -727,7 +877,9 @@ async function startRun(config, offered) {
   }
 
   try {
-    const branch = await prepareWorkingCopy(resolve(path), run.branch, defaultBranch);
+    const prepared = await prepareWorkingCopy(resolve(path), run.branch, defaultBranch);
+    const branch = prepared.branch;
+    baseCommit = prepared.base;
     log(`  working copy ${path} is on ${branch}`);
 
     await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/transition`, {
@@ -735,7 +887,7 @@ async function startRun(config, offered) {
       body: { state: 'RUNNING' },
     });
 
-    await spawnAgent(config, run, runToken, resolve(path));
+    await spawnAgent(config, run, runToken, resolve(path), baseCommit);
   } catch (failure) {
     // Anything that goes wrong before or during the spawn is the run's failure,
     // and the reason belongs on the run where someone will see it.
@@ -757,7 +909,7 @@ async function startRun(config, offered) {
  * `cawdr_` token bound to one run, which expires with it — so the worst a
  * confused or misbehaving session can do is act on the run it was started for.
  */
-async function spawnAgent(config, run, runToken, cwd) {
+async function spawnAgent(config, run, runToken, cwd, baseCommit) {
   const mcpDirectory = await mkdtemp(join(tmpdir(), 'cawdev-runner-'));
   const mcpConfigPath = join(mcpDirectory, 'mcp.json');
 
@@ -873,7 +1025,7 @@ async function spawnAgent(config, run, runToken, cwd) {
     // Prompts typed in the console, written into the live session.
     const prompts = deliverPrompts(config, run, child);
     // And what the console can see of the checkout, plus anything it asks of it.
-    const workingCopy = watchWorkingCopy(config, run, cwd);
+    const workingCopy = watchWorkingCopy(config, run, cwd, baseCommit);
 
     child.on('error', async (failure) => {
       prompts.stop();
@@ -887,6 +1039,10 @@ async function spawnAgent(config, run, runToken, cwd) {
     child.on('exit', async (code, signal) => {
       prompts.stop();
       workingCopy.stop();
+      // The last reading, after the agent has stopped changing things. It
+      // usually lands *after* the run is already FINISHED, because the agent
+      // ends its own run by reporting — which the API allows for exactly this.
+      await reportCommits(config, run, cwd, baseCommit);
       // Flushed before the transition, so the last thing the session said is
       // already readable when its state changes to FINISHED.
       await transcript.flush();
