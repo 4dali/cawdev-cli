@@ -62,6 +62,10 @@ node --test "tools/**/*.test.mjs"
 two stop agreeing, the generated file churns on every export and its diff stops
 meaning "the roadmap changed".
 
+`tools/lib/usage.test.mjs` covers what a turn reports. One of its tests asserts
+that **no dollar figure reaches a transcript**: the CLI quotes list prices, and
+a subscription does not work that way.
+
 ## `tools/mcp/`
 
 The MCP server an agent talks to — one zero-dependency file, stdio JSON-RPC.

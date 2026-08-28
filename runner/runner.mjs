@@ -15,6 +15,7 @@ import { spawn } from 'node:child_process';
 import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { describeTurn } from '../lib/usage.mjs';
 
 // --- configuration -----------------------------------------------------------
 
@@ -362,14 +363,11 @@ function linesOf(event, raw) {
     }
 
     case 'result':
-      return [{
-        kind: event.is_error ? 'ERROR' : 'SYSTEM',
-        body: `turn ended (${event.subtype ?? 'done'})`
-          + (event.duration_ms ? ` in ${Math.round(event.duration_ms / 1000)}s` : '')
-          + (typeof event.total_cost_usd === 'number'
-            ? `, $${event.total_cost_usd.toFixed(4)} so far`
-            : ''),
-      }];
+      // Tokens, not dollars. `total_cost_usd` is a list-price equivalent, not a
+      // bill — the event says so itself with `costBasis: "list"` — so showing
+      // it to somebody on a subscription names a number they will never be
+      // charged. See tools/lib/usage.mjs.
+      return [{ kind: event.is_error ? 'ERROR' : 'SYSTEM', body: describeTurn(event) }];
 
     default:
       return [];
