@@ -452,6 +452,30 @@ try {
     pushed.pushState === 'PUSHED' && pushed.prUrl?.endsWith('/pull/7'),
     JSON.stringify([pushed.pushState, pushed.prUrl]));
 
+  // --- R27: a session that talks about cawdev rather than coding ------------
+
+  const question = await console_(`/api/projects/${project}/runs/ask`, {
+    method: 'POST',
+    body: JSON.stringify({ prompt: 'Which cards are in CODING?', alsoReaches: [] }),
+  });
+  check('a question has no branch, because nothing is prepared for it',
+    question.kind === 'ASK' && question.branch === null,
+    JSON.stringify([question.kind, question.branch]));
+  check('and it reaches the project it was asked in',
+    question.reaches?.includes(project), JSON.stringify(question.reaches));
+
+  // A run token is granted every project the question spans, and no others.
+  const asker = await asToken(runnerToken, `/api/runners/${runner.id}/claim/${question.id}`);
+  const reachable = await fetch(`${BASE}/api/projects/${project}/roadmap?brief=true`, {
+    headers: { authorization: `Bearer ${asker.runToken}` },
+  });
+  check('its token can read the roadmap it was asked about', reachable.status === 200);
+
+  await console_(`/api/projects/${project}/runs/${question.id}/transition`, {
+    method: 'POST',
+    body: JSON.stringify({ state: 'CANCELLED', summary: 'Question check done.' }),
+  });
+
   const liveNow = await console_('/api/runs/live');
   const thisOne = liveNow.find((each) => each.run.id === session.id);
   check('the live page shows the session across projects, with its tail',

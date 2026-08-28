@@ -269,6 +269,32 @@ async function prepareWorkingCopy(path, branch, defaultBranch) {
  * it the task here would be a second copy that can disagree with the entry.
  */
 function promptFor(run) {
+  if (run.kind === 'ASK') {
+    // No working method, because there is no work: this session exists to use
+    // cawdev's own tools and answer. It has no permission to edit or run
+    // anything, so telling it to "build" would be instructions it cannot follow.
+    return `You are answering a question about cawdev itself — its roadmap, its
+changelog, and what its agents have been doing. You have the cawdev MCP tools and
+nothing else: no file edits, no shell, no git.
+
+Start with \`roadmap_where\` to see which platform and projects you can reach.
+${run.reaches?.length > 1 ? `This question spans ${run.reaches.join(', ')} — pass \`project\` on each call.` : ''}
+
+Use \`roadmap_list\`, \`roadmap_get\` and \`changelog_list\` to find things out
+rather than guessing, and say plainly when the answer is not there.
+
+If you are asked to change something — add an entry, correct a changelog line —
+do it with the tools and say what you did. If a decision is genuinely the
+person's, use \`ask_user\` and wait.
+
+Report your answer with \`report\` kind "done" when you are finished. That is how
+they see it.
+
+They asked:
+
+${run.openingPrompt}`;
+  }
+
   if (run.kind === 'MANUAL') {
     // A manual session has no entry to read and no "Done when" to satisfy.
     // What it has is what the person typed, and the branch it is on — so say
@@ -776,6 +802,32 @@ async function reportCommits(config, run, cwd, base) {
 
 // --- talking to a live session -----------------------------------------------
 
+/**
+ * The spawn arguments for a question, from the ones for coding.
+ *
+ * Everything up to `--allowedTools` is kept — the output format, the streaming
+ * input, the model — and the permissions are replaced with the cawdev tools
+ * alone. `acceptEdits` goes too: a session that cannot write files has no use
+ * for permission to.
+ */
+function askArgs(agentArgs) {
+  const kept = [];
+  for (let i = 0; i < agentArgs.length; i++) {
+    if (agentArgs[i] === '--allowedTools') {
+      break; // variadic: everything after it is a permission
+    }
+    if (agentArgs[i] === '--permission-mode') {
+      i += 1;
+      continue;
+    }
+    kept.push(agentArgs[i]);
+  }
+  return [...kept, '--allowedTools', ...CAWDEV_TOOLS];
+}
+
+/** Every cawdev MCP tool, which is the whole of what a question may use. */
+const CAWDEV_TOOLS = DEFAULTS.agentArgs.filter((arg) => arg.startsWith('mcp__cawdev__'));
+
 /** One user message, in the shape `--input-format stream-json` expects. */
 function writeUserMessage(child, text) {
   child.stdin.write(
@@ -877,9 +929,17 @@ async function startRun(config, offered) {
   }
 
   try {
-    const prepared = await prepareWorkingCopy(resolve(path), run.branch, defaultBranch);
-    const branch = prepared.branch;
-    baseCommit = prepared.base;
+    let branch = run.branch;
+    if (run.kind === 'ASK') {
+      // Nothing is prepared. It cuts no branch, and a dirty tree does not stop
+      // it, because it is not going to write to one — refusing here would make
+      // "what is R12 about?" unanswerable while somebody has edits open.
+      log('  a question: no branch, no working copy prepared');
+    } else {
+      const prepared = await prepareWorkingCopy(resolve(path), run.branch, defaultBranch);
+      branch = prepared.branch;
+      baseCommit = prepared.base;
+    }
     log(`  working copy ${path} is on ${branch}`);
 
     await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/transition`, {
@@ -949,10 +1009,16 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit) {
   // defaults finish with. If a custom agentArgs has no --allowedTools at all,
   // the flag is added rather than the extras being silently swallowed by
   // whatever option happened to come last.
-  const extras = [
-    ...(config.allowedTools ?? []),
-    ...(config.projects[run.projectSlug]?.allowedTools ?? []),
-  ];
+  // An ASK session gets the cawdev tools and NOTHING else — no edits, no
+  // shell, no git. A session asked a question should not be able to answer it
+  // by changing something, and the project's own permissions are exactly what
+  // must not apply here.
+  const extras = run.kind === 'ASK'
+    ? []
+    : [
+        ...(config.allowedTools ?? []),
+        ...(config.projects[run.projectSlug]?.allowedTools ?? []),
+      ];
   const agentArgs = [...config.agentArgs];
 
   // Which model answers. Passed through verbatim — the CLI validates it, and a
@@ -968,7 +1034,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit) {
     }
     agentArgs.push(...extras);
   }
-  const args = ['--mcp-config', mcpConfigPath, ...agentArgs];
+  const args = ['--mcp-config', mcpConfigPath, ...(run.kind === 'ASK' ? askArgs(agentArgs) : agentArgs)];
   log(`  spawning: ${config.agentCommand} ${args.join(' ')} (prompt on stdin)`);
 
   return new Promise((resolvePromise) => {
