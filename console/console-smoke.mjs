@@ -471,6 +471,24 @@ try {
   });
   check('its token can read the roadmap it was asked about', reachable.status === 200);
 
+  // What a session creates is recorded, not read out of its prose.
+  const madeByRun = await asToken(asker.runToken,
+    `/api/projects/${project}/roadmap`,
+    { title: `a card from R${entry.number}'s question`, body: '**Build:** nothing.' });
+  const afterCreate = await console_(`/api/projects/${project}/runs/${question.id}`);
+  check('the run reports the card its session created',
+    afterCreate.created?.some((each) => each.number === madeByRun.number),
+    JSON.stringify(afterCreate.created));
+
+  // And a person's card afterwards is not attributed to it.
+  await console_(`/api/projects/${project}/roadmap`, {
+    method: 'POST',
+    body: JSON.stringify({ title: 'a card a person added, not the session' }),
+  });
+  check('a person’s card is not attributed to the run',
+    (await console_(`/api/projects/${project}/runs/${question.id}`)).created.length
+      === afterCreate.created.length);
+
   await console_(`/api/projects/${project}/runs/${question.id}/transition`, {
     method: 'POST',
     body: JSON.stringify({ state: 'CANCELLED', summary: 'Question check done.' }),
