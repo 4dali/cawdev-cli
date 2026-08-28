@@ -176,15 +176,24 @@ try {
   check('starting leaves the entry where it was — moving it is the agent\'s first act',
     (await console_(`/api/projects/${project}/roadmap/${entry.number}`)).status === 'PLANNED');
 
-  // One live run per project, because runs share a working copy. This is the
-  // refusal the entry page has to render, so it must read like a sentence.
-  const refused = await console_(`/api/projects/${project}/runs`, {
+  // Runs share a working copy, so only one RUNS at a time — but a second is
+  // queued behind it rather than refused. Being told to come back later and
+  // remember to press the button again is not a queue.
+  const second = await console_(`/api/projects/${project}/runs`, {
     method: 'POST',
-    expect: 409,
-    body: JSON.stringify({ entryNumber: entry.number, branch }),
+    body: JSON.stringify({ entryNumber: entry.number, branch: `${branch}-again` }),
   });
-  check('a second live run in the project is refused readably',
-    typeof refused?.message === 'string' && /run/i.test(refused.message), JSON.stringify(refused));
+  check('a second run is queued behind the first, not refused',
+    second.state === 'QUEUED' && second.queuedBehind === 1,
+    `${second.state} / behind ${second.queuedBehind}`);
+  check('the first is still at the front of the queue',
+    (await console_(`/api/projects/${project}/runs/${runId}`)).queuedBehind === 0);
+
+  // Tidied away so it does not hold the project's queue for the rest of this.
+  await console_(`/api/projects/${project}/runs/${second.id}/transition`, {
+    method: 'POST',
+    body: JSON.stringify({ state: 'CANCELLED', summary: 'Queue check done.' }),
+  });
 
   // --- watch ---------------------------------------------------------------
 
@@ -357,9 +366,10 @@ try {
       && withCopy.workingCopy.detail?.length === 2,
     JSON.stringify(withCopy.workingCopy));
 
+  const cardTitle = `a card from a session ${entry.number}`;
   const queuedCommit = await console_(`${sessionPath}/commit`, {
     method: 'POST',
-    body: JSON.stringify({ message: 'Commit from the console smoke.', entryTitle: 'a card from a session' }),
+    body: JSON.stringify({ message: 'Commit from the console smoke.', entryTitle: cardTitle }),
   });
   check('a commit is queued for the runner, not asked of the agent',
     queuedCommit.state === 'QUEUED' && queuedCommit.kind === 'COMMIT', JSON.stringify(queuedCommit));
@@ -375,7 +385,7 @@ try {
     JSON.stringify(settled));
 
   const after = await console_(`/api/projects/${project}/roadmap?brief=true`);
-  const card = after.find((e) => e.title === 'a card from a session');
+  const card = after.find((e) => e.title === cardTitle);
   check('a successful commit creates the named card, as CODING on the branch',
     after.length === cardsBefore + 1 && card?.status === 'CODING'
       && card.branch === session.branch,
