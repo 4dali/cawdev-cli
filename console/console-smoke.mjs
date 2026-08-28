@@ -110,9 +110,10 @@ async function asToken(token, path, body, method = 'POST') {
   return response.status === 204 ? null : response.json();
 }
 
-const runner = await asToken(runnerToken, '/api/runners', {
-  name: `console-smoke-${process.pid}`,
-});
+// A stable name, not one per process: registering is idempotent by
+// (owner, name), and a pid in it bred a new runner on every run — eighteen of
+// them before anybody noticed the list was mostly litter.
+const runner = await asToken(runnerToken, '/api/runners', { name: 'console-smoke' });
 
 // The console clears the way: an earlier live run would refuse this one, and
 // cancelling is a console action too.

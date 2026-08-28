@@ -1133,7 +1133,11 @@ async function main() {
 
   let stopping = false;
   for (const signal of ['SIGINT', 'SIGTERM']) {
-    process.on(signal, () => {
+    process.on(signal, async () => {
+      if (stopping) {
+        // A second Ctrl-C means "now", not "again".
+        process.exit(0);
+      }
       log('stopping; leaving any live run to the platform’s staleness sweep');
       stopping = true;
       clearInterval(heartbeat);
@@ -1144,6 +1148,17 @@ async function main() {
           // Already gone.
         }
       }
+
+      // Say so, rather than letting the console offer this runner for another
+      // two minutes while it waits out the staleness window. Bounded, because
+      // an unreachable platform must not be able to hang a shutdown — the
+      // silence will settle it either way.
+      await Promise.race([
+        api(config, `/api/runners/${config.runnerId}/goodbye`, { method: 'POST' })
+          .then(() => log('told the platform this runner has stopped'))
+          .catch((failure) => log(`  could not say goodbye: ${failure.message}`)),
+        sleep(2000),
+      ]);
       process.exit(0);
     });
   }
