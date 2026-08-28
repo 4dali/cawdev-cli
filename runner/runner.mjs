@@ -485,6 +485,147 @@ class Transcript {
   }
 }
 
+// --- the working copy --------------------------------------------------------
+
+/**
+ * What is uncommitted, as counts.
+ *
+ * `--numstat` against HEAD covers staged and unstaged together, which is what
+ * a person means by "what has it changed". Untracked files are counted
+ * separately: numstat cannot see them, and a session that writes three new
+ * files and edits nothing would otherwise report a clean tree.
+ */
+async function readWorkingCopy(cwd) {
+  const files = new Map();
+
+  const numstat = await git(cwd, ['diff', '--numstat', 'HEAD']).catch(() => '');
+  for (const line of numstat.split('\n')) {
+    if (!line.trim()) continue;
+    const [added, removed, ...rest] = line.split('\t');
+    const path = rest.join('\t');
+    if (!path) continue;
+    // A binary file reports "-" for both. Counting those as zero is honest:
+    // "3 lines changed" for a PNG would not be.
+    files.set(path, {
+      path,
+      insertions: Number(added) || 0,
+      deletions: Number(removed) || 0,
+    });
+  }
+
+  // Untracked files, counted as wholly new.
+  const untracked = await git(cwd, ['ls-files', '--others', '--exclude-standard']).catch(() => '');
+  for (const path of untracked.split('\n')) {
+    if (!path.trim() || files.has(path)) continue;
+    const lines = await countLines(join(cwd, path));
+    files.set(path, { path, insertions: lines, deletions: 0 });
+  }
+
+  const detail = [...files.values()].sort((a, b) => a.path.localeCompare(b.path));
+  return {
+    files: detail.length,
+    insertions: detail.reduce((sum, file) => sum + file.insertions, 0),
+    deletions: detail.reduce((sum, file) => sum + file.deletions, 0),
+    detail: JSON.stringify(detail),
+  };
+}
+
+/** Lines in a new file. Unreadable or binary counts as zero rather than failing. */
+async function countLines(path) {
+  try {
+    const text = await readFile(path, 'utf8');
+    if (text.includes('\0')) {
+      return 0;
+    }
+    return text ? text.split('\n').length - (text.endsWith('\n') ? 1 : 0) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Keeps the platform's picture of the checkout current, and performs whatever
+ * a person has asked of it.
+ *
+ * One loop for both because they are the same concern and share a cadence: a
+ * commit changes the working copy, so reporting immediately after one is how
+ * the counts drop to zero in the console without waiting for the next tick.
+ */
+function watchWorkingCopy(config, run, cwd) {
+  let stopped = false;
+
+  (async () => {
+    let last = null;
+    while (!stopped) {
+      const state = await readWorkingCopy(cwd).catch((failure) => {
+        log(`  could not read the working copy: ${failure.message}`);
+        return null;
+      });
+
+      if (stopped) return;
+
+      // Only when it changed: a session that thinks for a minute should not
+      // generate a request a second saying the same thing.
+      const fingerprint = state && `${state.files}:${state.insertions}:${state.deletions}`;
+      if (state && fingerprint !== last) {
+        last = fingerprint;
+        await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/working-copy`, {
+          method: 'POST',
+          body: state,
+        }).catch((failure) => log(`  could not report the working copy: ${failure.message}`));
+      }
+
+      const actions = await api(
+        config,
+        `/api/projects/${run.projectSlug}/runs/${run.id}/actions/claim`,
+        { method: 'POST' },
+      ).catch((failure) => {
+        log(`  could not read actions: ${failure.message}`);
+        return [];
+      });
+
+      for (const action of actions ?? []) {
+        if (stopped) return;
+        await perform(config, run, cwd, action);
+        last = null; // The tree changed; report it on the next pass.
+      }
+
+      await sleep(3000);
+    }
+  })();
+
+  return { stop: () => { stopped = true; } };
+}
+
+/** Does what was asked, and says how it went either way. */
+async function perform(config, run, cwd, action) {
+  let ok = false;
+  let result;
+
+  if (action.kind === 'COMMIT') {
+    log(`  committing on ${run.branch}: ${(action.message ?? '').slice(0, 60)}`);
+    try {
+      await git(cwd, ['add', '-A']);
+      // --no-verify is deliberately NOT passed: a repository's hooks are its
+      // own business, and a commit that its own hooks reject should fail here
+      // rather than land because it came from a button.
+      await git(cwd, ['commit', '-m', action.message ?? 'Committed from the cawdev console']);
+      result = await git(cwd, ['rev-parse', '--short', 'HEAD']);
+      ok = true;
+    } catch (failure) {
+      result = failure.message;
+    }
+  } else {
+    result = `This runner does not know how to ${action.kind}.`;
+  }
+
+  await api(
+    config,
+    `/api/projects/${run.projectSlug}/runs/${run.id}/actions/${action.id}/finished`,
+    { method: 'POST', body: { ok, result: String(result).slice(0, 4000) } },
+  ).catch((failure) => log(`  could not report the action: ${failure.message}`));
+}
+
 // --- talking to a live session -----------------------------------------------
 
 /** One user message, in the shape `--input-format stream-json` expects. */
@@ -731,9 +872,12 @@ async function spawnAgent(config, run, runToken, cwd) {
 
     // Prompts typed in the console, written into the live session.
     const prompts = deliverPrompts(config, run, child);
+    // And what the console can see of the checkout, plus anything it asks of it.
+    const workingCopy = watchWorkingCopy(config, run, cwd);
 
     child.on('error', async (failure) => {
       prompts.stop();
+      workingCopy.stop();
       await transcript.flush();
       await finish(config, run, 'FAILED', `Could not spawn the agent: ${failure.message}`);
       await rm(mcpDirectory, { recursive: true, force: true });
@@ -742,6 +886,7 @@ async function spawnAgent(config, run, runToken, cwd) {
 
     child.on('exit', async (code, signal) => {
       prompts.stop();
+      workingCopy.stop();
       // Flushed before the transition, so the last thing the session said is
       // already readable when its state changes to FINISHED.
       await transcript.flush();

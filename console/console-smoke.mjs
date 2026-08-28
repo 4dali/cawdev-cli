@@ -340,6 +340,66 @@ try {
     sessionThread[0]?.sentByEmail === EMAIL && sessionThread[0].delivered === true,
     JSON.stringify(sessionThread));
 
+  // --- R24: the working copy, and committing it -----------------------------
+
+  await asToken(runnerToken, `${sessionPath}/working-copy`, {
+    files: 2,
+    insertions: 120,
+    deletions: 8,
+    detail: JSON.stringify([
+      { path: 'src/one.ts', insertions: 100, deletions: 8 },
+      { path: 'src/two.ts', insertions: 20, deletions: 0 },
+    ]),
+  });
+  const withCopy = await console_(sessionPath);
+  check('the run carries what the runner saw in the checkout',
+    withCopy.workingCopy?.files === 2 && withCopy.workingCopy.insertions === 120
+      && withCopy.workingCopy.detail?.length === 2,
+    JSON.stringify(withCopy.workingCopy));
+
+  const queuedCommit = await console_(`${sessionPath}/commit`, {
+    method: 'POST',
+    body: JSON.stringify({ message: 'Commit from the console smoke.', entryTitle: 'a card from a session' }),
+  });
+  check('a commit is queued for the runner, not asked of the agent',
+    queuedCommit.state === 'QUEUED' && queuedCommit.kind === 'COMMIT', JSON.stringify(queuedCommit));
+
+  const claimed2 = await asToken(runnerToken, `${sessionPath}/actions/claim`, {});
+  check('the runner claims it', claimed2.length === 1 && claimed2[0].id === queuedCommit.id,
+    JSON.stringify(claimed2));
+
+  const cardsBefore = (await console_(`/api/projects/${project}/roadmap?brief=true`)).length;
+  const settled = await asToken(runnerToken,
+    `${sessionPath}/actions/${queuedCommit.id}/finished`, { ok: true, result: 'abc1234' });
+  check('the action settles with the sha', settled.state === 'DONE' && settled.result === 'abc1234',
+    JSON.stringify(settled));
+
+  const after = await console_(`/api/projects/${project}/roadmap?brief=true`);
+  const card = after.find((e) => e.title === 'a card from a session');
+  check('a successful commit creates the named card, as CODING on the branch',
+    after.length === cardsBefore + 1 && card?.status === 'CODING'
+      && card.branch === session.branch,
+    JSON.stringify(card));
+
+  const adopted = await console_(sessionPath);
+  check('the session is attached to the card it produced',
+    adopted.entryNumber === card?.number, `${adopted.entryNumber} vs ${card?.number}`);
+
+  // Nothing to commit must be refused BEFORE a card is created — entries
+  // cannot be deleted, so a stray one would be permanent.
+  await asToken(runnerToken, `${sessionPath}/working-copy`,
+    { files: 0, insertions: 0, deletions: 0 });
+  const refused2 = await console_(`${sessionPath}/commit`, {
+    method: 'POST',
+    expect: 409,
+    body: JSON.stringify({ message: 'nothing here', entryTitle: 'should never exist' }),
+  });
+  check('committing a clean tree is refused readably',
+    /nothing to commit/i.test(refused2?.message ?? ''), JSON.stringify(refused2));
+  check('and no card was created for it',
+    (await console_(`/api/projects/${project}/roadmap?brief=true`))
+      .every((e) => e.title !== 'should never exist'));
+
   const liveNow = await console_('/api/runs/live');
   const thisOne = liveNow.find((each) => each.run.id === session.id);
   check('the live page shows the session across projects, with its tail',
