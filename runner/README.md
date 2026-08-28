@@ -62,8 +62,14 @@ runner rather than a third entry in the list.
 Cancelling a run reaches the daemon on its next poll and takes down the child's
 whole process group — an agent that started a build should not leave it running.
 
-**One run at a time per working copy.** Runs share a checkout, so a second
-session in the same directory would fight the first; the rest queue.
+**One run at a time per working copy** — for runs that use one. Coding runs
+share a checkout, so a second in the same directory would fight the first; the
+rest queue.
+
+**Questions are not serialised.** An `ASK` run prepares nothing and writes
+nothing, so it runs alongside whatever else is going on — you can ask about a
+project while an agent is working in it. `maxSessions` (4 by default) bounds how
+many agent processes this machine will host at once.
 
 ## If the daemon dies mid-run
 

@@ -29,6 +29,14 @@ const DEFAULTS = {
    */
   agentCommand: 'claude',
   /**
+   * How many agent processes this machine will host at once.
+   *
+   * Only ASK runs can be concurrent — the others hold a working copy each — so
+   * in practice this bounds how many questions can be in flight. Without a
+   * bound, a queue of them is a fork bomb with better manners.
+   */
+  maxSessions: 4,
+  /**
    * Verified against Claude Code 2.1.247.
    *
    * `--permission-mode acceptEdits` matters more than it looks: a spawned agent
@@ -116,6 +124,7 @@ async function readConfig() {
     token: process.env.CAWDEV_TOKEN ?? file.token,
     name: process.env.CAWDEV_RUNNER_NAME ?? file.name ?? DEFAULTS.name,
     agentCommand: process.env.CAWDEV_AGENT_COMMAND ?? file.agentCommand ?? DEFAULTS.agentCommand,
+    maxSessions: file.maxSessions ?? DEFAULTS.maxSessions,
     // Which projects this runner serves, and where their working copies are.
     projects: normaliseProjects(file.projects ?? {}),
     /**
@@ -1053,6 +1062,8 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit) {
     });
 
     child.cawdevProjectSlug = run.projectSlug;
+    // What kind it is, so the queue knows whether it holds the working copy.
+    child.cawdevKind = run.kind;
     running.set(run.id, child);
 
     // The opening instruction, as a user message. stdin is NOT closed: the
@@ -1233,10 +1244,18 @@ async function main() {
     try {
       await reapCancelled(config);
 
-      // One run at a time per working copy: runs share a checkout, so a second
-      // session in the same directory would fight the first.
+      // One run at a time per working copy — but only for runs that USE one.
+      //
+      // ENTRY and MANUAL runs share a checkout, so a second in the same
+      // directory would fight the first. An ASK run prepares nothing and writes
+      // nothing, so it has no reason to wait behind them: making it queue meant
+      // you could not ask a question about a project while anything was running
+      // there, which is exactly when you would want to.
       const busy = new Set(
-        [...running.values()].map((child) => child.cawdevProjectSlug).filter(Boolean),
+        [...running.values()]
+          .filter((child) => child.cawdevKind !== 'ASK')
+          .map((child) => child.cawdevProjectSlug)
+          .filter(Boolean),
       );
 
       const offers = await api(
@@ -1252,8 +1271,14 @@ async function main() {
         if (taken.has(offered.run.id)) {
           continue; // Already being claimed or prepared by us.
         }
-        if (busy.has(slug)) {
+        if (offered.run.kind !== 'ASK' && busy.has(slug)) {
           log(`${slug} already has a run here; leaving "${offered.run.label}" queued`);
+          continue;
+        }
+        if (running.size >= config.maxSessions) {
+          // A bound on how many agent processes this machine will host at once.
+          // Without it a queue of questions is a fork bomb with better manners.
+          log(`at ${config.maxSessions} sessions; leaving "${offered.run.label}" queued`);
           continue;
         }
         busy.add(slug);
