@@ -632,6 +632,44 @@ const TOOLS = [
   },
 
   {
+    name: 'propose_entry',
+    description:
+      'Record something an audit found, as a proposed roadmap entry. A PERSON decides which ' +
+      'proposals become entries — you are not creating one, you are suggesting it. Severity is ' +
+      '"critical" (broken, unsafe, or loses data), "medium" (it will hurt, but not today) or ' +
+      '"minor" (worth doing, nobody is bleeding). Write each one as an entry would be written, ' +
+      'and say where in the code you saw it. Only an audit session may use this.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        severity: { type: 'string', enum: ['critical', 'medium', 'minor'] },
+        title: { type: 'string', description: 'Short enough to scan in a list.' },
+        body: {
+          type: 'string',
+          description:
+            'Markdown: what and why, a **Build:** list, and a **Done when:** condition.',
+        },
+      },
+      required: ['severity', 'title', 'body'],
+    },
+    handler: async (config, args) => {
+      const { runId, project } = await requireRun(config);
+      const proposal = await api(config, `/api/projects/${project}/runs/${runId}/proposals`, {
+        method: 'POST',
+        body: {
+          severity: args.severity.toUpperCase(),
+          title: args.title,
+          body: args.body,
+        },
+      });
+      return (
+        `Proposed #${proposal.seq}: ${proposal.severity} — ${proposal.title}. ` +
+        `It is not on the roadmap: somebody will decide.`
+      );
+    },
+  },
+
+  {
     name: 'ask_user',
     description:
       'Ask the person who started this run, and wait for their answer. Use it when a decision is ' +

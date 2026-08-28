@@ -278,6 +278,10 @@ async function prepareWorkingCopy(path, branch, defaultBranch) {
  * it the task here would be a second copy that can disagree with the entry.
  */
 function promptFor(run) {
+  if (run.profile && run.profile !== 'CODE') {
+    return promptForProfile(run);
+  }
+
   if (run.kind === 'ASK') {
     // No working method, because there is no work: this session exists to use
     // cawdev's own tools and answer. It has no permission to edit or run
@@ -811,15 +815,45 @@ async function reportCommits(config, run, cwd, base) {
 
 // --- talking to a live session -----------------------------------------------
 
+// --- what each profile may do ------------------------------------------------
+//
+// The profile decides the PERMISSIONS, not merely the prompt. A session told
+// not to touch the code but able to is one refusal away from touching it; a
+// session that cannot has nothing to decide, and nothing to be talked out of.
+
+/** Every cawdev MCP tool the runner knows about, from the coding defaults. */
+const CAWDEV_TOOLS = DEFAULTS.agentArgs.filter((arg) => arg.startsWith('mcp__cawdev__'));
+
+const READ_ONLY_CAWDEV = CAWDEV_TOOLS.filter(
+  (tool) => !/(create|update|set_status|decline|add)$/.test(tool),
+);
+
+const ROADMAP_WRITE_CAWDEV = CAWDEV_TOOLS;
+
 /**
- * The spawn arguments for a question, from the ones for coding.
+ * Reading the code without being able to change it.
+ *
+ * Named individually rather than reached with a permission mode: `Read` and
+ * `Grep` are the tools an audit needs, and `Edit`, `Write` and `Bash` are
+ * exactly the ones it must not have.
+ */
+const READ_FILES = ['Read', 'Grep', 'Glob'];
+
+const PROFILE_TOOLS = {
+  ASK: READ_ONLY_CAWDEV,
+  ROADMAP: ROADMAP_WRITE_CAWDEV,
+  AUDIT: [...READ_ONLY_CAWDEV, 'mcp__cawdev__propose_entry', ...READ_FILES],
+};
+
+/**
+ * The spawn arguments for a session that does not write code.
  *
  * Everything up to `--allowedTools` is kept — the output format, the streaming
- * input, the model — and the permissions are replaced with the cawdev tools
- * alone. `acceptEdits` goes too: a session that cannot write files has no use
- * for permission to.
+ * input, the model — and the permissions are replaced with the profile's own.
+ * `--permission-mode acceptEdits` goes too: a session that cannot write files
+ * has no use for permission to.
  */
-function askArgs(agentArgs) {
+function argsForProfile(agentArgs, profile) {
   const kept = [];
   for (let i = 0; i < agentArgs.length; i++) {
     if (agentArgs[i] === '--allowedTools') {
@@ -831,11 +865,74 @@ function askArgs(agentArgs) {
     }
     kept.push(agentArgs[i]);
   }
-  return [...kept, '--allowedTools', ...CAWDEV_TOOLS];
+  return [...kept, '--allowedTools', ...(PROFILE_TOOLS[profile] ?? READ_ONLY_CAWDEV)];
 }
 
-/** Every cawdev MCP tool, which is the whole of what a question may use. */
-const CAWDEV_TOOLS = DEFAULTS.agentArgs.filter((arg) => arg.startsWith('mcp__cawdev__'));
+/** What each profile is asked to do, in its own words. */
+function promptForProfile(run) {
+  const spans = run.reaches?.length > 1
+    ? `This spans ${run.reaches.join(', ')} — pass \`project\` on each call.\n`
+    : '';
+
+  if (run.profile === 'ROADMAP') {
+    return `You are working on a roadmap in the cawdev platform. You have the cawdev MCP
+tools and nothing else: you cannot edit files, run commands, or use git, and you
+should not offer to.
+${spans}
+Start with \`roadmap_where\`, then \`roadmap_list\` to see what is already recorded.
+Read two or three existing entries before writing one, and match their shape: prose
+saying what and why, a **Build:** list, and a **Done when:** condition somebody
+could check.
+
+If a decision is genuinely the person's, use \`ask_user\` and wait. Report what you
+did with \`report\` kind "done".
+
+They asked:
+
+${run.openingPrompt}`;
+  }
+
+  if (run.profile === 'AUDIT') {
+    return `You are auditing this repository for the cawdev platform. You can READ the code
+and the roadmap; you cannot change either. No edits, no commands, no git — and no
+creating roadmap entries directly.
+
+What you find becomes a **proposal** with \`propose_entry\`, one per finding, each
+with a severity:
+
+- \`critical\` — it is broken, unsafe, or loses data
+- \`medium\` — it will hurt, but not today
+- \`minor\` — worth doing, nobody is bleeding
+
+A person decides which proposals become roadmap entries, so write each one as an
+entry would be written: a title somebody can scan, then prose, a **Build:** list
+and a **Done when:** condition. Say where in the code you saw it.
+
+Then \`report\` kind "done" with the report itself — what you looked at, what you
+found, and what you deliberately did not check. Twenty vague findings are worth
+less than four you can point at.
+
+They asked:
+
+${run.openingPrompt}`;
+  }
+
+  // ASK
+  return `You are answering a question about cawdev itself — its roadmap, its changelog,
+and what its agents have been doing. You have read-only cawdev tools and nothing
+else: no file edits, no shell, no git, and you cannot change the roadmap. If you
+are asked to change something, say that this session cannot and what could.
+${spans}
+Start with \`roadmap_where\`. Use \`roadmap_list\`, \`roadmap_get\` and
+\`changelog_list\` to find things out rather than guessing, and say plainly when
+the answer is not there.
+
+Report your answer with \`report\` kind "done". That is how they see it.
+
+They asked:
+
+${run.openingPrompt}`;
+}
 
 /** One user message, in the shape `--input-format stream-json` expects. */
 function writeUserMessage(child, text) {
@@ -939,11 +1036,11 @@ async function startRun(config, offered) {
 
   try {
     let branch = run.branch;
-    if (run.kind === 'ASK') {
+    if (run.profile && run.profile !== 'CODE') {
       // Nothing is prepared. It cuts no branch, and a dirty tree does not stop
       // it, because it is not going to write to one — refusing here would make
       // "what is R12 about?" unanswerable while somebody has edits open.
-      log('  a question: no branch, no working copy prepared');
+      log(`  a ${run.profile.toLowerCase()} session: no branch, nothing prepared`);
     } else {
       const prepared = await prepareWorkingCopy(resolve(path), run.branch, defaultBranch);
       branch = prepared.branch;
@@ -1022,7 +1119,10 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit) {
   // shell, no git. A session asked a question should not be able to answer it
   // by changing something, and the project's own permissions are exactly what
   // must not apply here.
-  const extras = run.kind === 'ASK'
+  // A project's own permissions apply to coding only. A project that permits
+  // `mvn` for building has said nothing about permitting it to a session that
+  // was asked a question.
+  const extras = run.profile && run.profile !== 'CODE'
     ? []
     : [
         ...(config.allowedTools ?? []),
@@ -1043,7 +1143,12 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit) {
     }
     agentArgs.push(...extras);
   }
-  const args = ['--mcp-config', mcpConfigPath, ...(run.kind === 'ASK' ? askArgs(agentArgs) : agentArgs)];
+  const writesCode = !run.profile || run.profile === 'CODE';
+  const args = [
+    '--mcp-config',
+    mcpConfigPath,
+    ...(writesCode ? agentArgs : argsForProfile(agentArgs, run.profile)),
+  ];
   log(`  spawning: ${config.agentCommand} ${args.join(' ')} (prompt on stdin)`);
 
   return new Promise((resolvePromise) => {
@@ -1063,7 +1168,8 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit) {
 
     child.cawdevProjectSlug = run.projectSlug;
     // What kind it is, so the queue knows whether it holds the working copy.
-    child.cawdevKind = run.kind;
+    // Whether it holds the working copy, which is what the queue serialises on.
+    child.cawdevWritesCode = writesCode;
     running.set(run.id, child);
 
     // The opening instruction, as a user message. stdin is NOT closed: the
@@ -1253,7 +1359,7 @@ async function main() {
       // there, which is exactly when you would want to.
       const busy = new Set(
         [...running.values()]
-          .filter((child) => child.cawdevKind !== 'ASK')
+          .filter((child) => child.cawdevWritesCode)
           .map((child) => child.cawdevProjectSlug)
           .filter(Boolean),
       );
@@ -1271,7 +1377,8 @@ async function main() {
         if (taken.has(offered.run.id)) {
           continue; // Already being claimed or prepared by us.
         }
-        if (offered.run.kind !== 'ASK' && busy.has(slug)) {
+        const writes = !offered.run.profile || offered.run.profile === 'CODE';
+        if (writes && busy.has(slug)) {
           log(`${slug} already has a run here; leaving "${offered.run.label}" queued`);
           continue;
         }

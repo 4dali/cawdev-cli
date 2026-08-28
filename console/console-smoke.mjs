@@ -458,9 +458,11 @@ try {
     method: 'POST',
     body: JSON.stringify({ prompt: 'Which cards are in CODING?', alsoReaches: [] }),
   });
+  // R28 split what a run is ABOUT (kind) from what it may DO (profile): a
+  // question is a MANUAL run with an ASK profile, not a kind of its own.
   check('a question has no branch, because nothing is prepared for it',
-    question.kind === 'ASK' && question.branch === null,
-    JSON.stringify([question.kind, question.branch]));
+    question.profile === 'ASK' && question.kind === 'MANUAL' && question.branch === null,
+    JSON.stringify([question.kind, question.profile, question.branch]));
   check('and it reaches the project it was asked in',
     question.reaches?.includes(project), JSON.stringify(question.reaches));
 
@@ -492,6 +494,50 @@ try {
   await console_(`/api/projects/${project}/runs/${question.id}/transition`, {
     method: 'POST',
     body: JSON.stringify({ state: 'CANCELLED', summary: 'Question check done.' }),
+  });
+
+  // --- R28: profiles, and what an audit proposes ----------------------------
+
+  const audit = await console_(`/api/projects/${project}/runs/ask`, {
+    method: 'POST',
+    body: JSON.stringify({ prompt: 'look at everything', profile: 'AUDIT' }),
+  });
+  check('an audit has no branch and its own profile',
+    audit.profile === 'AUDIT' && audit.kind === 'MANUAL' && audit.branch === null,
+    JSON.stringify([audit.kind, audit.profile, audit.branch]));
+
+  const coding = await console_(`/api/projects/${project}/runs/ask`, {
+    method: 'POST',
+    expect: 400,
+    body: JSON.stringify({ prompt: 'x', profile: 'CODE' }),
+  });
+  check('a CODE profile is refused by the endpoint for sessions that do not code',
+    /writes code/i.test(coding?.message ?? ''), JSON.stringify(coding));
+
+  const auditor = await asToken(runnerToken, `/api/runners/${runner.id}/claim/${audit.id}`);
+  const finding = await asToken(auditor.runToken,
+    `/api/projects/${project}/runs/${audit.id}/proposals`,
+    { severity: 'CRITICAL', title: 'a finding', body: '**Build:** fix it.' });
+  check('an audit proposes rather than creating', finding.accepted === false,
+    JSON.stringify(finding));
+  check('and nothing reached the roadmap',
+    (await console_(`/api/projects/${project}/runs/${audit.id}`)).created.length === 0);
+
+  const accepted = await console_(
+    `/api/projects/${project}/runs/${audit.id}/proposals/${finding.id}/accept`,
+    { method: 'POST' });
+  check('a person accepting it creates the entry',
+    accepted.accepted && typeof accepted.entryNumber === 'number', JSON.stringify(accepted));
+
+  const twice = await console_(
+    `/api/projects/${project}/runs/${audit.id}/proposals/${finding.id}/accept`,
+    { method: 'POST', expect: 409 });
+  check('accepting twice is refused — entries cannot be deleted',
+    /already on the roadmap/i.test(twice?.message ?? ''), JSON.stringify(twice));
+
+  await console_(`/api/projects/${project}/runs/${audit.id}/transition`, {
+    method: 'POST',
+    body: JSON.stringify({ state: 'CANCELLED', summary: 'Audit check done.' }),
   });
 
   const liveNow = await console_('/api/runs/live');
