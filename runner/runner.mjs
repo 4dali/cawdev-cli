@@ -1005,6 +1005,23 @@ const running = new Map();
  */
 const taken = new Set();
 
+/**
+ * Runs we have already said we are leaving queued.
+ *
+ * The queue re-offers them on every poll, and saying so every time buries
+ * anything worth reading. Said once, and again only if the run goes away and
+ * comes back.
+ */
+const noted = new Set();
+
+function noteQueued(run, why) {
+  if (noted.has(run.id)) {
+    return;
+  }
+  noted.add(run.id);
+  log(`${why}; leaving "${run.label}" queued`);
+}
+
 async function startRun(config, offered) {
   const run = offered.run;
   const project = config.projects[run.projectSlug];
@@ -1350,6 +1367,11 @@ async function main() {
     try {
       await reapCancelled(config);
 
+      const offers = await api(
+        config,
+        `/api/runners/${config.runnerId}/queue?wait=${config.pollSeconds}`,
+      );
+
       // One run at a time per working copy — but only for runs that USE one.
       //
       // ENTRY and MANUAL runs share a checkout, so a second in the same
@@ -1357,6 +1379,11 @@ async function main() {
       // nothing, so it has no reason to wait behind them: making it queue meant
       // you could not ask a question about a project while anything was running
       // there, which is exactly when you would want to.
+      //
+      // Computed AFTER the poll, not before. The poll blocks for up to
+      // pollSeconds, so a set built before it is a snapshot of the world as it
+      // was when the wait began — and a run that started during the wait was
+      // invisible. Two agents went into one checkout that way.
       const busy = new Set(
         [...running.values()]
           .filter((child) => child.cawdevWritesCode)
@@ -1364,10 +1391,8 @@ async function main() {
           .filter(Boolean),
       );
 
-      const offers = await api(
-        config,
-        `/api/runners/${config.runnerId}/queue?wait=${config.pollSeconds}`,
-      );
+      let claimable = 0;
+      let skipped = 0;
 
       for (const offered of offers) {
         const slug = offered.run.projectSlug;
@@ -1379,18 +1404,39 @@ async function main() {
         }
         const writes = !offered.run.profile || offered.run.profile === 'CODE';
         if (writes && busy.has(slug)) {
-          log(`${slug} already has a run here; leaving "${offered.run.label}" queued`);
+          noteQueued(offered.run, `${slug} already has a run here`);
+          skipped += 1;
           continue;
         }
         if (running.size >= config.maxSessions) {
           // A bound on how many agent processes this machine will host at once.
           // Without it a queue of questions is a fork bomb with better manners.
-          log(`at ${config.maxSessions} sessions; leaving "${offered.run.label}" queued`);
+          noteQueued(offered.run, `at ${config.maxSessions} sessions`);
+          skipped += 1;
           continue;
         }
         busy.add(slug);
         taken.add(offered.run.id);
+        noted.delete(offered.run.id);
+        claimable += 1;
         void startRun(config, offered);
+      }
+
+      // Forget runs that are no longer offered, so one that comes back around
+      // is reported again rather than staying silently skipped forever.
+      for (const id of [...noted]) {
+        if (!offers.some((offer) => offer.run.id === id)) {
+          noted.delete(id);
+        }
+      }
+
+      // The queue's long poll returns IMMEDIATELY when anything is waiting —
+      // that is what makes it useful. But a run we cannot take stays waiting,
+      // so asking again at once is a busy-wait: the loop spun at ~15ms and
+      // flooded the log with the same line. Nothing we are waiting for changes
+      // faster than a run finishing, so sleep before asking again.
+      if (!claimable && skipped) {
+        await sleep(config.pollSeconds * 1000);
       }
     } catch (failure) {
       log(`poll failed: ${failure.message}`);
