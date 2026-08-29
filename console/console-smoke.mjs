@@ -466,6 +466,32 @@ try {
   check('and it reaches the project it was asked in',
     question.reaches?.includes(project), JSON.stringify(question.reaches));
 
+  // Asking ABOUT a card records the card, so the console can link to it and the
+  // runner can name it — rather than it living only in the wording.
+  const aboutCard = await console_(`/api/projects/${project}/runs/ask`, {
+    method: 'POST',
+    body: JSON.stringify({ prompt: 'Why this one?', aboutEntry: entry.number }),
+  });
+  check('a question about a card records the card, and is still not a CODE run',
+    aboutCard.entryNumber === entry.number && aboutCard.profile === 'ASK'
+      && aboutCard.branch === null,
+    JSON.stringify([aboutCard.entryNumber, aboutCard.profile, aboutCard.branch]));
+  check('and the label is the question, not a preamble about the card',
+    aboutCard.label === 'Why this one?', aboutCard.label);
+
+  const noSuchCard = await console_(`/api/projects/${project}/runs/ask`, {
+    method: 'POST',
+    expect: 400,
+    body: JSON.stringify({ prompt: 'x', aboutEntry: 99999 }),
+  });
+  check('a card the project does not have is refused, rather than silently dropped',
+    /no R99999/.test(noSuchCard?.message ?? ''), JSON.stringify(noSuchCard));
+
+  await console_(`/api/projects/${project}/runs/${aboutCard.id}/transition`, {
+    method: 'POST',
+    body: JSON.stringify({ state: 'CANCELLED', summary: 'Card-reference check done.' }),
+  });
+
   // A run token is granted every project the question spans, and no others.
   const asker = await asToken(runnerToken, `/api/runners/${runner.id}/claim/${question.id}`);
   const reachable = await fetch(`${BASE}/api/projects/${project}/roadmap?brief=true`, {

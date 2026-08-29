@@ -874,11 +874,20 @@ function promptForProfile(run) {
     ? `This spans ${run.reaches.join(', ')} — pass \`project\` on each call.\n`
     : '';
 
+  // Which card, when the session is about one. The run records it rather than
+  // the question carrying "About R3 —" on its front, so this is where the agent
+  // is told — and `roadmap_get` is named because the title alone is not the
+  // entry, and guessing from a title is how you answer about the wrong card.
+  const about = run.entryNumber
+    ? `This is about **R${run.entryNumber} — ${run.entryTitle}**. Read it with `
+      + `\`roadmap_get\` before you answer.\n`
+    : '';
+
   if (run.profile === 'ROADMAP') {
     return `You are working on a roadmap in the cawdev platform. You have the cawdev MCP
 tools and nothing else: you cannot edit files, run commands, or use git, and you
 should not offer to.
-${spans}
+${spans}${about}
 Start with \`roadmap_where\`, then \`roadmap_list\` to see what is already recorded.
 Read two or three existing entries before writing one, and match their shape: prose
 saying what and why, a **Build:** list, and a **Done when:** condition somebody
@@ -896,7 +905,7 @@ ${run.openingPrompt}`;
     return `You are auditing this repository for the cawdev platform. You can READ the code
 and the roadmap; you cannot change either. No edits, no commands, no git — and no
 creating roadmap entries directly.
-
+${about}
 What you find becomes a **proposal** with \`propose_entry\`, one per finding, each
 with a severity:
 
@@ -922,7 +931,7 @@ ${run.openingPrompt}`;
 and what its agents have been doing. You have read-only cawdev tools and nothing
 else: no file edits, no shell, no git, and you cannot change the roadmap. If you
 are asked to change something, say that this session cannot and what could.
-${spans}
+${spans}${about}
 Start with \`roadmap_where\`. Use \`roadmap_list\`, \`roadmap_get\` and
 \`changelog_list\` to find things out rather than guessing, and say plainly when
 the answer is not there.
