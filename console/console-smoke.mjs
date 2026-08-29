@@ -577,6 +577,19 @@ try {
     method: 'POST',
     body: JSON.stringify({ state: 'CANCELLED', summary: 'Ended by the console smoke.' }),
   });
+  // R31: what happened, not only what is happening. The run just ended, so it
+  // is the newest thing in history — and must NOT be in the live scope.
+  const history = await console_('/api/runs/sessions?scope=done&limit=50');
+  check('a finished session is in history, with its prompt kept',
+    history.some((row) => row.id === session.id && row.openingPrompt),
+    JSON.stringify(history.slice(0, 2).map((r) => [r.id, r.state])));
+  const stillLive = await console_('/api/runs/sessions?scope=live&limit=50');
+  check('and is not in the live scope, which is the point of the split',
+    !stillLive.some((row) => row.id === session.id));
+  const elsewhere = await console_('/api/runs/sessions?scope=done&project=no-such-project');
+  check('a project you cannot see narrows to nothing rather than 403',
+    Array.isArray(elsewhere) && elsewhere.length === 0, JSON.stringify(elsewhere));
+
   check('ending a session drops it off the live page',
     (await console_('/api/runs/live')).every((each) => each.run.id !== session.id));
 
