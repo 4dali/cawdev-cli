@@ -1326,8 +1326,16 @@ async function main() {
   log(`serving: ${Object.entries(config.projects).map(([s, p]) => `${s} -> ${p.path}`).join(', ')}`);
 
   const heartbeat = setInterval(() => {
-    api(config, `/api/runners/${config.runnerId}/heartbeat`, { method: 'POST' })
-      .catch((failure) => log(`heartbeat failed: ${failure.message}`));
+    // What we are actually driving, not merely that we are alive. A restarted
+    // daemon is alive and drives nothing, and the runs it abandoned used to sit
+    // RUNNING for ever because the platform was watching the wrong thing.
+    //
+    // The whole set every time, so the platform can tell an abandoned run from
+    // one it has never heard about.
+    api(config, `/api/runners/${config.runnerId}/heartbeat`, {
+      method: 'POST',
+      body: { name: config.name, running: [...running.keys()] },
+    }).catch((failure) => log(`heartbeat failed: ${failure.message}`));
   }, config.heartbeatSeconds * 1000);
   heartbeat.unref?.();
 
