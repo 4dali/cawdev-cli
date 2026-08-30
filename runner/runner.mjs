@@ -1163,6 +1163,13 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit) {
   if (run.model) {
     agentArgs.unshift('--model', run.model);
   }
+
+  // How hard it is told to think: --effort low|medium|high|xhigh|max. Passed
+  // through verbatim for the same reason as the model — the CLI validates it,
+  // and a run naming none is spawned exactly as it was before.
+  if (run.effort) {
+    agentArgs.unshift('--effort', run.effort);
+  }
   if (extras.length) {
     if (!agentArgs.includes('--allowedTools')) {
       agentArgs.push('--allowedTools');

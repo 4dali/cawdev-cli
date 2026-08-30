@@ -168,6 +168,10 @@ try {
   });
   check('a blank model means the runner default, not a model called "   "',
     started.model === null, JSON.stringify(started.model));
+  // R33: effort is the other dial, and it has to survive the round trip or the
+  // picker is decoration.
+  check('and a blank effort means the same', started.effort === null,
+    JSON.stringify(started.effort));
   runId = started.id;
   check('start returns a queued run on the entry', started.state === 'QUEUED'
     && started.entryNumber === entry.number && started.branch === branch, JSON.stringify(started));
@@ -456,8 +460,14 @@ try {
 
   const question = await console_(`/api/projects/${project}/runs/ask`, {
     method: 'POST',
-    body: JSON.stringify({ prompt: 'Which cards are in CODING?', alsoReaches: [] }),
+    body: JSON.stringify({
+      prompt: 'Which cards are in CODING?',
+      alsoReaches: [],
+      effort: 'high',
+    }),
   });
+  check('the effort a person chose is carried on the run', question.effort === 'high',
+    JSON.stringify(question.effort));
   // R28 split what a run is ABOUT (kind) from what it may DO (profile): a
   // question is a MANUAL run with an ASK profile, not a kind of its own.
   check('a question has no branch, because nothing is prepared for it',
