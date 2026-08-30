@@ -1538,8 +1538,16 @@ const running = new Map();
  * preparing a working copy take a second or two, and the queue keeps offering
  * the run for that whole window. Without this the daemon claims the same run
  * twice and the second claim fails.
+ *
+ * A Map, not a Set, and the value is what makes the checkout gate correct: it
+ * holds the project each claimed run belongs to and whether that run writes
+ * code. `busy` is rebuilt from `running` on every poll, so a run that has been
+ * claimed but has not spawned yet was invisible to it — and with a full queue
+ * the long poll returns instantly, so the next poll lands squarely inside that
+ * window. Two agents went into one checkout that way, which is the failure this
+ * whole gate exists to prevent.
  */
-const taken = new Set();
+const taken = new Map();
 
 /**
  * Runs we have already said we are leaving queued.
@@ -1988,12 +1996,16 @@ async function main() {
       // pollSeconds, so a set built before it is a snapshot of the world as it
       // was when the wait began — and a run that started during the wait was
       // invisible. Two agents went into one checkout that way.
-      const busy = new Set(
-        [...running.values()]
+      const busy = new Set([
+        ...[...running.values()]
           .filter((child) => child.cawdevWritesCode)
-          .map((child) => child.cawdevProjectSlug)
-          .filter(Boolean),
-      );
+          .map((child) => child.cawdevProjectSlug),
+        // Claimed but not yet spawned counts too. Anything else leaves a hole
+        // exactly as wide as a claim plus a fetch and a checkout.
+        ...[...taken.values()]
+          .filter((claim) => claim.writes)
+          .map((claim) => claim.projectSlug),
+      ].filter(Boolean));
 
       let claimable = 0;
       let skipped = 0;
@@ -2020,7 +2032,7 @@ async function main() {
           continue;
         }
         busy.add(slug);
-        taken.add(offered.run.id);
+        taken.set(offered.run.id, { projectSlug: slug, writes });
         noted.delete(offered.run.id);
         claimable += 1;
         void startRun(config, offered);
