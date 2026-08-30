@@ -285,8 +285,9 @@ const TOOLS = [
   {
     name: 'roadmap_statuses',
     description:
-      'The six roadmap statuses, what each means, and what each one requires — CODING a branch, ' +
-      'SHIPPED a version, DECLINED a reason. Read this rather than guessing.',
+      'The seven roadmap statuses, what each means, and what each one requires — CODING a ' +
+      'branch, MERGED the merge, SHIPPED a version, DECLINED a reason. Read this rather than ' +
+      'guessing.',
     inputSchema: { type: 'object', properties: {} },
     handler: async (config) => {
       const statuses = await api(config, '/api/roadmap/statuses');
@@ -310,7 +311,7 @@ const TOOLS = [
         ...PROJECT_ARGUMENT,
         status: {
           type: 'string',
-          enum: ['CONSIDERING', 'PLANNED', 'IN_PROGRESS', 'CODING', 'SHIPPED', 'DECLINED'],
+          enum: ['CONSIDERING', 'PLANNED', 'IN_PROGRESS', 'CODING', 'MERGED', 'SHIPPED', 'DECLINED'],
         },
         brief: { type: 'boolean', description: 'Omit bodies. Default true.' },
       },
@@ -357,9 +358,10 @@ const TOOLS = [
         body: { type: 'string', description: 'Markdown.' },
         status: {
           type: 'string',
-          enum: ['CONSIDERING', 'PLANNED', 'IN_PROGRESS', 'CODING', 'SHIPPED', 'DECLINED'],
+          enum: ['CONSIDERING', 'PLANNED', 'IN_PROGRESS', 'CODING', 'MERGED', 'SHIPPED', 'DECLINED'],
         },
         branch: { type: 'string' },
+        merge: { type: 'string', description: 'What MERGED needs: the PR, the merge commit, or the sha.' },
         version: { type: 'string' },
         reason: { type: 'string' },
         section: { type: 'string', description: 'Which part of the roadmap, e.g. "Phase 2 — …".' },
@@ -371,7 +373,7 @@ const TOOLS = [
       const slug = await resolveProject(config, args.project);
       const entry = await api(config, `/api/projects/${slug}/roadmap`, {
         method: 'POST',
-        body: pick(args, ['title', 'body', 'status', 'branch', 'version', 'reason', 'section', 'related']),
+        body: pick(args, ['title', 'body', 'status', 'branch', 'merge', 'version', 'reason', 'section', 'related']),
       });
       return `Created R${entry.number} in ${slug}.\n\n${formatEntry(entry, {})}`;
     },
@@ -407,7 +409,9 @@ const TOOLS = [
     name: 'roadmap_set_status',
     description:
       'Move an entry to a status. Any status may move to any other — the rules are about what ' +
-      'a status must carry, not a permitted path. CODING needs a branch, SHIPPED a version.',
+      'a status must carry, not a permitted path. CODING needs a branch, MERGED the merge — the ' +
+      'PR, the merge commit or the sha — and SHIPPED a version. Move a card to MERGED when its ' +
+      'pull request lands; the branch may then be deleted.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -415,9 +419,10 @@ const TOOLS = [
         number: { type: 'integer' },
         status: {
           type: 'string',
-          enum: ['CONSIDERING', 'PLANNED', 'IN_PROGRESS', 'CODING', 'SHIPPED', 'DECLINED'],
+          enum: ['CONSIDERING', 'PLANNED', 'IN_PROGRESS', 'CODING', 'MERGED', 'SHIPPED', 'DECLINED'],
         },
         branch: { type: 'string' },
+        merge: { type: 'string', description: 'What MERGED needs: the PR, the merge commit, or the sha.' },
         version: { type: 'string' },
         reason: { type: 'string' },
       },
@@ -427,7 +432,7 @@ const TOOLS = [
       const slug = await resolveProject(config, args.project);
       const entry = await api(config, `/api/projects/${slug}/roadmap/${args.number}/status`, {
         method: 'POST',
-        body: pick(args, ['status', 'branch', 'version', 'reason']),
+        body: pick(args, ['status', 'branch', 'merge', 'version', 'reason']),
       });
       return `R${entry.number} is now ${entry.statusDisplay}.\n\n${formatEntry(entry, {})}`;
     },
@@ -747,6 +752,7 @@ function pick(source, keys) {
 function formatEntry(entry, { brief }) {
   const lines = [`R${entry.number} — ${entry.title}`, `  status: ${entry.statusDisplay}`];
   if (entry.branch) lines.push(`  branch: ${entry.branch}`);
+  if (entry.merge) lines.push(`  merged: ${entry.merge}`);
   if (entry.version) lines.push(`  version: ${entry.version}`);
   if (entry.declinedReason) lines.push(`  declined because: ${entry.declinedReason}`);
   if (entry.section) lines.push(`  section: ${entry.section}`);

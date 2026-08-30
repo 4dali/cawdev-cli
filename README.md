@@ -48,9 +48,11 @@ node roadmap.mjs --live    # also: SHIPPED versions are real tags, CODING branch
 ```
 
 Both forms run in CI. The shape checks catch what a review forgets — an entry
-that says `CODING` without naming a branch, a `Related:` pointing at nothing.
-`--live` catches the claim a file cannot check about itself: that a version
-someone wrote down was in fact tagged.
+that says `CODING` without naming a branch, an entry that says `MERGED` without
+naming the merge, a `Related:` pointing at nothing. `--live` catches the claim a
+file cannot check about itself: that a version someone wrote down was in fact
+tagged. A `MERGED` entry is checked against neither tags nor branches, because
+its branch is meant to have been deleted.
 
 ## Tests
 

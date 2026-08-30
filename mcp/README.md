@@ -61,11 +61,14 @@ The sequence is fixed, and the second step is the one people skip:
    "what is being worked on right now" without asking anyone.
 3. Build to the entry's "Done when" list.
 4. Finish with a PR. Never push to `main`.
+5. When the PR merges, move the entry to `MERGED` naming it. The branch may then
+   be deleted — `CODING` is for work somebody is doing, not work that is done.
 
 ### What a status must carry
 
 `roadmap_statuses` will tell you, and it is worth reading rather than guessing:
-`CODING` needs a branch, `SHIPPED` needs a version that is a real git tag,
+`CODING` needs a branch, `MERGED` needs the merge — a pull request, a merge
+commit, or a sha — `SHIPPED` needs a version that is a real git tag, and
 `DECLINED` needs a reason.
 
 **Any status may move to any other.** There is no transition diagram — an entry
@@ -98,7 +101,7 @@ what you are allowed to do.
 | Tool | What it does |
 |---|---|
 | `roadmap_where` | Which platform, which token, read from where, and who you are. Start here. |
-| `roadmap_statuses` | The six statuses, what they mean, what each requires. |
+| `roadmap_statuses` | The seven statuses, what they mean, what each requires. |
 | `roadmap_list` | Entries, optionally by status. `brief` omits bodies — use it to survey. |
 | `roadmap_get` | One entry in full. |
 | `roadmap_create` | Create an entry; the platform allocates its permanent number. |
