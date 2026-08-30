@@ -69,6 +69,7 @@ async function main() {
         body: {
           status: entry.status,
           branch: entry.branch ?? undefined,
+          merge: entry.merge ?? undefined,
           version: entry.version ?? undefined,
           reason: entry.reason ?? undefined,
         },
@@ -84,6 +85,7 @@ async function main() {
         body: entry.body,
         status: entry.status,
         branch: entry.branch ?? undefined,
+        merge: entry.merge ?? undefined,
         version: entry.version ?? undefined,
         reason: entry.reason ?? undefined,
         section: entry.section ?? undefined,

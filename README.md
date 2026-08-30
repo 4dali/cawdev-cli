@@ -69,10 +69,12 @@ node roadmap.mjs --live --project cawdev   # when CAWDEV_PROJECT is not set
 ```
 
 Both forms run in CI. The shape checks catch what a review forgets — an entry
-that says `CODING` without naming a branch, a `Related:` pointing at nothing.
-`--live` catches the claims a file cannot check about itself: that a version
-someone wrote down was in fact tagged, and that the file is still the export it
-says it is.
+that says `CODING` without naming a branch, an entry that says `MERGED` without
+naming the merge, a `Related:` pointing at nothing. `--live` catches the claims a
+file cannot check about itself: that a version someone wrote down was in fact
+tagged, and that the file is still the export it says it is. A `MERGED` entry is
+checked against neither tags nor branches, because its branch is meant to have
+been deleted.
 
 That last one re-runs `tools/roadmap/export.mjs` into a temporary file and
 compares the bytes. It goes through the exporter rather than rendering a second
