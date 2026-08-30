@@ -332,7 +332,11 @@ const TOOLS = [
 
   {
     name: 'roadmap_get',
-    description: 'One roadmap entry in full, including its body.',
+    description:
+      'One roadmap entry in full, including its body and the discussion on it. Read the ' +
+      'comments before proposing anything about this entry: they are where an objection was ' +
+      'answered, and re-proposing what was talked out three months ago is the thing they exist ' +
+      'to stop.',
     inputSchema: {
       type: 'object',
       properties: { ...PROJECT_ARGUMENT, number: { type: 'integer' } },
@@ -340,7 +344,38 @@ const TOOLS = [
     },
     handler: async (config, args) => {
       const slug = await resolveProject(config, args.project);
-      return formatEntry(await api(config, `/api/projects/${slug}/roadmap/${args.number}`), {});
+      const entry = await api(config, `/api/projects/${slug}/roadmap/${args.number}`);
+      const comments = await api(
+        config,
+        `/api/projects/${slug}/roadmap/${args.number}/comments`,
+      );
+      return formatEntry(entry, { comments });
+    },
+  },
+
+  {
+    name: 'roadmap_comment',
+    description:
+      'Say something about an entry, beside the entry rather than inside it. Use it for the ' +
+      'argument: an objection, a measurement, why an obvious approach was not taken. The body ' +
+      'is where a settled conclusion is written down — edit that when the discussion reaches ' +
+      'one. Comments cannot be deleted, by you or by anyone.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_ARGUMENT,
+        number: { type: 'integer' },
+        body: { type: 'string', description: 'Markdown.' },
+      },
+      required: ['number', 'body'],
+    },
+    handler: async (config, args) => {
+      const slug = await resolveProject(config, args.project);
+      await api(config, `/api/projects/${slug}/roadmap/${args.number}/comments`, {
+        method: 'POST',
+        body: { body: args.body },
+      });
+      return `Commented on R${args.number} in ${slug}. It cannot be deleted — that is the point.`;
     },
   },
 
@@ -562,6 +597,13 @@ const TOOLS = [
       const entry = await api(config, `/api/projects/${project}/roadmap/${run.entryNumber}`);
       const messages = await api(config, `/api/projects/${project}/runs/${runId}/messages`);
       const questions = await api(config, `/api/projects/${project}/runs/${runId}/questions`);
+      // The discussion comes with the card, not only from roadmap_get. This is
+      // where a session reads what it is building, and an argument nobody sees
+      // at the start is an argument that gets had again.
+      const comments = await api(
+        config,
+        `/api/projects/${project}/roadmap/${run.entryNumber}/comments`,
+      );
 
       const lines = [
         `project: ${project}`,
@@ -569,7 +611,7 @@ const TOOLS = [
         `run:     ${run.state}${run.runnerName ? ` on ${run.runnerName}` : ''}`,
         `started by ${run.startedByEmail}`,
         '',
-        formatEntry(entry, {}),
+        formatEntry(entry, { comments }),
       ];
 
       if (messages.length) {
@@ -735,6 +777,8 @@ const TOOLS = [
 
 // There is no roadmap_delete or changelog_delete, and there will not be. The
 // API has no such endpoint either: DECLINED with a reason is the only exit.
+// The same goes for comments — nothing here removes one, and nothing there
+// does either.
 
 function pick(source, keys) {
   const out = {};
@@ -744,15 +788,42 @@ function pick(source, keys) {
   return out;
 }
 
-function formatEntry(entry, { brief }) {
+function formatEntry(entry, { brief, comments }) {
   const lines = [`R${entry.number} — ${entry.title}`, `  status: ${entry.statusDisplay}`];
   if (entry.branch) lines.push(`  branch: ${entry.branch}`);
   if (entry.version) lines.push(`  version: ${entry.version}`);
   if (entry.declinedReason) lines.push(`  declined because: ${entry.declinedReason}`);
   if (entry.section) lines.push(`  section: ${entry.section}`);
   if (entry.related?.length) lines.push(`  related: ${entry.related.map((n) => `R${n}`).join(', ')}`);
+  // Said in a survey, where the comments themselves are not fetched: an entry
+  // with an argument attached should be visibly different from one without,
+  // even in a list. Omitted at zero rather than written as "comments: 0".
+  if (brief && entry.commentCount) lines.push(`  comments: ${entry.commentCount}`);
   if (!brief && entry.body) lines.push('', entry.body);
+  if (comments?.length) lines.push('', formatComments(comments));
   return lines.join('\n');
+}
+
+/**
+ * The discussion, oldest first.
+ *
+ * A run's comment is attributed to the run — "a session" — because that is who
+ * said it; the account it went out under is named too, since a reader deciding
+ * how much weight to give an argument wants both.
+ */
+function formatComments(comments) {
+  const lines = [`--- the discussion (${comments.length}) ---`];
+  for (const comment of comments) {
+    const who = comment.authorRunId
+      ? `a session, under ${comment.authorEmail}`
+      : comment.authorEmail;
+    lines.push(
+      `[${comment.createdAt}] ${who}${comment.editedAt ? ' (edited)' : ''}`,
+      comment.body,
+      '',
+    );
+  }
+  return lines.join('\n').trimEnd();
 }
 
 function formatChangelogEntry(entry) {

@@ -93,7 +93,8 @@ try {
   const list = await request('tools/list');
   const names = (list.result?.tools ?? []).map((tool) => tool.name);
   check('tools/list returns the roadmap and changelog verbs', names.includes('roadmap_list')
-    && names.includes('roadmap_set_status') && names.includes('changelog_add'),
+    && names.includes('roadmap_set_status') && names.includes('roadmap_comment')
+    && names.includes('changelog_add'),
     names.join(', '));
   check('every tool has a description and an input schema',
     (list.result?.tools ?? []).every((tool) => tool.description && tool.inputSchema));
@@ -149,6 +150,26 @@ try {
   });
   check('CODING with a branch is accepted', !moved.result?.isError
     && textOf(moved.result).includes('smoke-test'), textOf(moved.result));
+
+  // R37: the argument, beside the decision. An agent that can read the
+  // discussion stops re-proposing what was talked out months ago, so
+  // roadmap_get has to actually carry it.
+  const commented = await request('tools/call', {
+    name: 'roadmap_comment',
+    arguments: { project, number, body: 'A smoke-test comment. It cannot be deleted.' },
+  });
+  check('roadmap_comment says something beside the entry', !commented.result?.isError
+    && /Commented on R\d+/.test(textOf(commented.result)), textOf(commented.result));
+
+  const fetched = await request('tools/call', {
+    name: 'roadmap_get',
+    arguments: { project, number },
+  });
+  check('roadmap_get carries the discussion, not just the body',
+    !fetched.result?.isError
+      && textOf(fetched.result).includes('the discussion')
+      && textOf(fetched.result).includes('A smoke-test comment.'),
+    textOf(fetched.result));
 
   const declined = await request('tools/call', {
     name: 'roadmap_decline',
