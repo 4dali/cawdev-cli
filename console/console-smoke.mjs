@@ -194,6 +194,30 @@ try {
   check('the first is still at the front of the queue',
     (await console_(`/api/projects/${project}/runs/${runId}`)).queuedBehind === 0);
 
+  // R34: the start forms name a machine, and the run comes back saying which.
+  // Null there is "any runner that serves this project", which is what the two
+  // runs above sent and what every caller written before R34 means.
+  check('an untargeted run says so rather than naming a machine',
+    started.targetRunnerName === null && started.targetRunnerAlive === null,
+    JSON.stringify([started.targetRunnerName, started.targetRunnerAlive]));
+
+  const targeted = await console_(`/api/projects/${project}/runs`, {
+    method: 'POST',
+    body: JSON.stringify({
+      entryNumber: entry.number,
+      branch: `${branch}-here`,
+      targetRunnerId: runner.id,
+    }),
+  });
+  check('a targeted run comes back naming the machine it is for',
+    targeted.targetRunnerName === runner.name && targeted.targetRunnerAlive === true,
+    JSON.stringify([targeted.targetRunnerName, targeted.targetRunnerAlive]));
+
+  await console_(`/api/projects/${project}/runs/${targeted.id}/transition`, {
+    method: 'POST',
+    body: JSON.stringify({ state: 'CANCELLED', summary: 'Target check done.' }),
+  });
+
   // Tidied away so it does not hold the project's queue for the rest of this.
   await console_(`/api/projects/${project}/runs/${second.id}/transition`, {
     method: 'POST',
