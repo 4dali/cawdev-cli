@@ -66,7 +66,21 @@ runner rather than a third entry in the list.
    run is started in it — the platform cannot see your machine. A checkout it
    cannot read is reported as unreadable rather than omitted, because "I could
    not look" and "it was clean" are different answers.
-7. **Reports the lifecycle back** and, if the session dies without saying
+7. **Reads each repository for the project's Git tab**, on a slow timer of its
+   own — `gitSurveySeconds`, five minutes by default, plus once at startup. Per
+   project: `git fetch --prune`, the tail of the default branch's history, and
+   every remote branch with whether it is merged, plus any local branch whose
+   upstream is `[gone]`. The platform holds no git credentials, so this machine
+   is the only thing that can answer; the console shows every reading with when
+   it was taken and says **stale** when it has aged.
+
+   Its own timer rather than the heartbeat's, because it pays for a network
+   round trip per project and the heartbeat runs every thirty seconds. The
+   `fetch` is **skipped while an agent is working in that checkout** — it is the
+   only part that writes anything, and taking the ref lock out from under a
+   session to refresh a background page is a bad trade. Nothing here writes to
+   git: no merging, no branch deletion, no pushing.
+8. **Reports the lifecycle back** and, if the session dies without saying
    anything, ends the run rather than leaving it `RUNNING` forever.
 
 Cancelling a run reaches the daemon on its next poll and takes down the child's
