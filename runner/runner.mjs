@@ -203,6 +203,11 @@ function log(...parts) {
   console.log(`[${new Date().toISOString()}]`, ...parts);
 }
 
+/** Multi-line detail, set in from the log line it belongs to. */
+function indent(text) {
+  return text.split('\n').map((line) => `    ${line}`).join('\n');
+}
+
 // --- git ---------------------------------------------------------------------
 
 function git(cwd, args) {
@@ -222,23 +227,37 @@ function git(cwd, args) {
 }
 
 /**
- * Prepares the working copy: fetch, refuse if dirty, branch off the default.
+ * Prepares the working copy: fetch, check for dirt, branch off the default.
  *
- * **Refusing a dirty tree is the important part.** An agent let loose in a
- * checkout with uncommitted work will at best confuse itself and at worst
- * commit somebody's half-finished thoughts. Better to stop and say so.
+ * **A dirty tree is a warning, not a wall.** An agent let loose in a checkout
+ * with uncommitted work will at best confuse itself and at worst commit
+ * somebody's half-finished thoughts — so the person starting the run is shown
+ * what is uncommitted and decides. That decision arrives as `allowDirty`, and
+ * this is where it is honoured.
+ *
+ * Refusing here is still the default, because a run that arrives without the
+ * flag is one nobody was warned about: the composer's picture of the checkout
+ * is a heartbeat old, and a tree that went dirty inside that window would
+ * otherwise be worked on by an agent while somebody has edits open.
  */
-async function prepareWorkingCopy(path, branch, defaultBranch) {
+async function prepareWorkingCopy(path, branch, defaultBranch, allowDirty) {
   await access(join(path, '.git')).catch(() => {
     throw new Error(`${path} is not a git repository.`);
   });
 
   const dirty = await git(path, ['status', '--porcelain']);
-  if (dirty) {
+  if (dirty && !allowDirty) {
     throw new Error(
       `${path} has uncommitted changes:\n${dirty}\n\n` +
-        'Commit or stash them first. An agent should not start work on top of yours.',
+        'Commit or stash them first, or start the run again and choose to work ' +
+        'on top of them. An agent should not start work on top of yours by accident.',
     );
+  }
+  if (dirty) {
+    // Loudly, and on the run's own transcript by way of the log: "why does this
+    // diff contain changes I did not make" is a question best answered before
+    // it is asked.
+    log(`  starting on top of uncommitted work, as asked:\n${indent(dirty)}`);
   }
 
   await git(path, ['fetch', '--prune', 'origin']).catch((failure) => {
@@ -266,6 +285,65 @@ async function prepareWorkingCopy(path, branch, defaultBranch) {
     branch: await git(path, ['rev-parse', '--abbrev-ref', 'HEAD']),
     base: await git(path, ['rev-parse', 'HEAD']).catch(() => null),
   };
+}
+
+/** At most this many paths travel in a heartbeat; the count still tells the truth. */
+const SURVEY_FILE_CAP = 20;
+
+/**
+ * What every served working copy looks like right now, for the composer.
+ *
+ * The console cannot see these machines, so the only moment it can learn that a
+ * checkout is dirty is when the runner tells it — and the only regular moment
+ * is the heartbeat. This is deliberately the cheap reading: porcelain status,
+ * capped, with no line counts. It answers "should I warn before starting work
+ * here", not "what has this session changed", which is R24's question and is
+ * asked per run.
+ *
+ * A project that cannot be read at all reports `unreadable` rather than
+ * vanishing: "I could not look" and "I looked and it was clean" must not
+ * arrive at the console as the same answer.
+ */
+/**
+ * One porcelain line, split into its status and its path.
+ *
+ * <p>By token, not by column, and that is not fussiness: `git()` trims what it
+ * returns, so the leading space of an unstaged `" M path"` is gone from the
+ * *first* line and present on every other one. Slicing at a fixed offset ate
+ * the first character of the first filename and nothing else — the kind of
+ * thing that reads as correct in every test with two files in it.
+ *
+ * <p>A rename arrives as `R  old -> new`; keeping the whole remainder as the
+ * path says what happened rather than inventing a field for it.
+ */
+function statusAndPath(line) {
+  const match = /^\s*(\S+)\s+(.*)$/.exec(line);
+  return match ? { status: match[1], path: match[2] } : { status: '?', path: line.trim() };
+}
+
+async function surveyWorkingCopies(config) {
+  const survey = [];
+  for (const [slug, project] of Object.entries(config.projects)) {
+    const path = resolve(project.path);
+    try {
+      await access(join(path, '.git'));
+      const porcelain = await git(path, ['status', '--porcelain']);
+      const lines = porcelain ? porcelain.split('\n').filter((line) => line.trim()) : [];
+      survey.push({
+        project: slug,
+        path,
+        dirty: lines.length,
+        files: lines.slice(0, SURVEY_FILE_CAP).map(statusAndPath),
+      });
+    } catch (failure) {
+      survey.push({
+        project: slug,
+        path,
+        unreadable: failure.message.split('\n')[0],
+      });
+    }
+  }
+  return survey;
 }
 
 // --- the prompt --------------------------------------------------------------
@@ -1037,6 +1115,7 @@ async function startRun(config, offered) {
   const path = project?.path;
   let runToken;
   let defaultBranch;
+  let allowDirty = false;
   // Where the branch stood when this run took it over.
   let baseCommit;
 
@@ -1052,6 +1131,8 @@ async function startRun(config, offered) {
     // The claim carries everything needed to prepare the working copy, so the
     // runner never touches the project API — which is session-only anyway.
     defaultBranch = claimed.defaultBranch;
+    // Whether somebody was shown the uncommitted work and started anyway.
+    allowDirty = claimed.allowDirty === true;
   } catch (failure) {
     // Losing the race is normal when two runners serve one project, and is not
     // this run's failure — somebody else has it.
@@ -1068,7 +1149,8 @@ async function startRun(config, offered) {
       // "what is R12 about?" unanswerable while somebody has edits open.
       log(`  a ${run.profile.toLowerCase()} session: no branch, nothing prepared`);
     } else {
-      const prepared = await prepareWorkingCopy(resolve(path), run.branch, defaultBranch);
+      const prepared = await prepareWorkingCopy(
+        resolve(path), run.branch, defaultBranch, allowDirty);
       branch = prepared.branch;
       baseCommit = prepared.base;
     }
@@ -1341,18 +1423,38 @@ async function main() {
   log(`registered as "${runner.name}" (${runner.id}) against ${config.url}`);
   log(`serving: ${Object.entries(config.projects).map(([s, p]) => `${s} -> ${p.path}`).join(', ')}`);
 
-  const heartbeat = setInterval(() => {
+  // One beat straight away. Waiting a full interval would leave the composer
+  // with no picture of this machine's checkouts for the first thirty seconds
+  // after a restart — and warning nobody is exactly the failure this fixes.
+  const beat = async () => {
     // What we are actually driving, not merely that we are alive. A restarted
     // daemon is alive and drives nothing, and the runs it abandoned used to sit
     // RUNNING for ever because the platform was watching the wrong thing.
     //
     // The whole set every time, so the platform can tell an abandoned run from
     // one it has never heard about.
+    //
+    // The survey rides along rather than getting a beat of its own: it is the
+    // same statement — "here is this machine as it stands" — and a second timer
+    // would only let the two halves disagree.
+    const workingCopies = await surveyWorkingCopies(config).catch((failure) => {
+      log(`could not survey the working copies: ${failure.message}`);
+      return null;
+    });
     api(config, `/api/runners/${config.runnerId}/heartbeat`, {
       method: 'POST',
-      body: { name: config.name, running: [...running.keys()] },
+      body: {
+        name: config.name,
+        running: [...running.keys()],
+        // Stringified, as `capabilities` and R24's detail are: the platform
+        // stores what this machine said, not its own reading of it.
+        workingCopies: workingCopies ? JSON.stringify(workingCopies) : null,
+      },
     }).catch((failure) => log(`heartbeat failed: ${failure.message}`));
-  }, config.heartbeatSeconds * 1000);
+  };
+
+  await beat();
+  const heartbeat = setInterval(beat, config.heartbeatSeconds * 1000);
   heartbeat.unref?.();
 
   let stopping = false;

@@ -41,9 +41,13 @@ runner rather than a third entry in the list.
    the project's default branch — the runner never touches the project API,
    which is session-only.
 2. **Prepares the working copy**: fetch, then branch off the default.
-   **It refuses a dirty tree**, with the file list, and fails the run saying so.
-   An agent let loose in a checkout with uncommitted work will at best confuse
-   itself and at worst commit somebody's half-finished thoughts.
+   **A dirty tree stops it unless somebody said otherwise.** An agent let loose
+   in a checkout with uncommitted work will at best confuse itself and at worst
+   commit somebody's half-finished thoughts — so the console shows what is
+   uncommitted before the run is started, and the decision arrives with the
+   claim as `allowDirty`. Without it the runner still refuses, with the file
+   list, and fails the run saying so: a run that arrives with no flag is one
+   nobody was warned about.
 3. **Spawns the agent** in that directory, in its own process group, with the
    run token in its environment and an `.mcp.json` pointing at cawdev's MCP
    server. **Your own token never reaches the child.**
@@ -56,7 +60,13 @@ runner rather than a third entry in the list.
    reason (`--input-format stream-json`). One process, one session, many turns.
    A prompt is acknowledged only after the write, so one that never landed is
    retried rather than lost.
-6. **Reports the lifecycle back** and, if the session dies without saying
+6. **Says what its checkouts look like**, on every heartbeat: for each project
+   it serves, the porcelain status, capped at twenty paths but counting them
+   all. This is the only way the console can know a checkout is dirty before a
+   run is started in it — the platform cannot see your machine. A checkout it
+   cannot read is reported as unreadable rather than omitted, because "I could
+   not look" and "it was clean" are different answers.
+7. **Reports the lifecycle back** and, if the session dies without saying
    anything, ends the run rather than leaving it `RUNNING` forever.
 
 Cancelling a run reaches the daemon on its next poll and takes down the child's
