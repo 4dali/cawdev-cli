@@ -72,6 +72,45 @@ runner rather than a third entry in the list.
 Cancelling a run reaches the daemon on its next poll and takes down the child's
 whole process group — an agent that started a build should not leave it running.
 
+## What it does after a run is over
+
+A merge happens **after** the run ends, by definition: somebody reviews the pull
+request and merges it. So the one event worth recording is the one event a live
+session can never be present for, and R25's reading — taken on the runner's last
+reporting pass — always stops one question short. `PUSHED` is not `MERGED`.
+
+Every ten minutes, on the loop it already has, the daemon asks
+`GET /api/runners/{id}/branches` for the finished runs worth re-checking, looks,
+and posts the answers back in one batch. The platform names the branches; the
+runner says what happened to them. **cawdev holds no git-host credential** and
+could not answer this itself — that division is R19 and R25's, and this keeps it.
+
+How it answers, in order:
+
+1. **`gh pr view`**, preferring the recorded pull request URL over the branch
+   name. `gh pr view <branch>` stops finding anything once the branch is deleted,
+   which is exactly when the question gets interesting; a URL keeps answering.
+   This is also the only thing that can see a **squash merge**.
+2. **`git merge-base --is-ancestor <head> origin/<default>`**, which works for
+   any remote at all. By SHA, not by branch name: a merged branch is usually
+   deleted, but its last commit stays reachable from the default branch for ever,
+   which is why `git branch --merged` is not what is used here.
+3. **`git ls-remote`** — if ancestry says no and the branch is still on the
+   remote, it is genuinely open and waiting.
+
+Anything else is **`UNKNOWN`**, and that is a real answer rather than a missing
+one. Proving a merge is possible; disproving one is not — a squashed branch that
+was then deleted looks exactly like an abandoned one — so the daemon says it
+cannot tell instead of guessing. A project it serves whose checkout it can no
+longer read also answers `UNKNOWN`; a project it does **not** serve it says
+nothing about at all, so it cannot blank another machine's good answer.
+
+The pass is bounded and rotating, longest-unchecked first, and a run already
+recorded as merged is never offered again: **merged is permanent.** A merged
+branch is usually deleted within seconds, so the very next pass often cannot
+prove anything — and letting that overwrite the record would mean forgetting the
+one fact worth learning, minutes after learning it.
+
 **One run at a time per working copy** — for runs that use one. Coding runs
 share a checkout, so a second in the same directory would fight the first; the
 rest queue.

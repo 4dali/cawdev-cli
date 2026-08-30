@@ -869,6 +869,235 @@ async function findPullRequest(cwd, branch) {
   return github ? `https://github.com/${github[1]}/compare/${encodeURIComponent(branch)}` : null;
 }
 
+// --- what became of the branch, after the run is over ------------------------
+//
+// R25 answered "did the work leave the machine" and stopped there, because it
+// only ever asked while a session was alive. A merge happens AFTER the run ends
+// — somebody reviews the pull request — so the one event worth recording is the
+// one event that design could never be present for.
+//
+// The platform still asks no git question of its own. It says WHICH branches;
+// this says WHAT HAPPENED to them. R19 and R25's division of labour is
+// unchanged: the credentials are here, so the answers are here too.
+
+/** How often the merge pass runs, in minutes. A merge is a human-timescale event. */
+const MERGE_CHECK_MINUTES = 10;
+
+/**
+ * What `gh` says about the branch's pull request.
+ *
+ * The pull request URL is preferred over the branch name when we have a real
+ * one, because `gh pr view <branch>` stops finding anything once the branch is
+ * deleted — which is precisely when this question gets interesting. A URL keeps
+ * answering after the branch it belonged to is gone.
+ *
+ * A `/compare/` URL is not a pull request: `findPullRequest` falls back to one
+ * as a link somebody can click, and asking `gh` about it would be asking about
+ * a page that does not exist.
+ */
+async function askGitHub(cwd, branch, prUrl) {
+  const target = prUrl && !prUrl.includes('/compare/') ? prUrl : branch;
+  if (!target) {
+    return null;
+  }
+  const out = await new Promise((resolvePromise) => {
+    const child = spawn(
+      'gh',
+      ['pr', 'view', target, '--json', 'state,mergedAt,mergeCommit'],
+      { cwd, stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    let text = '';
+    child.stdout.on('data', (chunk) => (text += chunk));
+    child.on('error', () => resolvePromise(null));
+    child.on('exit', (code) => resolvePromise(code === 0 ? text.trim() : null));
+  });
+  if (!out) {
+    return null;
+  }
+
+  const parsed = safeJson(out);
+  if (!parsed?.state) {
+    return null;
+  }
+  // gh's states are OPEN, CLOSED and MERGED. CLOSED here means closed WITHOUT
+  // merging — gh reports a merged PR as MERGED, never as CLOSED — which is the
+  // distinction worth keeping: it is a card that needs a person, not a status
+  // change.
+  const state = { OPEN: 'OPEN', MERGED: 'MERGED', CLOSED: 'CLOSED' }[parsed.state];
+  if (!state) {
+    return null;
+  }
+  return {
+    state,
+    mergeCommit: parsed.mergeCommit?.oid ?? null,
+    mergedAt: parsed.mergedAt ?? null,
+  };
+}
+
+/**
+ * Whether the run's head is on the default branch, for any remote at all.
+ *
+ * By SHA rather than by branch name, and that is the whole point: a merged
+ * branch is usually deleted, but its last commit stays reachable from the
+ * default branch for ever. `git branch --merged` cannot answer for a branch
+ * that no longer exists; this can.
+ *
+ * The merge commit is the FIRST merge on the ancestry path from head to the
+ * default branch — the commit that actually brought the work in, rather than
+ * whatever landed next.
+ */
+async function askGit(cwd, head, defaultBranch) {
+  if (!head) {
+    return null;
+  }
+  const base = defaultBranch || 'main';
+  const target = await git(cwd, ['rev-parse', '--verify', `origin/${base}`])
+    .then(() => `origin/${base}`)
+    .catch(() => git(cwd, ['rev-parse', '--verify', base]).then(() => base).catch(() => null));
+  if (!target) {
+    return null;
+  }
+
+  const merged = await new Promise((resolvePromise) => {
+    const child = spawn('git', ['merge-base', '--is-ancestor', head, target], {
+      cwd,
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    child.on('error', () => resolvePromise(null));
+    // 0 is "yes", 1 is "no", anything else is "I could not tell" — a missing
+    // object after a prune reports 128, and treating that as "not merged" is
+    // how a merged run would be quietly downgraded.
+    child.on('exit', (code) => resolvePromise(code === 0 ? true : code === 1 ? false : null));
+  });
+  if (merged === null) {
+    return { landed: 'CANNOT_TELL' };
+  }
+  if (!merged) {
+    return { landed: 'NO' };
+  }
+
+  const mergeCommit = await git(cwd, [
+    'log', '--ancestry-path', '--merges', '--reverse', '--format=%H', `${head}..${target}`,
+  ]).then((out) => out.split('\n')[0]?.trim() || null).catch(() => null);
+
+  return { landed: 'YES', mergeCommit };
+}
+
+/**
+ * What became of one branch.
+ *
+ * `gh` first, because it is the only thing that can see a SQUASH merge: a
+ * squashed branch's commits never appear on the default branch at all, so the
+ * ancestry test below would confidently and wrongly say "not merged".
+ *
+ * That is also why the git fallback never returns OPEN or CLOSED for a branch
+ * that has left the remote. Proving a merge is possible; disproving one is not,
+ * and UNKNOWN is the honest answer rather than a guess dressed as a reading.
+ */
+async function readMergeState(cwd, { branch, defaultBranch, head, prUrl }) {
+  const viaGh = await askGitHub(cwd, branch, prUrl).catch(() => null);
+  if (viaGh) {
+    return viaGh;
+  }
+
+  const viaGit = await askGit(cwd, head, defaultBranch)
+    .catch(() => null)
+    .then((result) => result ?? { landed: 'CANNOT_TELL' });
+
+  if (viaGit.landed === 'YES') {
+    return { state: 'MERGED', mergeCommit: viaGit.mergeCommit, mergedAt: null };
+  }
+  if (viaGit.landed === 'CANNOT_TELL') {
+    return { state: 'UNKNOWN', mergeCommit: null, mergedAt: null };
+  }
+
+  // Ancestry says it has not landed. That is only half an answer: if the branch
+  // is still on the remote it is genuinely open and waiting, but if it is gone
+  // we cannot tell a squash merge from an abandoned branch — and must not
+  // pretend to.
+  const remotes = await git(cwd, ['remote']).catch(() => '');
+  if (!remotes.trim()) {
+    return { state: 'UNKNOWN', mergeCommit: null, mergedAt: null };
+  }
+  const remote = remotes.split('\n')[0].trim();
+  const onRemote = await git(cwd, ['ls-remote', '--heads', remote, branch])
+    .then((out) => Boolean(out.trim()))
+    .catch(() => false);
+
+  return { state: onRemote ? 'OPEN' : 'UNKNOWN', mergeCommit: null, mergedAt: null };
+}
+
+/**
+ * The periodic pass: ask the platform which branches to look at, and answer.
+ *
+ * Rides the loop the daemon already has rather than getting a timer of its own,
+ * so there is one outbound conversation and no second half to fall out of step
+ * with the first.
+ *
+ * A project this runner does not serve is skipped in silence — reporting
+ * UNKNOWN for a checkout we were never asked to hold would blank another
+ * machine's good answer. A project we DO serve but can no longer read reports
+ * UNKNOWN, which is the honest answer and better than a stale OPEN.
+ */
+async function checkMerges(config) {
+  const pending = await api(config, `/api/runners/${config.runnerId}/branches`).catch((failure) => {
+    log(`could not ask which branches to check: ${failure.message}`);
+    return null;
+  });
+  if (!pending?.length) {
+    return;
+  }
+
+  // One fetch per project, not one per branch: twenty-five branches in one
+  // repository are twenty-five questions about the same set of refs.
+  const fetched = new Set();
+  const readings = [];
+
+  for (const branch of pending) {
+    const project = config.projects[branch.projectSlug];
+    if (!project) {
+      continue; // Not ours to answer for.
+    }
+    const cwd = resolve(project.path);
+
+    try {
+      await access(join(cwd, '.git'));
+    } catch {
+      readings.push({ runId: branch.runId, state: 'UNKNOWN' });
+      continue;
+    }
+
+    if (!fetched.has(cwd)) {
+      fetched.add(cwd);
+      // Refs only. This never touches the working tree, so it is safe beside a
+      // live session in the same checkout.
+      await git(cwd, ['fetch', '--prune', 'origin']).catch(() => null);
+    }
+
+    const reading = await readMergeState(cwd, branch).catch(() => null);
+    readings.push({
+      runId: branch.runId,
+      state: reading?.state ?? 'UNKNOWN',
+      mergeCommit: reading?.mergeCommit ?? null,
+      mergedAt: reading?.mergedAt ?? null,
+    });
+  }
+
+  if (!readings.length) {
+    return;
+  }
+  const recorded = await api(config, `/api/runners/${config.runnerId}/merges`, {
+    method: 'POST',
+    body: { readings },
+  }).catch((failure) => {
+    log(`could not record what became of the branches: ${failure.message}`);
+    return null;
+  });
+  if (recorded?.merged?.length) {
+    log(`${recorded.merged.length} of ${recorded.recorded} branch(es) have merged`);
+  }
+}
+
 /** Reads the run's history out of git and tells the platform. */
 async function reportCommits(config, run, cwd, base) {
   const commits = await readCommits(cwd, base).catch((failure) => {
@@ -1489,9 +1718,22 @@ async function main() {
     });
   }
 
+  // Long ago enough that the first pass happens on the first poll: a daemon
+  // that has just started is exactly when somebody wants to know what landed
+  // while it was off.
+  let lastMergeCheck = 0;
+
   while (!stopping) {
     try {
       await reapCancelled(config);
+
+      // On the loop the daemon already has, not a timer of its own. Before the
+      // long poll rather than after, because the poll blocks for up to
+      // pollSeconds and work queued behind it should not wait on git.
+      if (Date.now() - lastMergeCheck >= MERGE_CHECK_MINUTES * 60_000) {
+        lastMergeCheck = Date.now();
+        await checkMerges(config);
+      }
 
       const offers = await api(
         config,
