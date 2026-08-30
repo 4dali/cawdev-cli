@@ -72,12 +72,29 @@ The sequence is fixed, and the second step is the one people skip:
 really can go from `CONSIDERING` straight to `SHIPPED` if that is what happened.
 The rules are about what a status *carries*, not the path it took.
 
+### The body is the decision; the comments are the argument
+
+`roadmap_get` gives you both, and `task_current` gives you both for the entry
+you are working on. **Read the discussion before you propose anything about an
+entry.** It is where an objection was answered and where an obvious-looking
+approach was ruled out with a reason — and re-proposing what was talked out
+three months ago is precisely what it exists to stop.
+
+Use `roadmap_comment` for the argument: what you measured, what you tried, why
+you did not take the route somebody would expect. Use `roadmap_update` when the
+discussion reaches a conclusion — the body is where a settled answer goes, so
+that the next reader does not have to reconstruct it from the thread.
+
+A comment you write is attributed to your run as well as to the account that
+minted your token, so a person can tell an agent's reading from a colleague's.
+
 ### There is no delete
 
 Not in these tools, not in the API. `roadmap_decline` with a reason is the only
 exit an entry has, and the reason is the point: it is what stops the same idea
 being proposed again in six months. Same for changelog entries — correct the
-text, do not remove the record.
+text, do not remove the record. Same for comments: nothing removes one, and the
+most you can do to your own is correct its wording.
 
 ### Ids are permanent
 
@@ -100,9 +117,10 @@ what you are allowed to do.
 | `roadmap_where` | Which platform, which token, read from where, and who you are. Start here. |
 | `roadmap_statuses` | The six statuses, what they mean, what each requires. |
 | `roadmap_list` | Entries, optionally by status. `brief` omits bodies — use it to survey. |
-| `roadmap_get` | One entry in full. |
+| `roadmap_get` | One entry in full: its body **and the discussion on it**. |
 | `roadmap_create` | Create an entry; the platform allocates its permanent number. |
 | `roadmap_update` | Title, body, section, related ids. |
+| `roadmap_comment` | Say something *beside* an entry rather than inside it. |
 | `roadmap_set_status` | Move an entry, carrying whatever the status requires. |
 | `roadmap_decline` | Decline with a reason. The only exit. |
 | `changelog_list` | The changelog, grouped by release, newest first. |

@@ -158,6 +158,44 @@ try {
     .join('-')}`;
   check('the proposed branch names the entry', branch === `r${entry.number}-console-smoke-safe-to-decline`, branch);
 
+  // --- the discussion under the entry ---------------------------------------
+
+  const comment = await console_(`/api/projects/${project}/roadmap/${entry.number}/comments`, {
+    method: 'POST',
+    body: JSON.stringify({ body: 'What the console smoke had to say about it.' }),
+  });
+  check('a comment comes back attributed to the person who wrote it',
+    comment.authorEmail === EMAIL && !comment.authorRunId, JSON.stringify(comment));
+  check('and not marked as edited, because it has not been',
+    comment.editedAt === null || comment.editedAt === undefined, JSON.stringify(comment.editedAt));
+
+  const discussion = await console_(`/api/projects/${project}/roadmap/${entry.number}/comments`);
+  check('the entry page reads the discussion back', discussion.length === 1
+    && discussion[0].id === comment.id, JSON.stringify(discussion));
+
+  const corrected = await console_(
+    `/api/projects/${project}/roadmap/${entry.number}/comments/${comment.id}`,
+    { method: 'PATCH', body: JSON.stringify({ body: 'Corrected, and it says so.' }) },
+  );
+  check('correcting your own wording stamps editedAt',
+    corrected.body === 'Corrected, and it says so.' && !!corrected.editedAt,
+    JSON.stringify(corrected));
+
+  // The board draws this on the card, so it has to arrive with the list rather
+  // than needing a request per entry.
+  const carded = (await console_(`/api/projects/${project}/roadmap?brief=true`))
+    .find((each) => each.number === entry.number);
+  check('the board card carries the count', carded?.commentCount === 1,
+    JSON.stringify(carded?.commentCount));
+
+  // There is no delete, here or anywhere: the absence of the endpoint is the
+  // guarantee, so the smoke asks for it and expects to be refused.
+  await console_(`/api/projects/${project}/roadmap/${entry.number}/comments/${comment.id}`, {
+    method: 'DELETE',
+    expect: 405,
+  });
+  check('and no way to delete one', true);
+
   // --- start ---------------------------------------------------------------
 
   const started = await console_(`/api/projects/${project}/runs`, {
