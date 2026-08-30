@@ -30,6 +30,7 @@ const SECTION_ORDER = [
   'Phase 3 — agent orchestration',
   'Phase 3 — the console becomes the workplace',
   'Phase 3 — the console drives the agent',
+  'The generated files and the tools',
 ];
 
 async function main() {
