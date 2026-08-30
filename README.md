@@ -26,6 +26,25 @@ Both are byte-stable: the same data produces the same bytes, so a regenerated
 file shows a diff only when the roadmap actually changed. CI proves
 export → import → export is a fixed point.
 
+### Where a section goes in the file
+
+An entry's `section` is a planning decision and lives in the database. The
+**order** the sections appear in is prose layout, and lives beside the exporter
+as `SECTION_ORDER` in `tools/roadmap/export.mjs`. `Considering` and `Declined`
+are not in that list: they are derived from status by `sectionOf`, and always
+come last.
+
+A section that is not in `SECTION_ORDER` is **appended, and named in the note
+the exporter prints** under its per-status counts, along with the number of
+entries it holds. It is a note rather than a failure — a new phase is
+legitimate, and an exporter that refused one would block the release that
+introduced it — but it should not arrive unannounced. Silence is how the list
+fell three sections behind and `"Roadmap"`, the fallback for an entry with no
+section of its own, became a junk drawer holding eight built features (R45).
+
+When you see the note: add the section to `SECTION_ORDER` in the position it
+should read in, or give those entries a section that is already there.
+
 ## `tools/roadmap/import.mjs`
 
 The one-time move from a hand-written `ROADMAP.md` into the platform, and the
@@ -44,13 +63,28 @@ would break every commit message that points at one.
 
 ```sh
 node roadmap.mjs           # shape: ids unique, statuses legal, required fields present
-node roadmap.mjs --live    # also: SHIPPED versions are real tags, CODING branches exist
+node roadmap.mjs --live    # also: SHIPPED versions are real tags, CODING branches
+                           # exist, and the file matches the database
+node roadmap.mjs --live --project cawdev   # when CAWDEV_PROJECT is not set
 ```
 
 Both forms run in CI. The shape checks catch what a review forgets — an entry
 that says `CODING` without naming a branch, a `Related:` pointing at nothing.
-`--live` catches the claim a file cannot check about itself: that a version
-someone wrote down was in fact tagged.
+`--live` catches the claims a file cannot check about itself: that a version
+someone wrote down was in fact tagged, and that the file is still the export it
+says it is.
+
+That last one re-runs `tools/roadmap/export.mjs` into a temporary file and
+compares the bytes. It goes through the exporter rather than rendering a second
+copy of it, so the two cannot drift apart. A difference fails and names the
+entries — missing here, missing there, or changed — with the remedy. If every
+entry agrees and the bytes still differ, the preamble or the section layout was
+edited by hand.
+
+It needs a `CAWDEV_TOKEN` and a project. Without them it prints a note saying it
+was skipped and the git checks still run; a check that cannot answer says so
+rather than passing (R41). If the token is set and the platform rejects it or is
+down, that is not "cannot answer" — it fails, with the API's own message.
 
 ## Tests
 
