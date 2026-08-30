@@ -632,15 +632,15 @@ try {
 
   // R44: the card is named after the finding, files where the person said, and
   // shows the severity rather than spending its title on it.
-  const card = await console_(`/api/projects/${project}/roadmap/${accepted.entryNumber}`);
+  const acceptedCard = await console_(`/api/projects/${project}/roadmap/${accepted.entryNumber}`);
   check('the card takes the finding’s title, with no severity welded on',
-    card.title === 'a finding', JSON.stringify(card.title));
+    acceptedCard.title === 'a finding', JSON.stringify(acceptedCard.title));
   check('it lands in the section the person chose, at the status they chose',
-    card.section === 'Phase 9 — the smoke test' && card.status === 'CONSIDERING',
-    JSON.stringify([card.section, card.status]));
+    acceptedCard.section === 'Phase 9 — the smoke test' && acceptedCard.status === 'CONSIDERING',
+    JSON.stringify([acceptedCard.section, acceptedCard.status]));
   check('and it still says what the audit thought, and which audit',
-    card.audit?.severity === 'CRITICAL' && card.audit?.runId === audit.id,
-    JSON.stringify(card.audit));
+    acceptedCard.audit?.severity === 'CRITICAL' && acceptedCard.audit?.runId === audit.id,
+    JSON.stringify(acceptedCard.audit));
 
   const boarded = (await console_(`/api/projects/${project}/roadmap?brief=true`))
     .find((entry) => entry.number === accepted.entryNumber);
@@ -661,7 +661,7 @@ try {
   const thirdFinding = await asToken(auditor.runToken,
     `/api/projects/${project}/runs/${audit.id}/proposals`,
     { severity: 'MEDIUM', title: 'a third finding', body: 'Also real.' });
-  const started = await console_(
+  const refusedStart = await console_(
     `/api/projects/${project}/runs/${audit.id}/proposals/${thirdFinding.id}/accept`,
     {
       method: 'POST',
@@ -669,7 +669,7 @@ try {
       body: JSON.stringify({ status: 'IN_PROGRESS' }),
     });
   check('a finding cannot land as started — nobody has started it',
-    /PLANNED/.test(started?.message ?? ''), JSON.stringify(started));
+    /PLANNED/.test(refusedStart?.message ?? ''), JSON.stringify(refusedStart));
 
   const twice = await console_(
     `/api/projects/${project}/runs/${audit.id}/proposals/${finding.id}/accept`,
