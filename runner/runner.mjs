@@ -101,6 +101,16 @@ const DEFAULTS = {
   ],
   pollSeconds: 25,
   heartbeatSeconds: 30,
+  /**
+   * How often to read each served repository for the project's Git tab.
+   *
+   * Deliberately slow, and on a timer of its own rather than riding the
+   * heartbeat: this reading runs `git fetch` per project, which is a network
+   * round trip nobody should pay for every thirty seconds. It is a background
+   * reading, not something worth a round trip per page view — and the console
+   * says when it was taken, so nothing pretends to be live.
+   */
+  gitSurveySeconds: 300,
 };
 
 async function readConfig() {
@@ -344,6 +354,216 @@ async function surveyWorkingCopies(config) {
     }
   }
   return survey;
+}
+
+// --- reading the repository for the Git tab -----------------------------------
+//
+// R39. cawdev knew a great deal about git and could show almost none of it: what
+// existed was per-run and nothing else. The project-level questions — what has
+// landed lately, which branches are open, which are merged, and which card each
+// belongs to — were unanswerable.
+//
+// **This machine answers them.** R25 settled the same question the same way for
+// pull request URLs: the runner already holds the credentials, so it looks and
+// the platform never needs a git-host token of its own. Everything here READS.
+// No merging, no branch deletion, no pushing.
+
+/**
+ * The field separator inside one line of git output.
+ *
+ * A record separator rather than anything a person can type, for the reason
+ * `readCommits` gives: a commit subject can contain anything, and splitting on
+ * a character somebody might use is how a parser meets its first
+ * "fix: handle | in input".
+ *
+ * Worth checking after any tool has rewritten this file:
+ * an unprintable character in a source file survives every editor and diff tool
+ * until the one that eats it, and `''` is indistinguishable from `''` on
+ * screen while splitting a string into individual characters.
+ */
+const FIELD = '';
+
+/** How much of the default branch's history travels in one reading. */
+const GIT_SURVEY_COMMITS = 30;
+
+/**
+ * Which branch this checkout thinks is the default.
+ *
+ * Asked of the repository rather than taken from the project's settings: the
+ * platform's `defaultBranch` is what somebody typed into a form, and what
+ * matters for `--merged` is what the checkout actually resolves. `origin/HEAD`
+ * is the honest answer when it exists; the fallbacks are for a clone made with
+ * `--single-branch`, where it does not.
+ */
+async function defaultBranchOf(path) {
+  const symbolic = await git(path, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])
+    .catch(() => '');
+  if (symbolic) {
+    return symbolic.replace(/^origin\//, '');
+  }
+  for (const candidate of ['main', 'master']) {
+    const exists = await git(path, ['rev-parse', '--verify', `origin/${candidate}`])
+      .then(() => true)
+      .catch(() => false);
+    if (exists) {
+      return candidate;
+    }
+  }
+  return 'main';
+}
+
+/** One `for-each-ref` line, split into the fields asked for. */
+function refFields(line) {
+  const [name, sha, subject, author, committedAt] = line.split(FIELD);
+  return {
+    name,
+    headSha: sha || null,
+    subject: subject || null,
+    author: author || null,
+    committedAt: committedAt || null,
+  };
+}
+
+/**
+ * Every branch on the remote, and every local branch whose remote is gone.
+ *
+ * `for-each-ref` rather than `git branch`, because `git branch` formats for a
+ * person: it decorates the current branch with an asterisk, abbreviates, and
+ * changes its mind about colour depending on whether it is talking to a
+ * terminal. `for-each-ref` prints exactly the fields asked for.
+ *
+ * **Gone is not the same as absent.** A branch merged and deleted on the remote
+ * leaves a local branch whose `%(upstream:track)` reads `[gone]`, and that is
+ * worth saying out loud. A branch nobody ever pushed is simply not in this
+ * reading at all, which is a different sentence for the console to write.
+ */
+async function readBranches(path, base) {
+  const format = ['%(refname:short)', '%(objectname)', '%(contents:subject)', '%(authorname)',
+    '%(committerdate:iso-strict)'].join(FIELD);
+
+  const remote = await git(path, ['for-each-ref', 'refs/remotes/origin', `--format=${format}`])
+    .catch(() => '');
+  const merged = new Set(
+    (await git(path, ['for-each-ref', 'refs/remotes/origin', '--merged', base,
+      '--format=%(refname:short)']).catch(() => ''))
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean),
+  );
+
+  const bare = base.replace(/^origin\//, '');
+  const branches = [];
+  for (const line of remote.split('\n')) {
+    if (!line.trim()) continue;
+    const ref = refFields(line);
+    // `origin/HEAD` is a pointer at another branch in this list, not a branch.
+    if (!ref.name || ref.name === 'origin/HEAD') continue;
+    const name = ref.name.replace(/^origin\//, '');
+    // The default branch is what everything else is measured against, not one
+    // of the things being measured.
+    if (name === bare) continue;
+    branches.push({ ...ref, name, merged: merged.has(ref.name), gone: false });
+  }
+
+  // A local branch whose upstream has been deleted. This is the case the whole
+  // entry turns on: a card in CODING naming a branch that was merged and
+  // deleted a month ago looks exactly like work in progress.
+  const localFormat = `${format}${FIELD}%(upstream:track)`;
+  const local = await git(path, ['for-each-ref', 'refs/heads', `--format=${localFormat}`])
+    .catch(() => '');
+  for (const line of local.split('\n')) {
+    if (!line.trim()) continue;
+    const track = line.split(FIELD)[5] ?? '';
+    if (!track.includes('gone')) continue;
+    const ref = refFields(line);
+    branches.push({ ...ref, merged: merged.has(`origin/${ref.name}`), gone: true });
+  }
+
+  return branches;
+}
+
+/** The tail of the default branch's history, newest first. */
+async function readRecentCommits(path, base, branch) {
+  const format = ['%H', '%s', '%an', '%aI'].join(FIELD);
+  const out = await git(path, ['log', `--format=${format}`, '-n', String(GIT_SURVEY_COMMITS), base])
+    .catch(() => '');
+
+  const commits = [];
+  for (const line of out.split('\n')) {
+    if (!line.trim()) continue;
+    const [sha, subject, author, committedAt] = line.split(FIELD);
+    if (!sha) continue;
+    commits.push({
+      sha,
+      subject: subject || '(no subject)',
+      author: author || null,
+      committedAt: committedAt || null,
+      branch,
+    });
+  }
+  return commits;
+}
+
+/**
+ * One repository, read.
+ *
+ * `fetch --prune` is skipped when an agent is working in this checkout: it is
+ * the only part of this reading that writes anything — remote-tracking refs —
+ * and taking the ref lock out from under a session to refresh a background page
+ * is a bad trade. The rest reads local refs, so the reading still happens; it is
+ * merely as fresh as the last fetch, which is all the page claims anyway.
+ */
+async function surveyProjectGit(path, { fetch = true } = {}) {
+  await access(join(path, '.git')).catch(() => {
+    throw new Error(`${path} is not a git repository.`);
+  });
+
+  if (fetch) {
+    await git(path, ['fetch', '--prune', 'origin']).catch((failure) => {
+      // A repository with no remote is legitimate for local experiments, and a
+      // network that is down should not throw away the rest of the reading.
+      log(`  git survey: fetch skipped: ${failure.message.split('\n')[0]}`);
+    });
+  }
+
+  const branch = await defaultBranchOf(path);
+  const base = await git(path, ['rev-parse', '--verify', `origin/${branch}`])
+    .then(() => `origin/${branch}`)
+    .catch(() => branch);
+
+  return {
+    defaultBranch: branch,
+    headSha: await git(path, ['rev-parse', base]).catch(() => null),
+    commits: await readRecentCommits(path, base, branch),
+    branches: await readBranches(path, base),
+  };
+}
+
+/**
+ * Reads every served repository and tells the platform.
+ *
+ * One request per project, and a project that could not be read reports the
+ * reason rather than nothing: "I could not look" and "I looked and there is
+ * nothing there" must not arrive at the console as the same answer. The platform
+ * keeps the last good reading either way and labels it — a project whose runner
+ * is down should show stale data marked stale, not an empty page.
+ */
+async function surveyGit(config) {
+  for (const [slug, project] of Object.entries(config.projects)) {
+    const path = resolve(project.path);
+    const busy = [...running.values()].some(
+      (child) => child.cawdevProjectSlug === slug && child.cawdevWritesCode,
+    );
+
+    const reading = await surveyProjectGit(path, { fetch: !busy }).catch((failure) => ({
+      error: failure.message.split('\n')[0],
+    }));
+
+    await api(config, `/api/runners/${config.runnerId}/git/${slug}`, {
+      method: 'POST',
+      body: reading,
+    }).catch((failure) => log(`  could not report git for ${slug}: ${failure.message}`));
+  }
 }
 
 // --- the prompt --------------------------------------------------------------
@@ -1457,6 +1677,21 @@ async function main() {
   const heartbeat = setInterval(beat, config.heartbeatSeconds * 1000);
   heartbeat.unref?.();
 
+  // The Git tab's reading, on a timer of its own because it is a different
+  // question asked at a different rate: the heartbeat says "this machine is
+  // alive" every thirty seconds, and this says "here is what these repositories
+  // look like" every few minutes, having paid for a fetch to find out.
+  //
+  // Once immediately, for the same reason the heartbeat beats immediately — a
+  // console showing an empty Git tab for five minutes after a restart has told
+  // somebody the repository has no branches.
+  const readGit = () => {
+    void surveyGit(config).catch((failure) => log(`git survey failed: ${failure.message}`));
+  };
+  readGit();
+  const gitSurvey = setInterval(readGit, config.gitSurveySeconds * 1000);
+  gitSurvey.unref?.();
+
   let stopping = false;
   for (const signal of ['SIGINT', 'SIGTERM']) {
     process.on(signal, async () => {
@@ -1467,6 +1702,7 @@ async function main() {
       log('stopping; leaving any live run to the platform’s staleness sweep');
       stopping = true;
       clearInterval(heartbeat);
+      clearInterval(gitSurvey);
       for (const child of running.values()) {
         try {
           process.kill(-child.pid, 'SIGTERM');
