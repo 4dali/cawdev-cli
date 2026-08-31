@@ -1727,6 +1727,25 @@ function writesCodeProfile(run) {
  * confused or misbehaving session can do is act on the run it was started for.
  */
 async function spawnAgent(config, run, runToken, cwd, baseCommit) {
+  // R51: what this machine will let a STORED rule cover. The project's rules
+  // are filtered through it before they go anywhere near a spawn, so the
+  // platform can narrow what runs here and never widen it.
+  //
+  // FIRST in this function, and it has to be: the MCP server's environment is
+  // written a few lines below and carries the ceiling, so a declaration further
+  // down is a ReferenceError on every single spawn. That shipped, and every
+  // coding run failed with "Cannot access 'ceiling' before initialization"
+  // until somebody tried to start one.
+  const ceiling = [
+    ...(config.grantable ?? []),
+    ...(config.projects[run.projectSlug]?.grantable ?? []),
+  ];
+  // Only a coding session can be given anything by a rule. Asked in the same
+  // breath as the ceiling so the two cannot drift apart.
+  const stored = writesCodeProfile(run) ? await projectRules(config, run.projectSlug) : [];
+  const admitted = stored.filter((pattern) => withinCeiling(ceiling, pattern));
+  const refused = stored.filter((pattern) => !withinCeiling(ceiling, pattern));
+
   const mcpDirectory = await mkdtemp(join(tmpdir(), 'cawdev-runner-'));
   const mcpConfigPath = join(mcpDirectory, 'mcp.json');
 
@@ -1776,20 +1795,6 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit) {
   // A project's own permissions apply to coding only. A project that permits
   // `mvn` for building has said nothing about permitting it to a session that
   // was asked a question.
-  //
-  // R51: what this machine will let a STORED rule cover. The project's rules
-  // are filtered through it before they go anywhere near a spawn, so the
-  // platform can narrow what runs here and never widen it. The same list goes
-  // to the MCP server below, because a rule added while this session is
-  // already running has never been through here at all.
-  const ceiling = [
-    ...(config.grantable ?? []),
-    ...(config.projects[run.projectSlug]?.grantable ?? []),
-  ];
-  const stored = writesCodeProfile(run) ? await projectRules(config, run.projectSlug) : [];
-  const admitted = stored.filter((pattern) => withinCeiling(ceiling, pattern));
-  const refused = stored.filter((pattern) => !withinCeiling(ceiling, pattern));
-
   const extras = run.profile && run.profile !== 'CODE'
     ? []
     : [
