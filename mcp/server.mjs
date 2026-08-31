@@ -235,6 +235,23 @@ async function pollForAnswer(config, project, runId, questionId, seconds) {
   return null;
 }
 
+/**
+ * The answer, with the argument that produced it.
+ *
+ * A question can be passed round before somebody answers it (R36), and the
+ * opinions collected on the way are on the question. Showing them matters: the
+ * answer is often "do the second one", and the reasoning that settled it lives
+ * in the thread rather than in the sentence you were handed.
+ */
+function renderAnswer(answered) {
+  const said = (answered.opinions ?? [])
+    .map((opinion) => `  ${opinion.authorEmail}: ${opinion.body}`)
+    .join('\n');
+
+  const answer = `${answered.answeredByEmail} answered:\n\n${answered.answer}`;
+  return said ? `${answer}\n\nWhat people said before deciding:\n${said}` : answer;
+}
+
 // --- the tools --------------------------------------------------------------
 
 const PROJECT_ARGUMENT = {
@@ -634,6 +651,21 @@ const TOOLS = [
               ? `A: ${question.answer}  (${question.answeredByEmail})`
               : `A: still waiting  (question_id ${question.id})`,
           );
+          // Who it went to, and what they said. A resumed session that cannot
+          // see this reads "still waiting" and concludes it has been ignored,
+          // when in fact somebody passed it to a colleague an hour ago.
+          for (const share of question.shares ?? []) {
+            if (share.open) {
+              lines.push(
+                share.kind === 'DECIDE'
+                  ? `   handed to ${share.sharedWithEmail} to decide, by ${share.sharedByEmail}`
+                  : `   ${share.sharedByEmail} asked ${share.sharedWithEmail} what they think`,
+              );
+            }
+          }
+          for (const opinion of question.opinions ?? []) {
+            lines.push(`   ${opinion.authorEmail} thinks: ${opinion.body}`);
+          }
         }
       }
       return lines.join('\n');
@@ -743,7 +775,7 @@ const TOOLS = [
 
       const answered = await pollForAnswer(config, project, runId, asked.id, askTimeoutSeconds());
       if (answered) {
-        return `${answered.answeredByEmail} answered:\n\n${answered.answer}`;
+        return renderAnswer(answered);
       }
       return (
         `Nobody has answered yet. The run is WAITING_ON_USER and the question is in their ` +
@@ -773,7 +805,7 @@ const TOOLS = [
         askTimeoutSeconds(),
       );
       if (answered) {
-        return `${answered.answeredByEmail} answered:\n\n${answered.answer}`;
+        return renderAnswer(answered);
       }
       return `Still nothing. Call await_answer again with question_id ${args.question_id}.`;
     },

@@ -313,9 +313,12 @@ try {
   const before = Date.now();
   const inbox = await console_('/api/inbox?wait=20');
   const waited = Math.round((Date.now() - before) / 1000);
-  const item = inbox.find((each) => each.runId === runId);
+  // Three groups since R36. Nothing has been passed on yet, so it is in the
+  // first one and the badge counts it.
+  const item = inbox.waitingOnYou.find((each) => each.runId === runId);
   check('the inbox long poll returns the question as soon as it is asked',
     item && waited < 15, `waited ${waited}s: ${JSON.stringify(inbox)}`);
+  check('the badge counts what is stopped on you', inbox.badge >= 1, JSON.stringify(inbox));
   check('the inbox item carries enough to route to the run',
     item?.projectSlug === project && item?.entryNumber === entry.number
       && item?.question.options.length === 2, JSON.stringify(item));
@@ -337,7 +340,89 @@ try {
     thread[0]?.answered && thread[0].answeredByEmail === EMAIL && thread[0].answeredAt,
     JSON.stringify(thread));
   check('the badge clears once nothing is waiting',
-    (await console_('/api/inbox')).every((each) => each.runId !== runId));
+    (await console_('/api/inbox')).waitingOnYou.every((each) => each.runId !== runId));
+
+  // --- R36: passing a question on ------------------------------------------
+
+  // A second question, so the whole share loop has something to act on.
+  const shared = await asToken(runToken, `${runPath}/questions`, {
+    question: 'Rename the endpoint, or keep the old one beside it?',
+  });
+
+  const candidates = await console_(
+    `${runPath}/questions/${shared.id}/share-candidates`,
+  );
+  check('the picker answers, and never offers you yourself',
+    Array.isArray(candidates) && candidates.every((who) => who.email !== EMAIL),
+    JSON.stringify(candidates));
+  check('anyone who could not answer is named with the reason, not hidden',
+    candidates.every((who) => who.eligible || who.why), JSON.stringify(candidates));
+
+  const colleague = candidates.find((who) => who.eligible);
+  if (!colleague) {
+    console.log(
+      'skip  passing a question on — this project has no other member holding WRITER.\n' +
+      '        Add one and re-run to exercise the share loop.',
+    );
+  } else {
+    await console_(`${runPath}/questions/${shared.id}/shares`, {
+      method: 'POST',
+      body: JSON.stringify({
+        withUserId: colleague.userId,
+        kind: 'OPINION',
+        note: 'You wrote the old one — what breaks?',
+      }),
+    });
+
+    const passed = await console_('/api/inbox');
+    const mine = passed.youAsked.find((each) => each.question.id === shared.id);
+    check('a question you passed on moves to "you asked someone"',
+      mine && !passed.waitingOnYou.some((each) => each.question.id === shared.id),
+      JSON.stringify(passed));
+    check('asking for an opinion does not unblock the run',
+      (await console_(`/api/projects/${project}/runs/${runId}`)).state === 'WAITING_ON_USER');
+    check('it still counts toward the badge — the session is still stopped',
+      passed.badge >= 1, JSON.stringify(passed));
+
+    // An opinion is not an answer: it lands on the question and leaves the run
+    // exactly where it was.
+    await console_(`${runPath}/questions/${shared.id}/opinions`, {
+      method: 'POST',
+      body: JSON.stringify({ body: 'Keep both for one release, then drop it.' }),
+    });
+
+    const withOpinion = (await console_(`${runPath}/questions`))
+      .find((each) => each.id === shared.id);
+    check('the opinion lands on the question without answering it',
+      withOpinion?.opinions.length === 1 && !withOpinion.answered,
+      JSON.stringify(withOpinion));
+    check('the run is still waiting on a person',
+      (await console_(`/api/projects/${project}/runs/${runId}`)).state === 'WAITING_ON_USER');
+
+    // Sharing must never be a way to grant access. A non-member is refused,
+    // and the refusal says why rather than pretending they do not exist.
+    const outsider = candidates.find((who) => !who.eligible);
+    if (outsider) {
+      const refused = await console_(`${runPath}/questions/${shared.id}/shares`, {
+        method: 'POST',
+        expect: 403,
+        body: JSON.stringify({ withUserId: outsider.userId, kind: 'DECIDE' }),
+      });
+      check('sharing with somebody who could not answer is refused, with a reason',
+        typeof refused?.message === 'string' && refused.message.length > 0,
+        JSON.stringify(refused));
+    }
+
+    await console_(
+      `${runPath}/questions/${shared.id}/answer`,
+      { method: 'POST', body: JSON.stringify({ answer: 'Keep both, drop it in v0.3.' }) },
+    );
+    const settled = (await console_(`${runPath}/questions`))
+      .find((each) => each.id === shared.id);
+    check('answering closes the share it was passed under',
+      settled?.shares.every((share) => !share.open && share.resolution === 'ANSWERED'),
+      JSON.stringify(settled?.shares));
+  }
 
   // --- the finish report ---------------------------------------------------
 

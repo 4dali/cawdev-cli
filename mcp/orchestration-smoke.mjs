@@ -207,8 +207,13 @@ try {
 
   // Give the ask time to reach the platform, then answer it from outside.
   await new Promise((resolve) => setTimeout(resolve, 800));
+  // Three groups since R36, not one list: what is on you, what you passed on,
+  // and what somebody wants your opinion about. Nothing has been passed
+  // anywhere here, so it is in the first.
   const inbox = await session('/api/inbox');
-  const target = inbox.find((item) => item.question.question === 'Postgres or SQLite?');
+  const target = inbox.waitingOnYou.find(
+    (item) => item.question.question === 'Postgres or SQLite?',
+  );
   check('the question reached the inbox with its run context',
     target && target.projectSlug === project, JSON.stringify(inbox));
 
