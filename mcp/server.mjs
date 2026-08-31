@@ -861,9 +861,17 @@ async function decide(config, args) {
     // willing to have applied with nobody watching. The ceiling is enforced
     // here as well as at spawn because a rule added while the session was
     // running has never been through the runner at all.
-    const rules = await api(config, `/api/projects/${project}/tool-rules`);
-    const live = (rules ?? [])
-      .map((rule) => rule.pattern)
+    //
+    // ITS OWN TRY, and this is the whole point of it: reading the rules is an
+    // optimisation — "has somebody already said yes to this" — and a failure to
+    // read them is a fact about the platform, not about this call. Sharing the
+    // catch below made an unreachable rules endpoint deny every single call
+    // without ever asking anybody, because the POST that raises the question
+    // sits after this line. A run against an API too old to have the endpoint
+    // reported itself blocked on npm, ng and most of Bash for a whole session,
+    // and nothing appeared in anyone's inbox. Unreadable rules means no rule
+    // applies, which means ask — the direction everything here fails in.
+    const live = (await liveRules(config, project))
       .filter((pattern) => withinCeiling(grantable(), pattern));
 
     const covered = coveredBy(live, toolName, input);
@@ -914,6 +922,24 @@ function allow(updatedInput, reason) {
 
 function deny(message) {
   return JSON.stringify({ behavior: 'deny', message });
+}
+
+/**
+ * The project's stored rules, or none when they cannot be read.
+ *
+ * Never throws. The caller is deciding a permission and must reach the point
+ * where it asks a person; an endpoint that 404s, times out or answers with
+ * nonsense is not an answer about this call, so it counts as "no rule covers
+ * it". The session then asks, which is what it would have done anyway had the
+ * project stored nothing.
+ */
+async function liveRules(config, project) {
+  try {
+    const rules = await api(config, `/api/projects/${project}/tool-rules`);
+    return (rules ?? []).map((rule) => rule?.pattern).filter((pattern) => typeof pattern === 'string');
+  } catch {
+    return [];
+  }
 }
 
 /**

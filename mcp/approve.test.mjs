@@ -22,7 +22,7 @@ const SERVER = new URL('./server.mjs', import.meta.url).pathname;
  * decision, and null keeps answering 204 — "still pending" — which is what the
  * agent's long poll sees while nobody has looked.
  */
-async function fakePlatform({ rules = [], decide = null, onApproval = () => {} } = {}) {
+async function fakePlatform({ rules = [], rulesStatus = 200, decide = null, onApproval = () => {} } = {}) {
   const asked = [];
   const server = createServer((request, response) => {
     const url = request.url ?? '';
@@ -35,6 +35,11 @@ async function fakePlatform({ rules = [], decide = null, onApproval = () => {} }
       return json({ runId: 'run-1', projects: [{ slug: 'board' }] });
     }
     if (url.startsWith('/api/projects/board/tool-rules')) {
+      if (rulesStatus !== 200) {
+        // An API too old to have the endpoint answers exactly like this.
+        response.writeHead(rulesStatus, { 'content-type': 'application/json' });
+        return response.end('{"status":404,"error":"Not Found"}');
+      }
       return json(rules.map((pattern) => ({ pattern })));
     }
     if (url.endsWith('/approvals') && request.method === 'POST') {
@@ -197,6 +202,26 @@ test('a rule outside the machine ceiling still asks', async () => {
       ),
     );
     assert.equal(decision.behavior, 'allow'); // because a person said so
+    assert.equal(platform.asked.length, 1, 'a person had to be asked');
+  } finally {
+    platform.close();
+  }
+});
+
+test('rules that cannot be read mean ask, not deny', async () => {
+  // The endpoint 404s — an API older than R51 does exactly this. That is a
+  // fact about the platform and not an answer about this call, so it must not
+  // short-circuit the question: a whole session was once reported blocked on
+  // npm and ng with nothing ever reaching anybody's inbox.
+  const platform = await fakePlatform({
+    rulesStatus: 404,
+    decide: { state: 'ALLOWED', reason: 'go on then' },
+  });
+  try {
+    const decision = JSON.parse(
+      await callTool(platform.url, 'approve', { tool_name: 'Bash', input: bash }),
+    );
+    assert.equal(decision.behavior, 'allow');
     assert.equal(platform.asked.length, 1, 'a person had to be asked');
   } finally {
     platform.close();

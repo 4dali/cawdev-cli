@@ -5,6 +5,18 @@
     "dycrypt": "/Users/dali/Documents/Dev/dycrypt",
     "medymo": "/Users/dali/Documents/Dev/medymo",
     "saasng": "/Users/dali/Documents/Dev/saasng",
-    "cawdev": "/Users/dali/Documents/Dev/cawdev"	
-  }
+    "cawdev": "/Users/dali/Documents/Dev/cawdev"
+  },
+  "allowedTools": [
+    "Bash(npm *)",
+    "Bash(npx *)",
+    "Bash(ng *)",
+    "Bash(mvn *)"
+  ],
+  "grantable": [
+    "Bash(npm *)",
+    "Bash(npx *)",
+    "Bash(ng *)",
+    "Bash(mvn *)"
+  ]
 }
