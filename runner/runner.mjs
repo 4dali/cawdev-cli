@@ -12,7 +12,7 @@
 // against your working copies; it should be a file you can read first.
 
 import { spawn } from 'node:child_process';
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describeTurn } from '../lib/usage.mjs';
@@ -314,6 +314,47 @@ function log(...parts) {
 /** Multi-line detail, set in from the log line it belongs to. */
 function indent(text) {
   return text.split('\n').map((line) => `    ${line}`).join('\n');
+}
+
+/**
+ * A copy of this daemon's own tooling, taken once at startup.
+ *
+ * The runner spawns the cawdev MCP server from `tools/mcp/server.mjs`, and
+ * cawdev is its own first project — so a run working on cawdev checks THAT
+ * DIRECTORY out onto another branch. The session is then handed whichever MCP
+ * server happened to be on the branch it is working on. That is how a run on a
+ * branch cut from `main` got a server with no `approve` tool while holding a
+ * `--permission-prompt-tool` flag that named it, and died on its first call.
+ *
+ * The rule it establishes is worth keeping on its own: **a daemon's tooling is
+ * frozen when the daemon starts.** Not because a newer one would be worse, but
+ * because a session's lifeline to the platform must not change underneath it
+ * when some other run switches a branch. To pick up a new MCP server, restart
+ * the daemon — which is when its own code is reloaded too, so the two can no
+ * longer disagree about what exists.
+ *
+ * The real fix is R47, where a run gets a workspace of its own and stops
+ * mutating the directory the daemon lives in. This keeps the daemon standing
+ * until then.
+ */
+async function snapshotTools() {
+  const here = new URL('.', import.meta.url).pathname;
+  const directory = await mkdtemp(join(tmpdir(), 'cawdev-tools-'));
+
+  await mkdir(join(directory, 'mcp'), { recursive: true });
+  await mkdir(join(directory, 'lib'), { recursive: true });
+  await copyFile(join(here, '../mcp/server.mjs'), join(directory, 'mcp/server.mjs'));
+
+  // Everything the server might import from lib. Copied wholesale rather than
+  // by working out its imports: a dependency list kept here is a list that goes
+  // stale the first time somebody adds one, and the symptom would be this same
+  // failure wearing a different message.
+  for (const file of await readdir(join(here, '../lib'))) {
+    if (file.endsWith('.mjs') && !file.endsWith('.test.mjs')) {
+      await copyFile(join(here, '../lib', file), join(directory, 'lib', file));
+    }
+  }
+  return { directory, serverPath: join(directory, 'mcp/server.mjs') };
 }
 
 /**
@@ -1861,7 +1902,9 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit) {
   const mcpDirectory = await mkdtemp(join(tmpdir(), 'cawdev-runner-'));
   const mcpConfigPath = join(mcpDirectory, 'mcp.json');
 
-  const serverPath = new URL('../mcp/server.mjs', import.meta.url).pathname;
+  // The frozen copy, never the one in the working copy — which the run itself
+  // may have just checked out onto another branch. See snapshotTools.
+  const serverPath = config.mcpServerPath ?? new URL('../mcp/server.mjs', import.meta.url).pathname;
 
   // The project's own MCP servers, folded into the config we pass.
   //
@@ -2211,6 +2254,18 @@ async function main() {
 
   log(`registered as "${runner.name}" (${runner.id}) against ${config.url}`);
   log(`serving: ${Object.entries(config.projects).map(([s, p]) => `${s} -> ${p.path}`).join(', ')}`);
+
+  // Frozen here, before anything can be claimed. A run that checks this very
+  // directory out onto another branch — which every run on cawdev does — must
+  // not be able to change what the NEXT session is given as its MCP server.
+  const tools = await snapshotTools().catch((failure) => {
+    log(`could not snapshot the MCP server (${failure.message}); using it in place`);
+    return null;
+  });
+  if (tools) {
+    config.mcpServerPath = tools.serverPath;
+    log(`MCP server frozen at ${tools.serverPath}`);
+  }
   if (config.grantable.length) {
     log(`stored rules may cover: ${config.grantable.join(', ')}`);
   }
@@ -2314,6 +2369,9 @@ async function main() {
       clearInterval(heartbeat);
       clearInterval(gitSurvey);
       clearInterval(publishRuns);
+      if (tools) {
+        await rm(tools.directory, { recursive: true, force: true }).catch(() => undefined);
+      }
       // Removed here rather than left for the next start: a socket file that
       // outlives its daemon is what makes the next `attach` report a machine
       // that is not there.

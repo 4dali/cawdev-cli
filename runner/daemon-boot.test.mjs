@@ -16,7 +16,7 @@ import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -270,6 +270,25 @@ test('a claimed run actually spawns', async (t) => {
     `the run never started: ${said}`,
   );
   assert.match(said, /spawning: \/bin\/echo/);
+
+  // And the session was given THIS daemon's MCP server, not whatever happens
+  // to be in the checkout.
+  //
+  // cawdev is its own first project, so a run working on it checks the
+  // daemon's own directory out onto another branch — and a session was handed
+  // a server from `main` with no `approve` tool while holding a
+  // --permission-prompt-tool flag naming it. It died on its first tool call.
+  const frozen = /MCP server frozen at (\S+)/.exec(said);
+  assert.ok(frozen, `the MCP server was not frozen at startup: ${said}`);
+  assert.ok(
+    frozen[1].startsWith(tmpdir()) || frozen[1].startsWith('/private'),
+    `frozen outside a temp directory, so a branch switch can still reach it: ${frozen[1]}`,
+  );
+  assert.match(
+    await readFile(frozen[1], 'utf8'),
+    /name: 'approve'/,
+    'the frozen copy is not the version this daemon was started with',
+  );
 });
 
 test('a daemon that stops takes its socket with it', async (t) => {

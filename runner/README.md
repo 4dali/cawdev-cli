@@ -105,6 +105,32 @@ More than one daemon here? `attach --runner <name>`. One is chosen for you.
 If `attach` says nothing is offering a socket, the daemon is not running — or it
 predates R52.
 
+## The daemon's tooling is frozen when it starts
+
+The runner spawns the cawdev MCP server from this repository — and **cawdev is
+its own first project**, so a run working on cawdev checks this very directory
+out onto another branch. The session would then be handed whichever MCP server
+happened to be on the branch it is working on.
+
+That is not hypothetical: a run on a branch cut from `main` was given a server
+with no `approve` tool while holding a `--permission-prompt-tool` flag naming
+it, and died on its first tool call.
+
+So the server is **copied to a temp directory at startup** and sessions are
+pointed at the copy. To pick up changes to it, restart the daemon — which is
+when its own code reloads anyway, so the two cannot disagree about what exists.
+
+**If you drive cawdev with cawdev, run the daemon from a separate worktree:**
+
+```sh
+git worktree add ~/code/cawdev-runner main
+cd ~/code/cawdev-runner/tools/runner
+node runner.mjs --config ~/code/cawdev/tools/runner/macbook-laptop.json --attach
+```
+
+Then a run switching branches in your working copy cannot reach the daemon's own
+files at all. R47 removes the need for this by giving each run a workspace.
+
 ## What it does with a run
 
 1. **Claims it.** The claim response carries the run's own `cawdr_` token and
