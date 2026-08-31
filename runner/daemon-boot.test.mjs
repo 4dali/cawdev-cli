@@ -14,74 +14,16 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
-import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { socketPathFor } from './control.mjs';
+import { fakePlatform } from './test-platform.mjs';
 
 const RUNNER = 'test-daemon-boot-r52';
 const DAEMON = new URL('./runner.mjs', import.meta.url).pathname;
-
-/**
- * Answers the calls a daemon makes.
- *
- * `offer` is a run handed over ONCE — the queue is empty afterwards, so the
- * daemon claims it, spawns it, and then goes quiet like a real one.
- */
-async function fakePlatform({ offer = null } = {}) {
-  const seen = [];
-  const transitions = [];
-  let offered = false;
-
-  const server = createServer((request, response) => {
-    seen.push(`${request.method} ${request.url.split('?')[0]}`);
-    let body = '';
-    request.on('data', (chunk) => (body += chunk));
-    request.on('end', () => {
-      const url = request.url ?? '';
-      response.writeHead(200, { 'content-type': 'application/json' });
-
-      if (url.startsWith('/api/runners') && request.method === 'POST' && url.endsWith('/runners')) {
-        return response.end(JSON.stringify({ id: 'runner-1', name: JSON.parse(body).name }));
-      }
-      if (url.includes('/queue')) {
-        if (offer && !offered) {
-          offered = true;
-          return response.end(JSON.stringify([{ run: offer }]));
-        }
-        return response.end('[]');
-      }
-      if (url.includes('/claim/')) {
-        return response.end(JSON.stringify({
-          runToken: 'cawdr_fake',
-          defaultBranch: 'main',
-          allowDirty: false,
-        }));
-      }
-      if (url.endsWith('/transition') && request.method === 'POST') {
-        transitions.push(JSON.parse(body));
-        return response.end('{}');
-      }
-      if (url.match(/\/runs\/[^/]+$/) && request.method === 'GET') {
-        // Over as far as the platform is concerned, so the daemon does not try
-        // to finish a run somebody else already finished.
-        return response.end(JSON.stringify({ live: false }));
-      }
-      response.end('{}');
-    });
-  });
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  return {
-    url: `http://127.0.0.1:${server.address().port}`,
-    seen,
-    transitions,
-    close: () => server.close(),
-  };
-}
 
 /**
  * Reads the first message a client is sent, or gives up.
@@ -220,13 +162,13 @@ test('a claimed run actually spawns', async (t) => {
   // An ASK profile, because it prepares no working copy and so needs no git
   // remote, and it reaches spawnAgent by exactly the same path.
   const platform = await fakePlatform({
-    offer: {
+    offers: [{
       id: 'run-ask-1',
       projectSlug: 'board',
       label: 'what is R12 about?',
       branch: null,
       profile: 'ASK',
-    },
+    }],
   });
   const directory = await mkdtemp(join(tmpdir(), 'cawdev-boot-'));
   const config = join(directory, 'config.json');
@@ -254,10 +196,7 @@ test('a claimed run actually spawns', async (t) => {
     await rm(socketPathFor(`${RUNNER}-4`), { force: true });
   });
 
-  const deadline = Date.now() + 15000;
-  while (Date.now() < deadline && !platform.transitions.length) {
-    await new Promise((done) => setTimeout(done, 200));
-  }
+  await platform.until((transitions) => transitions.length > 0);
 
   const failed = platform.transitions.find((each) => each.state === 'FAILED');
   assert.equal(

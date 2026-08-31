@@ -105,6 +105,45 @@ More than one daemon here? `attach --runner <name>`. One is chosen for you.
 If `attach` says nothing is offering a socket, the daemon is not running — or it
 predates R52.
 
+## Workspaces: more than one run at a time
+
+A project can offer several checkouts. A run takes one, and gives it back when
+it ends.
+
+```json
+{
+  "projects": {
+    "dycrypt": "/Users/you/code/dycrypt",
+    "cawdev": { "workspaces": ["/Users/you/code/cawdev-1", "/Users/you/code/cawdev-2"] }
+  }
+}
+```
+
+A bare path means one workspace, which is what every config meant before this
+existed — nothing changes for a machine that serves one checkout per project.
+
+How many coding runs go at once is `min(workspaces, maxSessions)`. A run that
+waits now says **"no free workspace in cawdev (2 here, all busy)"** instead of
+"that project already has a run here", which was a proxy for it. Asking a
+question takes no workspace and never queues behind coding.
+
+### A workspace belongs to the daemon
+
+Before each run it is cleared with `git clean -fd` — **without `-x`**, so
+`.env`, `node_modules` and `target` survive and only what the last session left
+lying about is removed. What goes is always logged.
+
+**Do not list a directory you work in by hand.** That clean deletes untracked
+files. It is skipped when a run was deliberately started on top of uncommitted
+work, but the rule stands: a workspace is the machine's, not yours.
+
+Provision them however you like — `git clone`, then whatever the project needs
+to build. R48 makes them cheap by cloning a golden checkout per run; until then
+they are yours to create, and two or three is plenty.
+
+Nothing is written down about which workspace is busy, so a killed daemon leaks
+nothing: restarting frees them all.
+
 ## The daemon's tooling is frozen when it starts
 
 The runner spawns the cawdev MCP server from this repository — and **cawdev is

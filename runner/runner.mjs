@@ -212,28 +212,57 @@ async function readConfig() {
 }
 
 /**
- * A project is a path, or a path with permissions of its own.
+ * A project is a path, or a path with permissions of its own, or several
+ * checkouts a run can be given one of.
  *
- * Both forms are accepted because most projects only need a path, and a config
- * that forces the long form on everybody to accommodate the one project that
- * runs Maven is a worse config.
+ * All three forms are accepted because most projects only need a path, and a
+ * config that forces the long form on everybody to accommodate the one project
+ * that runs three sessions at once is a worse config.
  *
  *   "dycrypt": "/Users/you/code/dycrypt"
  *   "dycrypt": { "path": "…", "allowedTools": ["Bash(mvn *)", "mcp__roadmap"] }
+ *   "cawdev":  { "workspaces": ["/…/ws-1", "/…/ws-2", "/…/ws-3"] }
+ *
+ * R47: a bare path means ONE workspace, which is what every config meant
+ * before workspaces existed. Concurrency for a project is
+ * `min(workspaces, maxSessions)`, and a run that waits now waits because there
+ * is no free checkout — which is the truth, rather than "that project already
+ * has a run here" standing in for it.
  */
 function normaliseProjects(projects) {
   const normalised = {};
   for (const [slug, value] of Object.entries(projects)) {
-    normalised[slug] = typeof value === 'string'
-      ? { path: value, allowedTools: [], grantable: [] }
-      : {
-          path: value.path,
-          allowedTools: value.allowedTools ?? [],
-          // A ceiling for this project alone, added to the machine's. A laptop
-          // that will let one repository run Maven unattended has not said the
-          // same about the other three.
-          grantable: value.grantable ?? [],
-        };
+    const settings = typeof value === 'string' ? { path: value } : value;
+    const workspaces = (settings.workspaces ?? (settings.path ? [settings.path] : []))
+      .map((path) => resolve(path));
+
+    if (!workspaces.length) {
+      throw new Error(
+        `Project "${slug}" has no path and no workspaces. Give it one:\n\n` +
+          `  "${slug}": "/Users/you/code/${slug}"\n\n` +
+          'or several, for runs that should go at the same time:\n\n' +
+          `  "${slug}": { "workspaces": ["/…/ws-1", "/…/ws-2"] }`,
+      );
+    }
+    const duplicated = workspaces.find((path, at) => workspaces.indexOf(path) !== at);
+    if (duplicated) {
+      // Two names for one directory is two runs in one checkout wearing a
+      // disguise, and the gate below would wave both through.
+      throw new Error(`Project "${slug}" lists ${duplicated} twice. A workspace is one directory.`);
+    }
+
+    normalised[slug] = {
+      workspaces,
+      // The first, for everything that reads a project rather than a run: the
+      // Git tab's survey, the merge check. They want *a* checkout of this
+      // project, not the one a particular run is using.
+      path: workspaces[0],
+      allowedTools: settings.allowedTools ?? [],
+      // A ceiling for this project alone, added to the machine's. A laptop
+      // that will let one repository run Maven unattended has not said the
+      // same about the other three.
+      grantable: settings.grantable ?? [],
+    };
   }
   return normalised;
 }
@@ -407,6 +436,32 @@ function git(cwd, args) {
  * is a heartbeat old, and a tree that went dirty inside that window would
  * otherwise be worked on by an agent while somebody has edits open.
  */
+/**
+ * Clears what the last session left lying about — R47.
+ *
+ * `git clean -fd`, and deliberately WITHOUT `-x`: ignored files stay, which is
+ * `.env`, `node_modules` and `target`. Nothing reinstalls those, and a
+ * workspace that loses them every run is a workspace where every run begins
+ * with a cold build.
+ *
+ * <strong>A workspace belongs to the daemon, not to you.</strong> This deletes
+ * untracked files, so a directory listed as a workspace must not be one
+ * somebody works in by hand. It is skipped entirely when the run was started
+ * on top of uncommitted work, because there the untracked files are the point.
+ */
+async function resetWorkspace(path) {
+  const leftovers = await git(path, ['clean', '-nd']).catch(() => '');
+  if (!leftovers) {
+    return;
+  }
+  // Said out loud, always. Deleting somebody's files quietly is how a tool
+  // stops being trusted, even when it was right to delete them.
+  log(`  clearing what a previous session left in ${path}:\n${indent(leftovers)}`);
+  await git(path, ['clean', '-fd']).catch((failure) => {
+    log(`  could not clear it: ${failure.message.split('\n')[0]}`);
+  });
+}
+
 async function prepareWorkingCopy(path, branch, defaultBranch, allowDirty) {
   await access(join(path, '.git')).catch(() => {
     throw new Error(`${path} is not a git repository.`);
@@ -490,24 +545,34 @@ function statusAndPath(line) {
 
 async function surveyWorkingCopies(config) {
   const survey = [];
+  // One entry per WORKSPACE since R47, not per project. With three checkouts of
+  // one project, "what is uncommitted in cawdev" has three answers, and
+  // reporting the first as though it were the only one tells somebody their
+  // work is safe when it is sitting in the checkout next door.
   for (const [slug, project] of Object.entries(config.projects)) {
-    const path = resolve(project.path);
-    try {
-      await access(join(path, '.git'));
-      const porcelain = await git(path, ['status', '--porcelain']);
-      const lines = porcelain ? porcelain.split('\n').filter((line) => line.trim()) : [];
-      survey.push({
-        project: slug,
-        path,
-        dirty: lines.length,
-        files: lines.slice(0, SURVEY_FILE_CAP).map(statusAndPath),
-      });
-    } catch (failure) {
-      survey.push({
-        project: slug,
-        path,
-        unreadable: failure.message.split('\n')[0],
-      });
+    for (const path of project.workspaces) {
+      const held = heldBy(path);
+      try {
+        await access(join(path, '.git'));
+        const porcelain = await git(path, ['status', '--porcelain']);
+        const lines = porcelain ? porcelain.split('\n').filter((line) => line.trim()) : [];
+        survey.push({
+          project: slug,
+          path,
+          // Which run has it, so a dirty workspace can be read as "a session is
+          // working" rather than "somebody left something behind".
+          runId: held ?? null,
+          dirty: lines.length,
+          files: lines.slice(0, SURVEY_FILE_CAP).map(statusAndPath),
+        });
+      } catch (failure) {
+        survey.push({
+          project: slug,
+          path,
+          runId: held ?? null,
+          unreadable: failure.message.split('\n')[0],
+        });
+      }
     }
   }
   return survey;
@@ -707,10 +772,14 @@ async function surveyProjectGit(path, { fetch = true } = {}) {
  */
 async function surveyGit(config) {
   for (const [slug, project] of Object.entries(config.projects)) {
-    const path = resolve(project.path);
-    const busy = [...running.values()].some(
-      (child) => child.cawdevProjectSlug === slug && child.cawdevWritesCode,
-    );
+    // A free checkout for preference — R47. This reading is about the project
+    // as a whole, and a workspace with a session in it is sitting on that
+    // session's branch with its work uncommitted. Reading the pool's spare
+    // gives the honest picture of the default branch instead.
+    const held = heldWorkspaces();
+    const free = project.workspaces.find((candidate) => !held.has(candidate));
+    const path = free ?? resolve(project.path);
+    const busy = free === undefined;
 
     const reading = await surveyProjectGit(path, { fetch: !busy }).catch((failure) => ({
       error: failure.message.split('\n')[0],
@@ -1443,7 +1512,10 @@ async function checkMerges(config) {
     if (!project) {
       continue; // Not ours to answer for.
     }
-    const cwd = resolve(project.path);
+    // Same argument as the git survey: read a checkout nobody is working in.
+    const heldNow = heldWorkspaces();
+    const cwd = project.workspaces.find((candidate) => !heldNow.has(candidate))
+      ?? resolve(project.path);
 
     try {
       await access(join(cwd, '.git'));
@@ -1731,6 +1803,36 @@ const taken = new Map();
  */
 const noted = new Map();
 
+/**
+ * The run holding a workspace, or undefined — R47.
+ *
+ * Read from the two places a workspace can be spoken for: a live child, and a
+ * run claimed but not yet spawned. Kept as a function rather than a third map
+ * because a third map is a third thing to forget to update, and the failure
+ * that causes is two agents in one checkout.
+ */
+function heldBy(path) {
+  for (const [id, child] of running) {
+    if (child.cawdevWorkspace === path) return id;
+  }
+  for (const [id, claim] of taken) {
+    if (claim.workspace === path) return id;
+  }
+  return undefined;
+}
+
+/** Every workspace spoken for right now. */
+function heldWorkspaces() {
+  const held = new Set();
+  for (const child of running.values()) {
+    if (child.cawdevWorkspace) held.add(child.cawdevWorkspace);
+  }
+  for (const claim of taken.values()) {
+    if (claim.workspace) held.add(claim.workspace);
+  }
+  return held;
+}
+
 function noteQueued(run, why) {
   if (noted.has(run.id)) {
     return;
@@ -1763,6 +1865,9 @@ function snapshotRuns() {
       branch: run.branch ?? null,
       profile: run.profile ?? 'CODE',
       writesCode: child.cawdevWritesCode === true,
+      // Which checkout it is in — R47. On a machine serving three, the label
+      // alone no longer says where the work is.
+      workspace: child.cawdevWorkspace ?? null,
       startedAt: child.cawdevStartedAt ?? null,
     });
   }
@@ -1776,6 +1881,7 @@ function snapshotRuns() {
       branch: null,
       profile: claim.writes ? 'CODE' : null,
       writesCode: claim.writes === true,
+      workspace: claim.workspace ?? null,
       startedAt: null,
     });
   }
@@ -1796,10 +1902,12 @@ function snapshotRuns() {
   return runs;
 }
 
-async function startRun(config, offered) {
+async function startRun(config, offered, workspace) {
   const run = offered.run;
   const project = config.projects[run.projectSlug];
-  const path = project?.path;
+  // The workspace this run was given, or — for a run that takes none — the
+  // first, which is where a question about the project gets read from.
+  const path = workspace ?? project?.path;
   let runToken;
   let defaultBranch;
   let allowDirty = false;
@@ -1836,6 +1944,12 @@ async function startRun(config, offered) {
       // "what is R12 about?" unanswerable while somebody has edits open.
       log(`  a ${run.profile.toLowerCase()} session: no branch, nothing prepared`);
     } else {
+      // Cleared BEFORE the checkout, and never when somebody deliberately
+      // started on top of their own uncommitted work — there the untracked
+      // files are the point of the run.
+      if (!allowDirty) {
+        await resetWorkspace(resolve(path));
+      }
       const prepared = await prepareWorkingCopy(
         resolve(path), run.branch, defaultBranch, allowDirty);
       branch = prepared.branch;
@@ -1845,10 +1959,15 @@ async function startRun(config, offered) {
 
     await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/transition`, {
       method: 'POST',
-      body: { state: 'RUNNING' },
+      // Where it ran, sent with the move to RUNNING because that is the one
+      // moment it is known. With three checkouts of one project, a run that
+      // does not say which it used makes "what is uncommitted on this run"
+      // unanswerable — and a console showing one run's files against another
+      // run's path is worse than one showing nothing.
+      body: { state: 'RUNNING', workspace: workspace ?? null },
     });
 
-    await spawnAgent(config, run, runToken, resolve(path), baseCommit);
+    await spawnAgent(config, run, runToken, resolve(path), baseCommit, workspace);
   } catch (failure) {
     // Anything that goes wrong before or during the spawn is the run's failure,
     // and the reason belongs on the run where someone will see it.
@@ -1879,7 +1998,7 @@ function writesCodeProfile(run) {
  * `cawdr_` token bound to one run, which expires with it — so the worst a
  * confused or misbehaving session can do is act on the run it was started for.
  */
-async function spawnAgent(config, run, runToken, cwd, baseCommit) {
+async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace) {
   // R51: what this machine will let a STORED rule cover. The project's rules
   // are filtered through it before they go anywhere near a spawn, so the
   // platform can narrow what runs here and never widen it.
@@ -2004,6 +2123,10 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit) {
     });
 
     child.cawdevProjectSlug = run.projectSlug;
+    // The checkout this child holds, and what the queue serialises on. Null for
+    // a run that took none, which is what lets an ASK session run alongside
+    // three coding ones.
+    child.cawdevWorkspace = workspace ?? null;
     // Enough of the run for the socket to name it. The child is the only handle
     // the daemon keeps once a session is going, so what somebody attaching
     // needs to read has to hang off it.
@@ -2169,6 +2292,13 @@ function capabilities(config) {
     // a machine is live and serving a project, and still not explain why a
     // fourth run is sitting there while three others go.
     maxSessions: config.maxSessions,
+    // How many checkouts each project has here — R47. Coding concurrency is
+    // min(workspaces, maxSessions), so maxSessions alone stopped being the
+    // whole answer: a machine with four sessions and one checkout still runs
+    // one coding session at a time, and the console should be able to say so.
+    workspaces: Object.fromEntries(
+      Object.entries(config.projects).map(([slug, project]) => [slug, project.workspaces.length]),
+    ),
     agent: config.agentCommand,
   });
 }
@@ -2253,7 +2383,12 @@ async function main() {
   config.runnerId = runner.id;
 
   log(`registered as "${runner.name}" (${runner.id}) against ${config.url}`);
-  log(`serving: ${Object.entries(config.projects).map(([s, p]) => `${s} -> ${p.path}`).join(', ')}`);
+  for (const [slug, project] of Object.entries(config.projects)) {
+    const many = project.workspaces.length > 1
+      ? ` (${project.workspaces.length} workspaces, so ${project.workspaces.length} at once)`
+      : '';
+    log(`serving ${slug}${many}: ${project.workspaces.join(', ')}`);
+  }
 
   // Frozen here, before anything can be claimed. A run that checks this very
   // directory out onto another branch — which every run on cawdev does — must
@@ -2441,28 +2576,23 @@ async function main() {
         `/api/runners/${config.runnerId}/queue?wait=${config.pollSeconds}`,
       );
 
-      // One run at a time per working copy — but only for runs that USE one.
+      // One run at a time per WORKSPACE — R47, and only for runs that use one.
       //
-      // ENTRY and MANUAL runs share a checkout, so a second in the same
-      // directory would fight the first. An ASK run prepares nothing and writes
-      // nothing, so it has no reason to wait behind them: making it queue meant
-      // you could not ask a question about a project while anything was running
-      // there, which is exactly when you would want to.
+      // The gate used to key on the project, because there was one checkout per
+      // project and the two were the same thing. They are not any more: a
+      // project with three workspaces takes three coding runs, and the reason a
+      // fourth waits is that there is no free checkout rather than that the
+      // project is somehow occupied.
+      //
+      // An ASK run prepares nothing and writes nothing, so it takes no
+      // workspace and waits for nothing — asking "what is R12 about?" while
+      // three sessions are running is exactly when you would want to.
       //
       // Computed AFTER the poll, not before. The poll blocks for up to
       // pollSeconds, so a set built before it is a snapshot of the world as it
       // was when the wait began — and a run that started during the wait was
       // invisible. Two agents went into one checkout that way.
-      const busy = new Set([
-        ...[...running.values()]
-          .filter((child) => child.cawdevWritesCode)
-          .map((child) => child.cawdevProjectSlug),
-        // Claimed but not yet spawned counts too. Anything else leaves a hole
-        // exactly as wide as a claim plus a fetch and a checkout.
-        ...[...taken.values()]
-          .filter((claim) => claim.writes)
-          .map((claim) => claim.projectSlug),
-      ].filter(Boolean));
+      const held = heldWorkspaces();
 
       let claimable = 0;
       let skipped = 0;
@@ -2475,11 +2605,21 @@ async function main() {
         if (taken.has(offered.run.id)) {
           continue; // Already being claimed or prepared by us.
         }
-        const writes = !offered.run.profile || offered.run.profile === 'CODE';
-        if (writes && busy.has(slug)) {
-          noteQueued(offered.run, `${slug} already has a run here`);
-          skipped += 1;
-          continue;
+        const writes = writesCodeProfile(offered.run);
+
+        // Which checkout this one gets. Null for a run that needs none.
+        let workspace = null;
+        if (writes) {
+          workspace = config.projects[slug].workspaces.find((path) => !held.has(path)) ?? null;
+          if (!workspace) {
+            const total = config.projects[slug].workspaces.length;
+            noteQueued(
+              offered.run,
+              `no free workspace in ${slug} (${total} here, all busy)`,
+            );
+            skipped += 1;
+            continue;
+          }
         }
         if (running.size >= config.maxSessions) {
           // A bound on how many agent processes this machine will host at once.
@@ -2488,11 +2628,18 @@ async function main() {
           skipped += 1;
           continue;
         }
-        busy.add(slug);
-        taken.set(offered.run.id, { projectSlug: slug, writes, label: offered.run.label });
+        if (workspace) {
+          held.add(workspace);
+        }
+        taken.set(offered.run.id, {
+          projectSlug: slug,
+          writes,
+          workspace,
+          label: offered.run.label,
+        });
         noted.delete(offered.run.id);
         claimable += 1;
-        void startRun(config, offered);
+        void startRun(config, offered, workspace);
       }
 
       // Forget runs that are no longer offered, so one that comes back around

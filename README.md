@@ -121,6 +121,16 @@ is a read-only view on purpose.
 terminal UI goes wrong silently: transcripts carry the agent's ANSI colour, and
 measuring it as plain text wraps the pane into nonsense.
 
+`tools/runner/workspaces.test.mjs` is R47 against the real daemon: two coding
+runs on one project, at the same time, in different checkouts, each reporting
+which. Getting that gate wrong is expensive in both directions — too tight and a
+machine with three checkouts still runs one session, too loose and two agents
+share a working copy.
+
+`tools/runner/test-platform.mjs` is the cawdev those two tests register with.
+Not a test itself, and not production code: it is a fake platform with a queue,
+shared because two fakes drift.
+
 `tools/runner/daemon-boot.test.mjs` starts the **real daemon** against a faked
 platform and a fake agent command. It is the only test of the first ten seconds
 — registering, the R51 permission-flag probe, opening the socket, and removing
