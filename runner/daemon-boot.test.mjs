@@ -25,9 +25,17 @@ import { socketPathFor } from './control.mjs';
 const RUNNER = 'test-daemon-boot-r52';
 const DAEMON = new URL('./runner.mjs', import.meta.url).pathname;
 
-/** Answers the handful of calls a daemon makes before it has any work. */
-async function fakePlatform() {
+/**
+ * Answers the calls a daemon makes.
+ *
+ * `offer` is a run handed over ONCE — the queue is empty afterwards, so the
+ * daemon claims it, spawns it, and then goes quiet like a real one.
+ */
+async function fakePlatform({ offer = null } = {}) {
   const seen = [];
+  const transitions = [];
+  let offered = false;
+
   const server = createServer((request, response) => {
     seen.push(`${request.method} ${request.url.split('?')[0]}`);
     let body = '';
@@ -35,19 +43,44 @@ async function fakePlatform() {
     request.on('end', () => {
       const url = request.url ?? '';
       response.writeHead(200, { 'content-type': 'application/json' });
+
       if (url.startsWith('/api/runners') && request.method === 'POST' && url.endsWith('/runners')) {
         return response.end(JSON.stringify({ id: 'runner-1', name: JSON.parse(body).name }));
       }
       if (url.includes('/queue')) {
-        // No work, and the daemon should sit here quietly rather than spin.
+        if (offer && !offered) {
+          offered = true;
+          return response.end(JSON.stringify([{ run: offer }]));
+        }
         return response.end('[]');
+      }
+      if (url.includes('/claim/')) {
+        return response.end(JSON.stringify({
+          runToken: 'cawdr_fake',
+          defaultBranch: 'main',
+          allowDirty: false,
+        }));
+      }
+      if (url.endsWith('/transition') && request.method === 'POST') {
+        transitions.push(JSON.parse(body));
+        return response.end('{}');
+      }
+      if (url.match(/\/runs\/[^/]+$/) && request.method === 'GET') {
+        // Over as far as the platform is concerned, so the daemon does not try
+        // to finish a run somebody else already finished.
+        return response.end(JSON.stringify({ live: false }));
       }
       response.end('{}');
     });
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
-  return { url: `http://127.0.0.1:${server.address().port}`, seen, close: () => server.close() };
+  return {
+    url: `http://127.0.0.1:${server.address().port}`,
+    seen,
+    transitions,
+    close: () => server.close(),
+  };
 }
 
 /**
@@ -177,6 +210,66 @@ test('--attach starts the machine and shows it, in one terminal', async (t) => {
   assert.doesNotMatch(plain, /registered as/, "the daemon's log leaked onto the UI's terminal");
   // Its own daemon, so the key is "stop", not "quit".
   assert.match(plain, /q stop/);
+});
+
+test('a claimed run actually spawns', async (t) => {
+  // The gap that let R51 ship a spawn that could not run. Nothing exercised
+  // spawnAgent, so `ceiling` being read above its own declaration — a
+  // ReferenceError on every single coding run — passed every test there was.
+  //
+  // An ASK profile, because it prepares no working copy and so needs no git
+  // remote, and it reaches spawnAgent by exactly the same path.
+  const platform = await fakePlatform({
+    offer: {
+      id: 'run-ask-1',
+      projectSlug: 'board',
+      label: 'what is R12 about?',
+      branch: null,
+      profile: 'ASK',
+    },
+  });
+  const directory = await mkdtemp(join(tmpdir(), 'cawdev-boot-'));
+  const config = join(directory, 'config.json');
+  await writeFile(config, JSON.stringify({
+    url: platform.url,
+    name: `${RUNNER}-4`,
+    agentCommand: '/bin/echo',
+    grantable: ['Bash(mvn *)'],
+    projects: { board: directory },
+    pollSeconds: 1,
+  }));
+
+  const daemon = spawn(process.execPath, [DAEMON, '--config', config], {
+    env: { ...process.env, CAWDEV_TOKEN: 'cawd_fake' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let said = '';
+  daemon.stdout.on('data', (chunk) => (said += chunk));
+  daemon.stderr.on('data', (chunk) => (said += chunk));
+
+  t.after(async () => {
+    daemon.kill('SIGKILL');
+    platform.close();
+    await rm(directory, { recursive: true, force: true });
+    await rm(socketPathFor(`${RUNNER}-4`), { force: true });
+  });
+
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline && !platform.transitions.length) {
+    await new Promise((done) => setTimeout(done, 200));
+  }
+
+  const failed = platform.transitions.find((each) => each.state === 'FAILED');
+  assert.equal(
+    failed,
+    undefined,
+    `the run failed instead of spawning: ${failed?.summary ?? ''}\n${said}`,
+  );
+  assert.ok(
+    platform.transitions.some((each) => each.state === 'RUNNING'),
+    `the run never started: ${said}`,
+  );
+  assert.match(said, /spawning: \/bin\/echo/);
 });
 
 test('a daemon that stops takes its socket with it', async (t) => {
