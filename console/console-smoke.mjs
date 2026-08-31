@@ -113,7 +113,12 @@ async function asToken(token, path, body, method = 'POST') {
 // A stable name, not one per process: registering is idempotent by
 // (owner, name), and a pid in it bred a new runner on every run — eighteen of
 // them before anybody noticed the list was mostly litter.
-const runner = await asToken(runnerToken, '/api/runners', { name: 'console-smoke' });
+// Capabilities in the shape R35 documented (DEVELOPING.md, "What a runner says
+// about itself"), because the Runners page and `?serving=` both read it.
+const runner = await asToken(runnerToken, '/api/runners', {
+  name: 'console-smoke',
+  capabilities: JSON.stringify({ projects: [project], maxSessions: 1, agent: 'smoke' }),
+});
 
 // The console clears the way: an earlier live run would refuse this one, and
 // cancelling is a console action too.
@@ -138,12 +143,45 @@ let runId;
 try {
   // --- what the entry page shows before you press start ---------------------
 
+  // R35. Two questions of one endpoint: the Runners page wants your machines
+  // in full, and the start form's badge wants only "is anything up here".
   const runners = await console_('/api/runners');
-  const live = runners.filter((each) => each.alive);
+  const mine = runners.find((each) => each.id === runner.id);
+  check(
+    'the Runners page sees your own machine, flagged as yours',
+    mine?.yours === true,
+    JSON.stringify(runners),
+  );
+  check(
+    'and what it says it serves and drives',
+    JSON.parse(mine?.capabilities ?? '{}').projects?.includes(project)
+      && Array.isArray(mine?.driving),
+    JSON.stringify(mine),
+  );
+
+  const serving = await console_(`/api/runners?serving=${project}`);
+  const live = serving.filter((each) => each.alive);
   check(
     'the entry page can see which runners are live',
     live.some((each) => each.id === runner.id),
-    JSON.stringify(runners),
+    JSON.stringify(serving),
+  );
+  check(
+    'and ?serving= hands out a name and a liveness, not the inventory',
+    serving.every((each) => !('ownerEmail' in each) && !('workingCopies' in each)),
+    JSON.stringify(serving),
+  );
+
+  // Forgetting is refused while the machine is beating: it would register
+  // itself again on its next heartbeat, so the button would appear to work.
+  const beating = await console_(`/api/runners/${runner.id}/forget`, {
+    method: 'POST',
+    expect: 409,
+  });
+  check(
+    'a machine that is still beating cannot be forgotten',
+    /still beating/i.test(beating?.message ?? ''),
+    JSON.stringify(beating),
   );
 
   // The branch the console proposes. Kept in step with proposeBranch() in

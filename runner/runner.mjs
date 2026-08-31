@@ -1862,6 +1862,31 @@ async function reapCancelled(config) {
 
 // --- the loop ----------------------------------------------------------------
 
+/**
+ * What this machine says it can do, as the platform stores it.
+ *
+ * The shape is documented — DEVELOPING.md, "What a runner says about itself" —
+ * and the console reads it: R35 gives every runner a row saying which projects
+ * it serves and how many sessions at once it will take, which used to be
+ * knowable only by reading this file on the machine itself.
+ *
+ * Stringified, like `workingCopies` and R24's per-file detail: the column is
+ * free-form JSON and the platform stores what the runner said rather than a
+ * reading of it. Sent on every heartbeat and not only at registration, so a
+ * daemon restarted with a project added does not leave the console showing
+ * yesterday's answer.
+ */
+function capabilities(config) {
+  return JSON.stringify({
+    projects: Object.keys(config.projects),
+    // The gate the queue loop actually enforces. Without it the console can say
+    // a machine is live and serving a project, and still not explain why a
+    // fourth run is sitting there while three others go.
+    maxSessions: config.maxSessions,
+    agent: config.agentCommand,
+  });
+}
+
 async function main() {
   const config = await readConfig();
 
@@ -1869,10 +1894,7 @@ async function main() {
     method: 'POST',
     body: {
       name: config.name,
-      capabilities: JSON.stringify({
-        projects: Object.keys(config.projects),
-        agent: config.agentCommand,
-      }),
+      capabilities: capabilities(config),
     },
   });
   config.runnerId = runner.id;
@@ -1903,6 +1925,7 @@ async function main() {
       body: {
         name: config.name,
         running: [...running.keys()],
+        capabilities: capabilities(config),
         // Stringified, as `capabilities` and R24's detail are: the platform
         // stores what this machine said, not its own reading of it.
         workingCopies: workingCopies ? JSON.stringify(workingCopies) : null,
