@@ -37,9 +37,26 @@ runner rather than a third entry in the list.
 
 ## Watching it from a terminal
 
+Start the machine and watch it with one command:
+
+```sh
+node runner.mjs --config macbook-laptop.json --attach
+```
+
+Or attach to a daemon that is already running, from another window:
+
 ```sh
 node runner.mjs attach
 ```
+
+With `--attach` there is **one process and one terminal**: the daemon's log
+stops printing (it would paint over the UI) and moves to the `g` pane, and `q`
+stops the daemon rather than just closing the view. With sessions live it asks
+first — `q` must not be a way to lose three hours of work by leaning on the
+keyboard.
+
+A detached daemon would have been the other option, and is worse: it outlives
+the window and then has to be found and stopped by pid.
 
 The console shows you a session. This shows you **the machine** — and the
 difference is the runs that are *not* moving. The daemon knows why the fifth run

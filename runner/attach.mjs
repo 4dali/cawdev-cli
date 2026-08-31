@@ -251,13 +251,17 @@ function askSecret(question) {
 
 // --- the client ---------------------------------------------------------------
 
-export async function attach(argv) {
-  const wanted = valueOf(argv, '--runner');
-  const socket = await chooseSocket(wanted);
-
+/**
+ * @param argv the command line, for `--runner`, `--email`, `--watch-only`
+ * @param options set when the daemon is running IN THIS PROCESS (`--attach`):
+ *   its socket is already known, quitting means stopping it, and it can say how
+ *   much work would be lost if you did.
+ */
+export async function attach(argv, options = {}) {
+  const socket = options.socketPath ?? (await chooseSocket(valueOf(argv, '--runner')));
   const session = await maybeSignIn(argv);
 
-  const ui = new Attached(socket, session);
+  const ui = new Attached(socket, session, options);
   await ui.start();
 }
 
@@ -320,9 +324,10 @@ async function maybeSignIn(argv) {
 }
 
 class Attached {
-  constructor(socketPath, session) {
+  constructor(socketPath, session, options = {}) {
     this.socketPath = socketPath;
     this.session = session;
+    this.options = options;
 
     this.runner = null;
     this.runs = [];
@@ -500,6 +505,12 @@ class Attached {
     if (this.mode === 'prompt' || this.mode === 'reason') {
       return this.onTyping(key);
     }
+    // Any other key means "no". A confirmation that outlives the moment is one
+    // somebody answers by accident three keystrokes later.
+    if (key !== 'q' && key !== 'x') {
+      this.confirmQuit = false;
+      this.confirming = null;
+    }
 
     switch (key) {
       case 'q':
@@ -671,6 +682,17 @@ class Attached {
   }
 
   quit() {
+    const live = this.options.liveSessions?.() ?? 0;
+    if (this.options.onQuit && live > 0 && !this.confirmQuit) {
+      // Started with `--attach`, so this window IS the daemon: quitting takes
+      // the sessions with it. `q` must not be a way to lose three hours of work
+      // by leaning on the keyboard.
+      this.confirmQuit = true;
+      return this.note(
+        `${live} session${live === 1 ? '' : 's'} running here — press q again to stop the daemon too`,
+      );
+    }
+
     this.stopped = true;
     try {
       this.client?.destroy();
@@ -680,7 +702,13 @@ class Attached {
     process.stdin.setRawMode?.(false);
     process.stdout.write(SHOW_CURSOR + ALT_SCREEN_OFF);
     this.finish?.();
-    process.exit(0);
+
+    if (this.options.onQuit) {
+      // Hand back to the daemon's own shutdown: say goodbye to the platform,
+      // take the children down, then exit. Exiting here would skip all three.
+      return this.options.onQuit();
+    }
+    return process.exit(0);
   }
 
   // --- drawing -----------------------------------------------------------------
@@ -803,7 +831,8 @@ class Attached {
     }
     const keys =
       ` ${DIM}tab${RESET} next  ${DIM}1-9${RESET} pick  ${DIM}i${RESET} prompt  ` +
-      `${DIM}y/Y/n${RESET} permission  ${DIM}x${RESET} cancel  ${DIM}g${RESET} log  ${DIM}q${RESET} quit`;
+      `${DIM}y/Y/n${RESET} permission  ${DIM}x${RESET} cancel  ${DIM}g${RESET} log  ` +
+      `${DIM}q${RESET} ${this.options.onQuit ? 'stop' : 'quit'}`;
     const status = this.status ? `  ${ESC}[33m${this.status}${RESET}` : '';
     return pad(clip(keys + status, width - 1), width);
   }

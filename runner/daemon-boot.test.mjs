@@ -142,6 +142,43 @@ test('the daemon registers, offers a socket, and says what it is', async (t) => 
   assert.ok(platform.seen.some((call) => call.includes('heartbeat')), platform.seen.join(', '));
 });
 
+test('--attach starts the machine and shows it, in one terminal', async (t) => {
+  const platform = await fakePlatform();
+  const directory = await mkdtemp(join(tmpdir(), 'cawdev-boot-'));
+  const config = join(directory, 'config.json');
+  await writeFile(config, JSON.stringify({
+    url: platform.url,
+    name: `${RUNNER}-3`,
+    agentCommand: '/bin/echo',
+    projects: { board: directory },
+  }));
+
+  const both = spawn(process.execPath, [DAEMON, '--config', config, '--attach', '--watch-only'], {
+    env: { ...process.env, CAWDEV_TOKEN: 'cawd_fake' },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let drawn = '';
+  both.stdout.on('data', (chunk) => (drawn += chunk));
+
+  t.after(async () => {
+    both.kill('SIGKILL');
+    platform.close();
+    await rm(directory, { recursive: true, force: true });
+    await rm(socketPathFor(`${RUNNER}-3`), { force: true });
+  });
+
+  await new Promise((done) => setTimeout(done, 2500));
+  const plain = drawn.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+
+  assert.match(plain, /sessions here/, 'the UI never drew');
+  assert.match(plain, new RegExp(`${RUNNER}-3`), 'the UI did not name the runner it started');
+  // The daemon's log must NOT be on the terminal: it would paint over the UI,
+  // and it is one keypress away in a pane instead.
+  assert.doesNotMatch(plain, /registered as/, "the daemon's log leaked onto the UI's terminal");
+  // Its own daemon, so the key is "stop", not "quit".
+  assert.match(plain, /q stop/);
+});
+
 test('a daemon that stops takes its socket with it', async (t) => {
   const platform = await fakePlatform();
   const directory = await mkdtemp(join(tmpdir(), 'cawdev-boot-'));

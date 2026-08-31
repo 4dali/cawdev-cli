@@ -276,8 +276,31 @@ function safeJson(text) {
  */
 let control = null;
 
+/**
+ * Whether this process's terminal belongs to the attached UI — `--attach`.
+ *
+ * The daemon's log and a full-screen UI cannot share a terminal: one paints
+ * over the other, and the result is unreadable for both. So in that mode the
+ * log goes ONLY to the socket, where the UI shows it on `g` — the same lines,
+ * in a pane, instead of on top of everything.
+ *
+ * Kept until the socket exists, so a daemon that dies during startup still has
+ * something to print. Silence plus a stack trace is a bad way to find out your
+ * token is wrong.
+ */
+let quiet = false;
+const beforeQuiet = [];
+
 function log(...parts) {
-  console.log(`[${new Date().toISOString()}]`, ...parts);
+  const line = `[${new Date().toISOString()}] ${parts
+    .map((part) => (typeof part === 'string' ? part : String(part)))
+    .join(' ')}`;
+  if (quiet) {
+    beforeQuiet.push(line);
+    if (beforeQuiet.length > 200) beforeQuiet.shift();
+  } else {
+    console.log(`[${new Date().toISOString()}]`, ...parts);
+  }
   // The daemon's own running commentary is half of what makes attaching worth
   // it: "claiming…", "no free workspace", "agent stderr". None of it reaches
   // the platform, and it is what explains the runs that are NOT moving.
@@ -2166,6 +2189,10 @@ async function probePermissionPrompt(config) {
 }
 
 async function main() {
+  // Read before anything can log, so the very first line already goes the
+  // right way.
+  quiet = attaching;
+
   const config = await readConfig();
 
   const runner = await api(config, '/api/runners', {
@@ -2308,6 +2335,27 @@ async function main() {
     });
   }
 
+  // R52's second half: one command that starts the machine and shows it to you.
+  //
+  // In the SAME process, deliberately. A detached daemon would outlive the
+  // window and then have to be found and stopped by pid, which is a worse
+  // problem than the one being solved. One command, one process, one Ctrl-C —
+  // and quitting with sessions live asks first, because `q` must not be a way
+  // to lose three hours of work by leaning on the keyboard.
+  if (attaching) {
+    const { attach } = await import('./attach.mjs');
+    void attach(process.argv.slice(2), {
+      socketPath: control?.path,
+      // Its own daemon, so quitting means stopping: raised as a signal rather
+      // than an exit, so the run goes through the same goodbye and the same
+      // termination of children as a Ctrl-C would.
+      onQuit: () => process.kill(process.pid, 'SIGINT'),
+      liveSessions: () => running.size,
+    }).catch((failure) => {
+      console.error(`could not attach: ${failure.message}`);
+    });
+  }
+
   // Long ago enough that the first pass happens on the first poll: a daemon
   // that has just started is exactly when somebody wants to know what landed
   // while it was off.
@@ -2415,6 +2463,9 @@ async function main() {
  * refuses to return without them. Somebody watching a machine should not have
  * to hold the credential that machine runs on.
  */
+/** `--attach`: start the daemon and watch it, in one process and one terminal. */
+const attaching = process.argv.includes('--attach');
+
 if (process.argv[2] === 'attach') {
   const { attach } = await import('./attach.mjs');
   attach(process.argv.slice(3)).catch((failure) => {
@@ -2423,6 +2474,12 @@ if (process.argv[2] === 'attach') {
   });
 } else {
   main().catch((failure) => {
+    // Whatever the daemon managed to say before the UI took the terminal. A
+    // daemon that dies during startup in --attach mode would otherwise fail in
+    // silence.
+    if (quiet) {
+      for (const line of beforeQuiet) console.error(line);
+    }
     console.error(failure.message);
     process.exit(1);
   });
