@@ -35,6 +35,59 @@ The name is how you will recognise it in the console's runner picker.
 Registering is idempotent by (owner, name), so restarting the daemon is the same
 runner rather than a third entry in the list.
 
+## Watching it from a terminal
+
+```sh
+node runner.mjs attach
+```
+
+The console shows you a session. This shows you **the machine** — and the
+difference is the runs that are *not* moving. The daemon knows why the fifth run
+is waiting ("cawdev already has a run here", "at 4 sessions"); nothing else
+does, and until now that reason existed only as a line in a log nobody was
+tailing.
+
+A rail of every session on this machine — running, claimed, or queued with its
+reason — the selected transcript streaming beside it, and the daemon's own log a
+keypress away.
+
+| Key | |
+|---|---|
+| `tab`, `j`, `k` | move between sessions |
+| `1`–`9` | pick one |
+| `i` | prompt the session; `enter` sends, `esc` cancels |
+| `y` / `Y` / `n` | allow once / allow always here / refuse a permission request |
+| `x`, twice | cancel the session |
+| `g` | the daemon's log instead of the transcript |
+| `PgUp` / `PgDn` | scroll back |
+| `q` | leave |
+
+### Watching is free; acting means signing in
+
+It asks for your email and password at startup. **Leave the email blank to just
+watch** — everything on the socket is readable without it.
+
+Anything that *changes* something goes to the platform over HTTP as you, not
+through the daemon. That is not fussiness: prompting a session, cancelling one
+and deciding a permission request all refuse an agent token (R51), so a socket
+that could do them would either lend the daemon's own credential to a guard
+built to prevent exactly that, or keep yours. The password is held in memory for
+the life of the process and written nowhere.
+
+`--email you@example.com` skips one prompt; `--watch-only` skips both.
+
+### Where the socket is
+
+`~/.cawdev/run/<runner name>.sock`, in a `0700` directory, removed when the
+daemon stops. **Permission to read it is permission to read this machine's
+transcripts** — which is why it is under your home directory and shows only this
+machine's own work.
+
+More than one daemon here? `attach --runner <name>`. One is chosen for you.
+
+If `attach` says nothing is offering a socket, the daemon is not running — or it
+predates R52.
+
 ## What it does with a run
 
 1. **Claims it.** The claim response carries the run's own `cawdr_` token and

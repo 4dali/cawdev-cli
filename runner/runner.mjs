@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describeTurn } from '../lib/usage.mjs';
 import { withinCeiling } from '../lib/tool-rules.mjs';
+import { serveControl } from './control.mjs';
 
 // --- configuration -----------------------------------------------------------
 
@@ -264,8 +265,27 @@ function safeJson(text) {
   }
 }
 
+/**
+ * The socket this daemon offers, once it has one — R52.
+ *
+ * Module-level rather than threaded through every function, because the two
+ * things worth publishing — the log, and each line of transcript — are produced
+ * in a dozen places that have no business knowing whether anybody is watching.
+ * Null until `main` opens it, and null for ever if opening failed, so every use
+ * is optional.
+ */
+let control = null;
+
 function log(...parts) {
   console.log(`[${new Date().toISOString()}]`, ...parts);
+  // The daemon's own running commentary is half of what makes attaching worth
+  // it: "claiming…", "no free workspace", "agent stderr". None of it reaches
+  // the platform, and it is what explains the runs that are NOT moving.
+  control?.publish({
+    type: 'log',
+    line: parts.map((part) => (typeof part === 'string' ? part : String(part))).join(' '),
+    at: new Date().toISOString(),
+  });
 }
 
 /** Multi-line detail, set in from the log line it belongs to. */
@@ -869,6 +889,14 @@ class Transcript {
 
   push(line) {
     if (!line?.body) return;
+    // Tee'd to anybody attached before it is batched for the platform. The
+    // socket is the local view and should not wait on a 400ms flush window, let
+    // alone on the network.
+    control?.publish({
+      type: 'output',
+      runId: this.run.id,
+      line: { ...line, at: new Date().toISOString() },
+    });
     this.pending.push(line);
     if (this.pending.length >= this.max) {
       void this.flush();
@@ -1637,14 +1665,71 @@ const taken = new Map();
  * anything worth reading. Said once, and again only if the run goes away and
  * comes back.
  */
-const noted = new Set();
+const noted = new Map();
 
 function noteQueued(run, why) {
   if (noted.has(run.id)) {
     return;
   }
-  noted.add(run.id);
+  // A Map since R52, and the value is the point: the REASON a run is waiting is
+  // knowledge that exists nowhere but here. The platform sees a queued run; only
+  // this daemon knows it is queued because the checkout is busy rather than
+  // because nothing has picked it up.
+  noted.set(run.id, { label: run.label, projectSlug: run.projectSlug, why });
   log(`${why}; leaving "${run.label}" queued`);
+}
+
+/**
+ * This machine, as somebody attached to it sees it — R52.
+ *
+ * Three states in one list because they are three answers to one question:
+ * what is this laptop doing? A claimed run is not yet running and is not
+ * queued either, and a console that only knows about the first and third makes
+ * the gap between them look like nothing happening.
+ */
+function snapshotRuns() {
+  const runs = [];
+  for (const [id, child] of running) {
+    const run = child.cawdevRun ?? {};
+    runs.push({
+      id,
+      state: 'running',
+      projectSlug: run.projectSlug ?? child.cawdevProjectSlug,
+      label: run.label ?? '(a session)',
+      branch: run.branch ?? null,
+      profile: run.profile ?? 'CODE',
+      writesCode: child.cawdevWritesCode === true,
+      startedAt: child.cawdevStartedAt ?? null,
+    });
+  }
+  for (const [id, claim] of taken) {
+    if (running.has(id)) continue; // Already counted, and further along.
+    runs.push({
+      id,
+      state: 'claiming',
+      projectSlug: claim.projectSlug,
+      label: claim.label ?? '(claiming)',
+      branch: null,
+      profile: claim.writes ? 'CODE' : null,
+      writesCode: claim.writes === true,
+      startedAt: null,
+    });
+  }
+  for (const [id, waiting] of noted) {
+    if (running.has(id) || taken.has(id)) continue;
+    runs.push({
+      id,
+      state: 'queued',
+      projectSlug: waiting.projectSlug,
+      label: waiting.label,
+      branch: null,
+      profile: null,
+      writesCode: false,
+      startedAt: null,
+      why: waiting.why,
+    });
+  }
+  return runs;
 }
 
 async function startRun(config, offered) {
@@ -1711,6 +1796,10 @@ async function startRun(config, offered) {
   } finally {
     running.delete(run.id);
     taken.delete(run.id);
+    // The transcript of a run that is over is on the platform, where it belongs.
+    // Holding four thousand lines of it here for ever is how a daemon that runs
+    // for a week ends up being restarted for no reason anybody can name.
+    control?.forget(run.id);
   }
 }
 
@@ -1844,6 +1933,16 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit) {
     });
 
     child.cawdevProjectSlug = run.projectSlug;
+    // Enough of the run for the socket to name it. The child is the only handle
+    // the daemon keeps once a session is going, so what somebody attaching
+    // needs to read has to hang off it.
+    child.cawdevRun = {
+      projectSlug: run.projectSlug,
+      label: run.label,
+      branch: run.branch,
+      profile: run.profile ?? 'CODE',
+    };
+    child.cawdevStartedAt = new Date().toISOString();
     // What kind it is, so the queue knows whether it holds the working copy.
     // Whether it holds the working copy, which is what the queue serialises on.
     child.cawdevWritesCode = writesCode;
@@ -2088,6 +2187,39 @@ async function main() {
   // than buried under a session that then fails for a reason it explains.
   await probePermissionPrompt(config);
 
+  // R52. Nothing here is load-bearing for running an agent, so a daemon that
+  // cannot open a socket says so and carries on: trading the ability to run
+  // work for the ability to watch it would be the wrong way round.
+  try {
+    control = await serveControl({
+      runner: {
+        id: config.runnerId,
+        name: config.name,
+        url: config.url,
+        projects: Object.keys(config.projects),
+        maxSessions: config.maxSessions,
+      },
+      snapshot: snapshotRuns,
+    });
+    log(`watchable at ${control.path} — attach with: node runner.mjs attach`);
+  } catch (failure) {
+    log(`no control socket (${failure.message}); the daemon runs, you just cannot attach`);
+  }
+
+  // Published on a timer rather than from the dozen places that change it.
+  // Cheap — a few hundred bytes compared against the last one — and it cannot
+  // fall out of step with the truth the way a dozen call sites would.
+  let lastPublished = '';
+  const publishRuns = setInterval(() => {
+    if (!control) return;
+    const runs = snapshotRuns();
+    const now = JSON.stringify(runs);
+    if (now === lastPublished) return;
+    lastPublished = now;
+    control.publish({ type: 'runs', runs });
+  }, 1000);
+  publishRuns.unref?.();
+
   // One beat straight away. Waiting a full interval would leave the composer
   // with no picture of this machine's checkouts for the first thirty seconds
   // after a restart — and warning nobody is exactly the failure this fixes.
@@ -2149,6 +2281,11 @@ async function main() {
       stopping = true;
       clearInterval(heartbeat);
       clearInterval(gitSurvey);
+      clearInterval(publishRuns);
+      // Removed here rather than left for the next start: a socket file that
+      // outlives its daemon is what makes the next `attach` report a machine
+      // that is not there.
+      await control?.close().catch(() => undefined);
       for (const child of running.values()) {
         try {
           process.kill(-child.pid, 'SIGTERM');
@@ -2241,7 +2378,7 @@ async function main() {
           continue;
         }
         busy.add(slug);
-        taken.set(offered.run.id, { projectSlug: slug, writes });
+        taken.set(offered.run.id, { projectSlug: slug, writes, label: offered.run.label });
         noted.delete(offered.run.id);
         claimable += 1;
         void startRun(config, offered);
@@ -2249,7 +2386,7 @@ async function main() {
 
       // Forget runs that are no longer offered, so one that comes back around
       // is reported again rather than staying silently skipped forever.
-      for (const id of [...noted]) {
+      for (const id of [...noted.keys()]) {
         if (!offers.some((offer) => offer.run.id === id)) {
           noted.delete(id);
         }
@@ -2270,7 +2407,23 @@ async function main() {
   }
 }
 
-main().catch((failure) => {
-  console.error(failure.message);
-  process.exit(1);
-});
+/**
+ * Two programs in one file, told apart by the first argument.
+ *
+ * `attach` is a client and needs none of what a daemon needs — no token, no
+ * projects, no config at all — so it is dispatched BEFORE `readConfig`, which
+ * refuses to return without them. Somebody watching a machine should not have
+ * to hold the credential that machine runs on.
+ */
+if (process.argv[2] === 'attach') {
+  const { attach } = await import('./attach.mjs');
+  attach(process.argv.slice(3)).catch((failure) => {
+    console.error(failure.message);
+    process.exit(1);
+  });
+} else {
+  main().catch((failure) => {
+    console.error(failure.message);
+    process.exit(1);
+  });
+}

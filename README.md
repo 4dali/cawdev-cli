@@ -112,6 +112,21 @@ platform, and pins the shape Claude Code reads back: a permission decision is
 JSON in the result text, and getting it wrong does not fail loudly — it stops a
 session, which is the failure R51 exists to end.
 
+`tools/runner/control.test.mjs` covers the socket a daemon offers (R52) on a
+real socket, including the backlog somebody attaching to an hour-old session
+needs, and that an unknown command is ignored rather than obeyed — that socket
+is a read-only view on purpose.
+
+`tools/runner/attach.test.mjs` covers the rendering arithmetic, which is where a
+terminal UI goes wrong silently: transcripts carry the agent's ANSI colour, and
+measuring it as plain text wraps the pane into nonsense.
+
+`tools/runner/daemon-boot.test.mjs` starts the **real daemon** against a faked
+platform and a fake agent command. It is the only test of the first ten seconds
+— registering, the R51 permission-flag probe, opening the socket, and removing
+it again on the way out — a path that otherwise needs a `runner:operate` token
+to reach at all.
+
 ## `tools/mcp/`
 
 The MCP server an agent talks to — zero dependencies, stdio JSON-RPC.
