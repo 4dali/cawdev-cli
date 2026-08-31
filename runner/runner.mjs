@@ -16,6 +16,7 @@ import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describeTurn } from '../lib/usage.mjs';
+import { withinCeiling } from '../lib/tool-rules.mjs';
 
 // --- configuration -----------------------------------------------------------
 
@@ -62,8 +63,30 @@ const DEFAULTS = {
     '--input-format',
     'stream-json',
     '--verbose',
+    // The operator's own ~/.claude/settings.json does NOT apply to a run.
+    //
+    // Without this the spawned agent silently inherits whatever the person who
+    // started the daemon has allowed themselves — proved by spike: with
+    // settings loading, `echo hello` ran without the permission tool being
+    // consulted at all. That makes what a run may do depend on an invisible
+    // file on whichever laptop happened to claim it, and makes the ceiling
+    // below decorative. What a run may do is: these defaults, plus the
+    // project's rules, filtered by this machine's `grantable`.
+    '--setting-sources',
+    '',
     '--permission-mode',
     'acceptEdits',
+    // R51. What happens when none of the above covers a call: instead of
+    // denying it silently, the CLI asks cawdev's own MCP server, which asks a
+    // person and blocks until they answer.
+    //
+    // This is the difference between a session that stops dead three hours in
+    // — which is how R35 and R36 both ended — and one that says "I need mvn"
+    // and waits. Hidden from `claude --help` on 2.1.251 but accepted; the
+    // daemon probes for it at boot rather than discovering it at the first
+    // denial.
+    '--permission-prompt-tool',
+    'mcp__cawdev__approve',
     // acceptEdits covers writing files. It does NOT cover MCP tools — and
     // without these the agent cannot read its task, move the entry, report, or
     // ask, which is the entire loop. A real session found this by being
@@ -82,6 +105,10 @@ const DEFAULTS = {
     // git only. Tests and builds are per-project decisions, so a project that
     // needs them adds them.
     'Bash(git *)',
+    // The permission tool itself. Claude Code allows it implicitly, but a
+    // permission handler that could itself need permission would be a deadlock
+    // with no way to break it, so it is named.
+    'mcp__cawdev__approve',
     'mcp__cawdev__task_current',
     'mcp__cawdev__report',
     'mcp__cawdev__ask_user',
@@ -99,6 +126,25 @@ const DEFAULTS = {
     'mcp__cawdev__changelog_add',
     'mcp__cawdev__changelog_update',
   ],
+  /**
+   * What this machine will let a STORED rule allow, with nobody watching.
+   *
+   * R51's asymmetry, and the reason a project's rules may live on the platform
+   * at all. Two paths, two risks:
+   *
+   *   - a person deciding one call in the moment needs no ceiling: they are
+   *     there, and they are looking at the command;
+   *   - a rule saved earlier applies to sessions nobody is watching, so the
+   *     machine's owner has the last word on what it may cover.
+   *
+   * Empty by default, which is the safe reading rather than a cautious one: a
+   * machine that has declared nothing still works, it just asks every time.
+   * Widening this is a decision about what an unattended agent may run in your
+   * checkout, so it is yours to make rather than a default you inherit.
+   *
+   *   "grantable": ["Bash(mvn *)", "Bash(npm *)"]
+   */
+  grantable: [],
   pollSeconds: 25,
   heartbeatSeconds: 30,
   /**
@@ -145,6 +191,8 @@ async function readConfig() {
      * should have to do that to let a project run its own build.
      */
     allowedTools: file.allowedTools ?? [],
+    /** The machine's ceiling on stored rules. Per project ones add to it. */
+    grantable: file.grantable ?? DEFAULTS.grantable,
   };
 
   if (!config.token) {
@@ -176,8 +224,15 @@ function normaliseProjects(projects) {
   const normalised = {};
   for (const [slug, value] of Object.entries(projects)) {
     normalised[slug] = typeof value === 'string'
-      ? { path: value, allowedTools: [] }
-      : { path: value.path, allowedTools: value.allowedTools ?? [] };
+      ? { path: value, allowedTools: [], grantable: [] }
+      : {
+          path: value.path,
+          allowedTools: value.allowedTools ?? [],
+          // A ceiling for this project alone, added to the machine's. A laptop
+          // that will let one repository run Maven unattended has not said the
+          // same about the other three.
+          grantable: value.grantable ?? [],
+        };
   }
   return normalised;
 }
@@ -216,6 +271,24 @@ function log(...parts) {
 /** Multi-line detail, set in from the log line it belongs to. */
 function indent(text) {
   return text.split('\n').map((line) => `    ${line}`).join('\n');
+}
+
+/**
+ * What a project has decided its agents may do without asking — R51.
+ *
+ * Read once per run, at spawn, and never cached: a rule granted an hour ago
+ * should apply to the run starting now. A failure here is not fatal — it means
+ * the session asks about things it need not have, which is the direction this
+ * whole mechanism is supposed to fail in.
+ */
+async function projectRules(config, slug) {
+  try {
+    const rules = await api(config, `/api/projects/${slug}/tool-rules`);
+    return (rules ?? []).map((rule) => rule.pattern).filter(Boolean);
+  } catch (failure) {
+    log(`  could not read ${slug}'s tool rules (${failure.message}); the session will ask`);
+    return [];
+  }
 }
 
 // --- git ---------------------------------------------------------------------
@@ -1390,6 +1463,14 @@ function argsForProfile(agentArgs, profile) {
       i += 1;
       continue;
     }
+    // And the permission-prompt tool. A profile's permissions are the whole
+    // point of the profile: an ASK session that can have a person grant it the
+    // shell is an ASK session that can write code, which is exactly what R28
+    // decided it must not be. "Cannot" must not quietly become "not yet".
+    if (agentArgs[i] === '--permission-prompt-tool') {
+      i += 1;
+      continue;
+    }
     kept.push(agentArgs[i]);
   }
   return [...kept, '--allowedTools', ...(PROFILE_TOOLS[profile] ?? READ_ONLY_CAWDEV)];
@@ -1633,6 +1714,11 @@ async function startRun(config, offered) {
   }
 }
 
+/** Whether this run is the kind that writes code, before the child exists. */
+function writesCodeProfile(run) {
+  return !run.profile || run.profile === 'CODE';
+}
+
 /**
  * Spawns the agent with the run's own token, and nothing else.
  *
@@ -1664,6 +1750,9 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit) {
       CAWDEV_URL: config.url,
       CAWDEV_TOKEN: runToken,
       CAWDEV_PROJECT: run.projectSlug,
+      // The ceiling travels with the server, so the half that answers
+      // permission questions mid-run enforces the same limit the spawn did.
+      CAWDEV_GRANTABLE: JSON.stringify(ceiling),
     },
   };
   await writeFile(mcpConfigPath, JSON.stringify({ mcpServers }, null, 2));
@@ -1687,11 +1776,26 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit) {
   // A project's own permissions apply to coding only. A project that permits
   // `mvn` for building has said nothing about permitting it to a session that
   // was asked a question.
+  //
+  // R51: what this machine will let a STORED rule cover. The project's rules
+  // are filtered through it before they go anywhere near a spawn, so the
+  // platform can narrow what runs here and never widen it. The same list goes
+  // to the MCP server below, because a rule added while this session is
+  // already running has never been through here at all.
+  const ceiling = [
+    ...(config.grantable ?? []),
+    ...(config.projects[run.projectSlug]?.grantable ?? []),
+  ];
+  const stored = writesCodeProfile(run) ? await projectRules(config, run.projectSlug) : [];
+  const admitted = stored.filter((pattern) => withinCeiling(ceiling, pattern));
+  const refused = stored.filter((pattern) => !withinCeiling(ceiling, pattern));
+
   const extras = run.profile && run.profile !== 'CODE'
     ? []
     : [
         ...(config.allowedTools ?? []),
         ...(config.projects[run.projectSlug]?.allowedTools ?? []),
+        ...admitted,
       ];
   const agentArgs = [...config.agentArgs];
 
@@ -1715,7 +1819,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit) {
     }
     agentArgs.push(...extras);
   }
-  const writesCode = !run.profile || run.profile === 'CODE';
+  const writesCode = writesCodeProfile(run);
   const args = [
     '--mcp-config',
     mcpConfigPath,
@@ -1735,6 +1839,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit) {
         CAWDEV_URL: config.url,
         CAWDEV_TOKEN: runToken,
         CAWDEV_PROJECT: run.projectSlug,
+        CAWDEV_GRANTABLE: JSON.stringify(ceiling),
       },
     });
 
@@ -1750,6 +1855,17 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit) {
 
     let lastText = '';
     const transcript = new Transcript(config, run);
+
+    // A rule the project granted that this machine will not apply unattended.
+    // Said on the RUN, not only in the daemon's log: "I clicked allow and
+    // nothing happened" needs an answer where the person is looking, and the
+    // person is looking at the session.
+    for (const pattern of refused) {
+      const line = `${pattern} is allowed by this project but not by this machine's `
+        + `grantable list, so this session will still ask before using it.`;
+      log(`  ${line}`);
+      transcript.push({ kind: 'SYSTEM', body: line });
+    }
 
     // stream-json arrives in chunks that split mid-line, so buffer until a
     // newline rather than assuming one chunk is one event.
@@ -1887,6 +2003,69 @@ function capabilities(config) {
   });
 }
 
+/**
+ * Does this agent CLI still accept `--permission-prompt-tool`?
+ *
+ * Asked at boot, because the alternative is finding out at the first denial —
+ * three hours into a session, in a transcript nobody is watching. The flag is
+ * hidden from `claude --help` on 2.1.251, so the probe cannot read the help
+ * text: it offers the flag with no prompt and reads the complaint. A CLI that
+ * accepts it complains about the missing prompt; one that does not complains
+ * about the option.
+ *
+ * Never fatal. A daemon that refuses to start because it could not classify a
+ * message from a CLI it does not own is worse than one that says so and runs.
+ */
+async function probePermissionPrompt(config) {
+  const said = await new Promise((done) => {
+    let text = '';
+    let child;
+    try {
+      child = spawn(config.agentCommand, ['-p', '--permission-prompt-tool', 'mcp__cawdev__approve'], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (failure) {
+      return done(`could not be run: ${failure.message}`);
+    }
+    const give_up = setTimeout(() => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // Already gone.
+      }
+      done(text);
+    }, 10_000);
+    give_up.unref?.();
+
+    child.stdout.on('data', (chunk) => (text += chunk));
+    child.stderr.on('data', (chunk) => (text += chunk));
+    child.on('error', (failure) => {
+      clearTimeout(give_up);
+      done(`could not be run: ${failure.message}`);
+    });
+    child.on('exit', () => {
+      clearTimeout(give_up);
+      done(text);
+    });
+    // Nothing to say: the missing prompt is what we want it to complain about.
+    child.stdin.end();
+  });
+
+  if (/unknown option.*permission-prompt-tool/i.test(said)) {
+    log(
+      `WARNING: ${config.agentCommand} does not accept --permission-prompt-tool. Sessions that ` +
+        `need a command nobody allowed in advance will be denied outright rather than asking ` +
+        `you. See R51 and tools/runner/README.md.`,
+    );
+    return false;
+  }
+  if (said.startsWith('could not be run:')) {
+    log(`WARNING: ${config.agentCommand} ${said}`);
+    return false;
+  }
+  return true;
+}
+
 async function main() {
   const config = await readConfig();
 
@@ -1901,6 +2080,13 @@ async function main() {
 
   log(`registered as "${runner.name}" (${runner.id}) against ${config.url}`);
   log(`serving: ${Object.entries(config.projects).map(([s, p]) => `${s} -> ${p.path}`).join(', ')}`);
+  if (config.grantable.length) {
+    log(`stored rules may cover: ${config.grantable.join(', ')}`);
+  }
+
+  // Before anything is claimed, so the warning is at the top of the log rather
+  // than buried under a session that then fails for a reason it explains.
+  await probePermissionPrompt(config);
 
   // One beat straight away. Waiting a full interval would leave the composer
   // with no picture of this machine's checkouts for the first thirty seconds

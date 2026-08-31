@@ -22,6 +22,7 @@
 // The script is chosen by CAWDEV_STUB_SCRIPT:
 //   report-and-finish  (default) progress, then done
 //   ask-then-finish              ask a question, wait for the answer, then done
+//   permission-then-finish       ask permission for a command, wait, then done
 //   crash                        exit non-zero without reporting
 //   hang                         never exit, for testing cancellation
 
@@ -100,6 +101,45 @@ if (script === 'hang') {
       process.exit(0);
     }
     await report('PROGRESS', `Got the answer: ${answer}`);
+  }
+
+  if (script === 'permission-then-finish') {
+    // R51's loop, in miniature: the real CLI does this through
+    // --permission-prompt-tool, which calls the MCP server, which calls these
+    // same two endpoints. Exercising it here costs nothing and is the only way
+    // to test the whole path — inbox, decision, release — without a live
+    // model deciding for itself that it does not need Maven after all.
+    const asked = await api(`/api/projects/${project}/runs/${runId}/approvals`, {
+      method: 'POST',
+      body: {
+        toolName: 'Bash',
+        toolInput: JSON.stringify({ command: 'mvn --version' }),
+        summary: 'mvn --version',
+        suggestion: 'Bash(mvn *)',
+        toolUseId: 'stub-tool-use',
+      },
+    });
+
+    let decision = null;
+    const until = Date.now() + 60_000;
+    while (!decision && Date.now() < until) {
+      const response = await fetch(
+        `${url}/api/projects/${project}/runs/${runId}/approvals/${asked.id}/decision?wait=5`,
+        { headers: { authorization: `Bearer ${token}` } },
+      );
+      if (response.status === 200) {
+        decision = await response.json();
+      }
+    }
+    if (!decision) {
+      await report('BLOCKED', 'Nobody decided the stub agent\'s permission request.');
+      process.exit(0);
+    }
+    if (decision.state !== 'ALLOWED') {
+      await report('BLOCKED', `Refused (${decision.state}): ${decision.reason ?? 'no reason given'}`);
+      process.exit(0);
+    }
+    await report('PROGRESS', 'Allowed. Pretending to run mvn --version.');
   }
 
   await report('DONE', 'Stub agent finished. No code was written, which is the point.');

@@ -14,6 +14,12 @@
 import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
+import {
+  coveredBy,
+  suggestionFor,
+  summaryOf,
+  withinCeiling,
+} from '../lib/tool-rules.mjs';
 
 const NAME = 'cawdev';
 const VERSION = '0.1.0';
@@ -810,7 +816,156 @@ const TOOLS = [
       return `Still nothing. Call await_answer again with question_id ${args.question_id}.`;
     },
   },
+
+  {
+    name: 'approve',
+    description:
+      'INTERNAL — Claude Code calls this itself as --permission-prompt-tool when no rule covers ' +
+      'a tool call. Do not call it yourself: it decides whether YOUR next call is allowed, and ' +
+      'calling it directly asks a person a question about nothing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tool_name: { type: 'string' },
+        input: { type: 'object' },
+        tool_use_id: { type: 'string' },
+      },
+      required: ['tool_name', 'input'],
+    },
+    handler: async (config, args) => decide(config, args),
+  },
 ];
+
+/**
+ * The permission decision, as Claude Code reads it — R51.
+ *
+ * <p>Returned as JSON text, which is the wire format the CLI expects from a
+ * permission-prompt tool: `{behavior: "allow", updatedInput}` or
+ * `{behavior: "deny", message}`.
+ *
+ * THIS FUNCTION NEVER THROWS. Every other tool here turns a failure into an
+ * error result the agent reads and works around; this one cannot. A malformed
+ * answer to a permission question is not a refusal — it is a session that
+ * stops without saying why, which is the failure R51 exists to end. So an
+ * unreachable platform, a bad response, anything at all, comes back as a deny
+ * carrying the reason.
+ */
+async function decide(config, args) {
+  const toolName = String(args.tool_name ?? '');
+  const input = args.input && typeof args.input === 'object' ? args.input : {};
+
+  try {
+    const { runId, project } = await requireRun(config);
+
+    // What this project has already decided, filtered by what THIS MACHINE is
+    // willing to have applied with nobody watching. The ceiling is enforced
+    // here as well as at spawn because a rule added while the session was
+    // running has never been through the runner at all.
+    const rules = await api(config, `/api/projects/${project}/tool-rules`);
+    const live = (rules ?? [])
+      .map((rule) => rule.pattern)
+      .filter((pattern) => withinCeiling(grantable(), pattern));
+
+    const covered = coveredBy(live, toolName, input);
+    if (covered) {
+      return allow(input, `covered by this project's rule ${covered}`);
+    }
+
+    const asked = await api(config, `/api/projects/${project}/runs/${runId}/approvals`, {
+      method: 'POST',
+      body: {
+        toolName,
+        toolInput: JSON.stringify(input),
+        summary: summaryOf(toolName, input),
+        suggestion: suggestionFor(toolName, input),
+        toolUseId: args.tool_use_id,
+      },
+    });
+
+    const decided = await pollForDecision(config, project, runId, asked.id);
+    if (decided?.state === 'ALLOWED') {
+      return allow(input, decided.reason ?? 'allowed by a person');
+    }
+    if (decided?.state === 'DENIED') {
+      return deny(
+        `${decided.reason ?? 'A person refused this.'} Do not try to work around it — report ` +
+          `blocked and say what you needed, or ask for a different approach.`,
+      );
+    }
+    // EXPIRED, or the poll gave up before the platform expired it. Same answer
+    // either way, and the difference is on the run for whoever reads it later.
+    return deny(
+      `Nobody answered this permission request in time. Do not retry it in a loop: report ` +
+        `blocked, say exactly what you needed to run and why, and let a person allow it.`,
+    );
+  } catch (failure) {
+    return deny(
+      `cawdev could not be asked whether this is allowed (${failure.message}). Treating that as ` +
+        `no. If this persists, report blocked rather than retrying.`,
+    );
+  }
+}
+
+function allow(updatedInput, reason) {
+  // `updatedInput` echoed back unchanged. The hook exists to say yes or no,
+  // not to rewrite what the agent was about to do behind its back.
+  return JSON.stringify({ behavior: 'allow', updatedInput, reason });
+}
+
+function deny(message) {
+  return JSON.stringify({ behavior: 'deny', message });
+}
+
+/**
+ * What this machine is willing to have applied unattended.
+ *
+ * Put in the environment by the runner when it spawns the session. Absent
+ * means an empty ceiling, which is the safe reading: no stored rule applies on
+ * its own and every call is asked about. A machine that wants otherwise says
+ * so in its own config file, on the machine, by its owner.
+ */
+function grantable() {
+  try {
+    const parsed = JSON.parse(process.env.CAWDEV_GRANTABLE ?? '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Waits for somebody to decide, for as long as the platform will hold it open.
+ *
+ * Bounded a little beyond the platform's own expiry so the two cannot both be
+ * waiting on each other: if the sweep is late, this gives up and denies, which
+ * is the same answer the sweep would have produced.
+ */
+async function pollForDecision(config, project, runId, approvalId) {
+  const deadline = Date.now() + approvalTimeoutSeconds() * 1000;
+  while (Date.now() < deadline) {
+    const remaining = Math.ceil((deadline - Date.now()) / 1000);
+    const response = await fetch(
+      `${config.url}/api/projects/${project}/runs/${runId}/approvals/${approvalId}/decision` +
+        `?wait=${Math.min(25, Math.max(1, remaining))}`,
+      { headers: { authorization: `Bearer ${config.token}` } },
+    );
+    if (response.status === 200) {
+      return await response.json();
+    }
+    if (response.status !== 204) {
+      const text = await response.text();
+      throw new CawdevError(safeJson(text)?.message ?? `waiting failed: HTTP ${response.status}`);
+    }
+    // 204 means "still pending" — ask again.
+  }
+  return null;
+}
+
+/** A little past the platform's own fifteen-minute expiry. Overridable for tests. */
+function approvalTimeoutSeconds() {
+  const configured = Number(process.env.CAWDEV_APPROVAL_TIMEOUT_SECONDS);
+  return Number.isFinite(configured) && configured > 0 ? configured : 960;
+}
 
 // There is no roadmap_delete or changelog_delete, and there will not be. The
 // API has no such endpoint either: DECLINED with a reason is the only exit.

@@ -102,9 +102,19 @@ meaning "the roadmap changed".
 that **no dollar figure reaches a transcript**: the CLI quotes list prices, and
 a subscription does not work that way.
 
+`tools/lib/tool-rules.test.mjs` covers the matcher for what a run may do (R51).
+Every assertion of `false` in it is asserting that somebody gets asked a
+question they may have answered before — the cheap failure. The expensive one is
+a `true` nobody intended.
+
+`tools/mcp/approve.test.mjs` drives the real server over stdio against a faked
+platform, and pins the shape Claude Code reads back: a permission decision is
+JSON in the result text, and getting it wrong does not fail loudly — it stops a
+session, which is the failure R51 exists to end.
+
 ## `tools/mcp/`
 
-The MCP server an agent talks to — one zero-dependency file, stdio JSON-RPC.
+The MCP server an agent talks to — zero dependencies, stdio JSON-RPC.
 `tools/mcp/README.md` covers setting it up in a repository, and is also written
 for the agent that reads it: it teaches the working method (branch first,
 `CODING` names the branch before the first commit, `roadmap_where` when in

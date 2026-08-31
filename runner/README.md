@@ -204,9 +204,18 @@ nothing here should imply the agent may run arbitrary commands.
   default prompt asks for is a broken default. A real session wrote the file,
   could not commit, and reported `blocked`: correct behaviour, avoidable cause.
 
-**Nothing else runs.** A task needing tests or a build will stall waiting for
-permission that never comes, so add what that project needs — with
-`allowedTools`, which **adds to** the defaults rather than replacing them:
+**Anything else stops and asks you** (R51). Rather than being denied in
+silence, a session that needs `mvn` or `npm` posts a request that appears in
+your inbox and on the run, and waits for an answer. Allow it once, or allow it
+always here — which writes a rule on the project that every runner serving it
+inherits.
+
+Nobody answering is a decision too: after fifteen minutes the request expires
+and the session is told to report blocked rather than wait for ever.
+
+You can still say in advance what a project may do, and for anything a session
+needs on every run that is the better answer — with `allowedTools`, which
+**adds to** the defaults rather than replacing them:
 
 ```json
 {
@@ -227,6 +236,45 @@ the one project that runs Maven does not force the long form on the rest.
 Do **not** reach for `agentArgs` to add a permission: it replaces the whole
 default list, so you would have to repeat all sixteen MCP tool names to add one
 `Bash` pattern.
+
+#### `grantable`: what this machine lets a saved rule cover
+
+A rule stored on the platform applies to sessions **nobody is watching**, so the
+machine's owner has the last word on it. `grantable` is that word:
+
+```json
+{
+  "grantable": ["Bash(mvn *)"],
+  "projects": {
+    "dycrypt": {
+      "path": "/Users/you/code/dycrypt",
+      "grantable": ["Bash(npm *)"]
+    }
+  }
+}
+```
+
+A project rule outside the ceiling is **dropped**, and the drop is reported onto
+the run so nobody is left wondering why allowing something changed nothing.
+
+**Empty by default, and that is safe rather than timid**: a machine that has
+declared nothing still works, it just asks every time. Widening it is a real
+decision about what an unattended agent may run in your checkout, so it is yours
+to make rather than a default you inherit without noticing.
+
+The ceiling limits *saved rules only*. A person allowing one call in the moment
+is present and looking at the command, and needs no ceiling.
+
+#### Two flags worth knowing about
+
+- `--permission-prompt-tool mcp__cawdev__approve` is what makes the asking
+  possible. It is **hidden from `claude --help`** on 2.1.251 but accepted; the
+  daemon probes for it at startup and warns loudly if the CLI it was pointed at
+  does not take it.
+- `--setting-sources ''` stops a run inheriting **your own**
+  `~/.claude/settings.json`. Without it, what a session may do depends on an
+  invisible file on whichever machine claimed the run — two laptops, two answers
+  — and the ceiling above means nothing.
 
 ### The model
 

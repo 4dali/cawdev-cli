@@ -1,6 +1,7 @@
 # cawdev MCP server
 
-One file of plain Node, zero dependencies, stdio JSON-RPC. It gives a coding
+Plain Node, zero dependencies, stdio JSON-RPC — `server.mjs`, plus the shared
+rule matcher in `tools/lib/tool-rules.mjs` that the runner uses too. It gives a coding
 agent a project's roadmap and changelog — the same verbs a person gets in the
 console, because the API was built to mirror these tools one-for-one.
 
@@ -133,9 +134,9 @@ what you are allowed to do.
 
 ### Inside a run
 
-These four only work when the token is a **run token** (`cawdr_`), which the
-runner mints when a run starts and hands to the session it spawns. A plain
-`cawd_` token gets a refusal saying so.
+These only work when the token is a **run token** (`cawdr_`), which the runner
+mints when a run starts and hands to the session it spawns. A plain `cawd_`
+token gets a refusal saying so.
 
 | Tool | What it does |
 |---|---|
@@ -143,6 +144,7 @@ runner mints when a run starts and hands to the session it spawns. A plain
 | `report` | `progress` as often as useful; `done` when finished, naming the branch and any PR; `blocked` when a person must resolve something. `done` and `blocked` end the run. |
 | `ask_user` | Ask the person who started the run, and wait. Blocks up to ten minutes, then hands back a `question_id`. |
 | `await_answer` | Resume waiting for a question `ask_user` handed back. |
+| `approve` | **Not yours to call.** Claude Code calls it itself, as `--permission-prompt-tool`, when no rule covers a tool call. |
 
 **`ask_user` is for decisions that are genuinely theirs** — an architectural
 choice, a trade-off with no right answer, something the entry does not settle.
@@ -155,6 +157,24 @@ asked because the decision was not yours. Call `await_answer`, or `report`
 
 After `report done` or `report blocked`, the run is over and your token has
 expired with it. There is nothing further to do.
+
+### When something you need is not allowed (R51)
+
+You will not usually notice this happening. When you call a tool no rule covers
+— `mvn`, `npm`, anything outside what the project has granted — Claude Code
+asks `approve` on your behalf, a person is shown the command, and your call
+either goes ahead or comes back refused. From inside the session it looks like a
+tool call that took a while.
+
+Two things to do with the answer:
+
+- **A refusal carries a reason.** Act on it. "Not from an unattended session" is
+  something you can work with — report `blocked` saying what you needed, or find
+  an approach that does not need it. Do not retry the same call hoping for a
+  different person.
+- **An expiry means nobody was there.** Do not loop. Report `blocked`, say
+  exactly what you needed to run and why, and let somebody allow it and start
+  you again.
 
 ## Checking it works
 
