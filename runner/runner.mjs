@@ -1266,6 +1266,15 @@ async function perform(config, run, cwd, action) {
     } catch (failure) {
       result = failure.message;
     }
+  } else if (action.kind === 'PUSH') {
+    log(`  pushing ${run.branch}${byRule(action)}`);
+    ({ ok, result } = await pushBranch(cwd, run.branch));
+  } else if (action.kind === 'OPEN_PR') {
+    log(`  opening a pull request for ${run.branch}${byRule(action)}`);
+    ({ ok, result } = await openPullRequest(cwd, run, action.message));
+  } else if (action.kind === 'MERGE') {
+    log(`  MERGING ${run.branch}${byRule(action)} — nobody is reading this diff`);
+    ({ ok, result } = await mergePullRequest(cwd, run.branch));
   } else {
     result = `This runner does not know how to ${action.kind}.`;
   }
@@ -1531,6 +1540,201 @@ async function findPullRequest(cwd, branch) {
   const origin = await git(cwd, ['remote', 'get-url', 'origin']).catch(() => '');
   const github = /github\.com[:/](.+?)(?:\.git)?$/.exec(origin.trim());
   return github ? `https://github.com/${github[1]}/compare/${encodeURIComponent(branch)}` : null;
+}
+
+// --- what a project's rules asked for (R40) ----------------------------------
+//
+// Pushing, opening a pull request and merging happen HERE, and could not happen
+// anywhere else: the platform holds no git-host credential and this process
+// does. That is R19 and R25's division of labour, unchanged. What R40 adds is
+// that the platform can now say it would like one of these done — as a
+// run_action, on the queue R24 built for the Commit button, so that each one
+// has a state, a result and a name in the console rather than being a sentence
+// in a prompt the agent could ignore.
+//
+// Every one of them is refusable by this machine simply by not being able to do
+// it, and says why when it cannot. A rule is a request, not a grant.
+
+/** " (auto_pr)" — so the log says whose idea this was. */
+function byRule(action) {
+  return action.requestedByRule ? ` (${action.requestedByRule})` : '';
+}
+
+/**
+ * What this project's rules will do when the run ends, said at claim time.
+ *
+ * Silence for a project with no rules, which is every project by default — a
+ * daemon that logged "auto_push: no" four times per claim would train its
+ * operator to stop reading. `auto_merge` gets a line of its own and a shouted
+ * one, because it is the only rule here whose consequence cannot be undone by
+ * clicking something afterwards.
+ */
+function announceRules(rules) {
+  if (!rules) return; // An API older than R40. Nothing is queued, so nothing happens.
+  const on = ['autoPush', 'autoPr', 'autoMerge', 'requireReview'].filter((name) => rules[name]);
+  if (!on.length) return;
+  log(`  this project's rules: ${on.join(', ')}`);
+  if (rules.autoMerge) {
+    log('  !! auto_merge is ON: when this run finishes, its branch will be merged '
+      + 'with nobody reading it');
+  }
+}
+
+/** The remote to push to. The first one, as `readPushState` also assumes. */
+async function firstRemote(cwd) {
+  const remotes = await git(cwd, ['remote']).catch(() => '');
+  return remotes.split('\n')[0]?.trim() || null;
+}
+
+/** Runs `gh` and hands back everything it said, including on failure. */
+function gh(cwd, args) {
+  return new Promise((resolvePromise) => {
+    const child = spawn('gh', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (chunk) => (out += chunk));
+    child.stderr.on('data', (chunk) => (err += chunk));
+    child.on('error', (failure) => resolvePromise({
+      code: -1,
+      out: '',
+      err: failure.code === 'ENOENT'
+        ? 'gh is not installed on this machine, so it cannot talk to the git host.'
+        : failure.message,
+    }));
+    child.on('exit', (code) => resolvePromise({ code, out: out.trim(), err: err.trim() }));
+  });
+}
+
+/**
+ * The branch, on the remote.
+ *
+ * `--set-upstream` so the checkout can be used by hand afterwards, and
+ * deliberately no `--force`: a rule that pushes should never be a rule that
+ * overwrites somebody else's commits on the same branch. If the remote has
+ * diverged, this fails and says so, which is the correct outcome.
+ */
+async function pushBranch(cwd, branch) {
+  const remote = await firstRemote(cwd);
+  if (!remote) {
+    return { ok: false, result: 'No remote is configured in this checkout, so there is nowhere to push.' };
+  }
+  try {
+    const said = await git(cwd, ['push', '--set-upstream', remote, branch]);
+    return { ok: true, result: said || `${branch} → ${remote}` };
+  } catch (failure) {
+    return { ok: false, result: failure.message };
+  }
+}
+
+/**
+ * A pull request, opened rather than found.
+ *
+ * This is the line R25 wrote — "the PR is found, never created" — being
+ * narrowly reopened, and it is worth being clear about what did and did not
+ * change. R25 refused *cawdev* holding a git-host credential. It still does not
+ * hold one. This runs on the machine whose `gh` is already authenticated, which
+ * is where every other question about the git host has been answered since R19.
+ *
+ * It pushes first if the branch is not out yet: `gh pr create` cannot open a
+ * request for a branch the host has never seen, and failing with the host's
+ * wording of that would be a worse answer than simply doing the obvious thing.
+ * An existing pull request is a success, not a conflict — the rule wanted one
+ * to exist, and one does.
+ */
+async function openPullRequest(cwd, run, title) {
+  const state = await readPushState(cwd, run.branch).catch(() => null);
+  if (state === 'NO_REMOTE') {
+    return { ok: false, result: 'No remote is configured in this checkout.' };
+  }
+  if (state !== 'PUSHED') {
+    const pushed = await pushBranch(cwd, run.branch);
+    if (!pushed.ok) {
+      return { ok: false, result: `Could not push before opening it: ${pushed.result}` };
+    }
+  }
+
+  const existing = await findPullRequest(cwd, run.branch).catch(() => null);
+  if (existing && !existing.includes('/compare/')) {
+    return { ok: true, result: existing };
+  }
+
+  const opened = await gh(cwd, [
+    'pr', 'create',
+    '--head', run.branch,
+    '--title', title?.trim() || run.label || run.branch,
+    // The body says what opened it and why, because somebody will find this in
+    // a review queue with no idea where it came from.
+    '--body', `Opened by cawdev's \`auto_pr\` rule for **${run.label ?? run.branch}**.\n\n`
+      + `Nobody clicked anything: this project's rules say a finished run opens a pull request. `
+      + `The session's transcript, commits and reports are on the run in the cawdev console.`,
+  ]);
+  if (opened.code === 0 && opened.out) {
+    // gh prints the URL and nothing else on success.
+    return { ok: true, result: opened.out.split('\n').pop().trim() };
+  }
+  return { ok: false, result: opened.err || opened.out || 'gh pr create failed without saying why.' };
+}
+
+/**
+ * And merging it, with nobody reading the diff.
+ *
+ * The most dangerous eight lines in this file, and they are only ever reached
+ * because somebody with OWNER on a project deliberately turned on a rule that
+ * says so on a page that spells out what it does. It is refused outright while
+ * that project requires review — in the API and in a database check constraint
+ * both — so this cannot be how a review gets skipped.
+ *
+ * `--squash` because a rule-merged branch should land as one commit somebody
+ * can revert, and `--delete-branch` because a branch merged by a machine is a
+ * branch nobody is coming back to.
+ */
+async function mergePullRequest(cwd, branch) {
+  const url = await findPullRequest(cwd, branch).catch(() => null);
+  if (!url || url.includes('/compare/')) {
+    return {
+      ok: false,
+      result: 'There is no pull request for this branch to merge. Nothing was merged.',
+    };
+  }
+  const merged = await gh(cwd, ['pr', 'merge', url, '--squash', '--delete-branch']);
+  if (merged.code === 0) {
+    return { ok: true, result: `${url} — squashed and merged, branch deleted.` };
+  }
+  return { ok: false, result: merged.err || merged.out || 'gh pr merge failed without saying why.' };
+}
+
+/**
+ * One last pass over the action queue, after the session has ended.
+ *
+ * `watchWorkingCopy` stops when the child does, and the rules queue their work
+ * at exactly that moment — the run reaching FINISHED is what creates it. Without
+ * this, an `auto_pr` project would queue a pull request that nothing ever came
+ * back for, and the run would sit there claiming it was about to be published.
+ *
+ * Bounded rather than looped: these are the actions the run's own ending
+ * produced, and if the platform has more to say it can say it to the next run.
+ */
+async function settleActions(config, run, cwd) {
+  const actions = await api(
+    config,
+    `/api/projects/${run.projectSlug}/runs/${run.id}/actions/claim`,
+    { method: 'POST' },
+  ).catch((failure) => {
+    log(`  could not read the closing actions: ${failure.message}`);
+    return [];
+  });
+
+  // Array.isArray rather than `?? []`: this runs on the last breath of a run,
+  // inside an exit handler, and a platform older than R40 — or one that
+  // answered with something else entirely — must not be the thing that throws
+  // out of it. "Nothing was queued" is both the common case and the safe
+  // reading of anything that is not a list.
+  if (!Array.isArray(actions)) {
+    return;
+  }
+  for (const action of actions) {
+    await perform(config, run, cwd, action);
+  }
 }
 
 // --- what became of the branch, after the run is over ------------------------
@@ -2138,6 +2342,12 @@ async function startRun(config, offered, workspace) {
     defaultBranch = claimed.defaultBranch;
     // Whether somebody was shown the uncommitted work and started anyway.
     allowDirty = claimed.allowDirty === true;
+    // And what this project has decided happens when the run ends — R40. The
+    // daemon does not act on this: the platform queues the push, the pull
+    // request and the merge as actions and `settleActions` performs them. It is
+    // said out loud here so that whoever is watching this log finds out BEFORE
+    // the surprise rather than after it — particularly the last one.
+    announceRules(claimed.rules);
   } catch (failure) {
     // Losing the race is normal when two runners serve one project, and is not
     // this run's failure — somebody else has it.
@@ -2413,10 +2623,6 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace) {
     child.on('exit', async (code, signal) => {
       prompts.stop();
       workingCopy.stop();
-      // The last reading, after the agent has stopped changing things. It
-      // usually lands *after* the run is already FINISHED, because the agent
-      // ends its own run by reporting — which the API allows for exactly this.
-      await reportCommits(config, run, cwd, baseCommit);
       // Flushed before the transition, so the last thing the session said is
       // already readable when its state changes to FINISHED.
       await transcript.flush();
@@ -2434,6 +2640,20 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace) {
           : `The agent exited with code ${code} without reporting. ${lastText}`.trim();
         await finish(config, run, code === 0 ? 'FINISHED' : 'FAILED', summary);
       }
+
+      // The run has ended, which is the moment its project's rules queue a
+      // push, a pull request or a merge — R40. The working-copy watcher that
+      // would normally pick those up stopped with the child, so this is the
+      // pass that performs them. It has to come BEFORE the last reading, or
+      // the push state and PR link the console shows would be the ones from
+      // before the rules ran.
+      await settleActions(config, run, cwd);
+
+      // The last reading, after the agent has stopped changing things and after
+      // anything the rules did. It usually lands *after* the run is already
+      // FINISHED, because the agent ends its own run by reporting — which the
+      // API allows for exactly this.
+      await reportCommits(config, run, cwd, baseCommit);
       resolvePromise();
     });
   });
