@@ -22,7 +22,14 @@ const SERVER = new URL('./server.mjs', import.meta.url).pathname;
  * decision, and null keeps answering 204 — "still pending" — which is what the
  * agent's long poll sees while nobody has looked.
  */
-async function fakePlatform({ rules = [], rulesStatus = 200, decide = null, onApproval = () => {} } = {}) {
+async function fakePlatform({
+  rules = [],
+  rulesStatus = 200,
+  sessionRules = [],
+  sessionRulesStatus = 200,
+  decide = null,
+  onApproval = () => {},
+} = {}) {
   const asked = [];
   const server = createServer((request, response) => {
     const url = request.url ?? '';
@@ -41,6 +48,15 @@ async function fakePlatform({ rules = [], rulesStatus = 200, decide = null, onAp
         return response.end('{"status":404,"error":"Not Found"}');
       }
       return json(rules.map((pattern) => ({ pattern })));
+    }
+    // R60. Checked BEFORE the project's rules in the URL matching here only
+    // because this path is the more specific one — it lives under the run.
+    if (url.includes('/runs/run-1/tool-rules')) {
+      if (sessionRulesStatus !== 200) {
+        response.writeHead(sessionRulesStatus, { 'content-type': 'application/json' });
+        return response.end('{"status":404,"error":"Not Found"}');
+      }
+      return json(sessionRules.map((pattern) => ({ pattern })));
     }
     if (url.endsWith('/approvals') && request.method === 'POST') {
       let body = '';
@@ -236,4 +252,82 @@ test('an unreachable platform denies, and says so', async () => {
   );
   assert.equal(decision.behavior, 'deny');
   assert.match(decision.message, /could not be asked/i);
+});
+
+// --- R60: a grant that lasts as long as the run ------------------------------
+
+test('a session grant covers the next call, and no person is asked again', async () => {
+  const platform = await fakePlatform({ sessionRules: ['Bash(mvn *)'] });
+  try {
+    const decision = JSON.parse(
+      await callTool(platform.url, 'approve', { tool_name: 'Bash', input: bash }),
+    );
+    assert.equal(decision.behavior, 'allow');
+    assert.match(decision.reason, /allowed for this session/);
+    // The point of it: nobody was asked. Without this the session stops on
+    // every call, which is what "allow once" already did.
+    assert.deepEqual(platform.asked, []);
+  } finally {
+    platform.close();
+  }
+});
+
+test('a session grant is NOT filtered by this machine\'s ceiling', async () => {
+  // The whole of R60's decision, in one assertion. A project rule with an
+  // empty ceiling is dropped; a session grant with the same empty ceiling
+  // stands, because a person is watching this run and it dies with it.
+  const platform = await fakePlatform({ sessionRules: ['Bash'] });
+  try {
+    const decision = JSON.parse(
+      await callTool(
+        platform.url,
+        'approve',
+        { tool_name: 'Bash', input: { command: 'cd backend && ./mvnw test' } },
+        { CAWDEV_GRANTABLE: '[]' },
+      ),
+    );
+    assert.equal(decision.behavior, 'allow');
+    assert.deepEqual(platform.asked, []);
+  } finally {
+    platform.close();
+  }
+});
+
+test('a project rule with the same pattern IS filtered by the ceiling', async () => {
+  // The other half, so the pair says which rule the ceiling is about. This one
+  // asks a person, and here nobody comes.
+  const platform = await fakePlatform({ rules: ['Bash'], decide: null });
+  try {
+    const decision = JSON.parse(
+      await callTool(
+        platform.url,
+        'approve',
+        { tool_name: 'Bash', input: bash },
+        { CAWDEV_GRANTABLE: '[]' },
+      ),
+    );
+    assert.equal(decision.behavior, 'deny');
+    assert.equal(platform.asked.length, 1, 'the ceiling should have sent this to a person');
+  } finally {
+    platform.close();
+  }
+});
+
+test('session rules that cannot be read mean ask, not allow and not deny', async () => {
+  // An API too old to have the endpoint answers 404, which is the normal case
+  // mid-upgrade. Not knowing what was granted is a fact about the platform,
+  // not about this call, so the session asks — as it did before R60 existed.
+  const platform = await fakePlatform({
+    sessionRulesStatus: 404,
+    decide: { state: 'ALLOWED', reason: 'go on' },
+  });
+  try {
+    const decision = JSON.parse(
+      await callTool(platform.url, 'approve', { tool_name: 'Bash', input: bash }),
+    );
+    assert.equal(decision.behavior, 'allow');
+    assert.equal(platform.asked.length, 1, 'it should have asked a person');
+  } finally {
+    platform.close();
+  }
 });

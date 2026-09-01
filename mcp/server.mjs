@@ -879,6 +879,25 @@ async function decide(config, args) {
       return allow(input, `covered by this project's rule ${covered}`);
     }
 
+    // What somebody already allowed for the rest of THIS run — R60.
+    //
+    // Deliberately NOT filtered by the ceiling, and it is the one place in this
+    // file where that is true. R51's ceiling is about rules that apply when
+    // nobody is watching: a project rule reaches sessions that have not started
+    // yet, so the machine's owner has the last word on it. A session grant
+    // reaches no session but this one, was made by a person looking at this
+    // command, and dies when the run does. Filtering it would leave the console
+    // offering a button that does nothing on every machine with a narrow
+    // grantable — which is the default, and the reason this session stopped.
+    //
+    // Its own try, like liveRules and for the same reason: not knowing what was
+    // granted is a fact about the platform, not about this call, and the honest
+    // consequence is to ask again rather than to deny.
+    const granted = coveredBy(await sessionRules(config, project, runId), toolName, input);
+    if (granted) {
+      return allow(input, `allowed for this session by ${granted}`);
+    }
+
     const asked = await api(config, `/api/projects/${project}/runs/${runId}/approvals`, {
       method: 'POST',
       body: {
@@ -937,6 +956,24 @@ async function liveRules(config, project) {
   try {
     const rules = await api(config, `/api/projects/${project}/tool-rules`);
     return (rules ?? []).map((rule) => rule?.pattern).filter((pattern) => typeof pattern === 'string');
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * What has already been allowed for the rest of this run, or none — R60.
+ *
+ * Never throws, for the reason `liveRules` does not: the caller is deciding a
+ * permission and must reach the point where it asks a person. An endpoint that
+ * 404s — an older API, which is the normal case during an upgrade — is not an
+ * answer about this call, so it counts as "nothing has been granted" and the
+ * session asks. That is what it would have done anyway before R60 existed.
+ */
+async function sessionRules(config, project, runId) {
+  try {
+    const rules = await api(config, `/api/projects/${project}/runs/${runId}/tool-rules`);
+    return (rules ?? []).map((rule) => rule?.pattern).filter((p) => typeof p === 'string');
   } catch {
     return [];
   }
