@@ -92,6 +92,20 @@ that the next reader does not have to reconstruct it from the thread.
 A comment you write is attributed to your run as well as to the account that
 minted your token, so a person can tell an agent's reading from a colleague's.
 
+### Read what the earlier sessions did before repeating it
+
+`task_current` lists **every run this card has already had** — how each ended,
+on what branch, with what model, whether the work was pushed, and the commits it
+made by subject. A card that failed twice on the same branch is telling you
+something its status does not, and the second attempt is the one that most needs
+to know what the first tried.
+
+No transcripts come with it, deliberately: the terminal log is on the run's own
+page in the console, and nine of them would fill the context this call exists to
+orient. If you need the detail, the discussion under the entry is where a
+previous session should have written down what it learned — and where yours
+should.
+
 ### There is no delete
 
 Not in these tools, not in the API. `roadmap_decline` with a reason is the only
@@ -140,7 +154,7 @@ token gets a refusal saying so.
 
 | Tool | What it does |
 |---|---|
-| `task_current` | The entry you are working on, its branch, and everything already said and asked on this run. **Call it first**, and again whenever you are unsure where you are. |
+| `task_current` | The entry you are working on, its branch, everything already said and asked on this run, **and every earlier run on the same card**. **Call it first**, and again whenever you are unsure where you are. |
 | `report` | `progress` as often as useful; `done` when finished, naming the branch and any PR; `blocked` when a person must resolve something. `done` and `blocked` end the run. |
 | `ask_user` | Ask the person who started the run, and wait. Blocks up to ten minutes, then hands back a `question_id`. |
 | `await_answer` | Resume waiting for a question `ask_user` handed back. |

@@ -632,6 +632,14 @@ const TOOLS = [
         config,
         `/api/projects/${project}/roadmap/${run.entryNumber}/comments`,
       );
+      // Every session this card has already had — R38. Its own try, because a
+      // history that cannot be read is not a reason to fail the one call a
+      // resumed session re-orients from: the entry and the branch matter more,
+      // and the honest consequence of not knowing is to say nothing about it.
+      const history = await api(
+        config,
+        `/api/projects/${project}/roadmap/${run.entryNumber}/runs`,
+      ).catch(() => []);
 
       const lines = [
         `project: ${project}`,
@@ -641,6 +649,18 @@ const TOOLS = [
         '',
         formatEntry(entry, { comments }),
       ];
+
+      // What happened the other times. A session is told the entry and the
+      // branch but not that two previous runs on this card failed, which is
+      // exactly what a session about to repeat them needs. This run is left
+      // out: everything about it is already above and below.
+      const before = history.filter((item) => item.run.id !== runId);
+      if (before.length) {
+        lines.push('', `--- this card has been worked on before (${before.length}) ---`);
+        for (const { run: past, commits } of before) {
+          lines.push(formatPastRun(past, commits));
+        }
+      }
 
       if (messages.length) {
         lines.push('', '--- what you have reported so far ---');
@@ -1055,8 +1075,47 @@ function formatEntry(entry, { brief, comments }) {
   // with an argument attached should be visibly different from one without,
   // even in a list. Omitted at zero rather than written as "comments: 0".
   if (brief && entry.commentCount) lines.push(`  comments: ${entry.commentCount}`);
+  // R38. Both omitted at zero and at null: a card nobody has run anything on,
+  // written by a person, is the ordinary case and says nothing about itself.
+  if (entry.runCount) lines.push(`  runs so far: ${entry.runCount}`);
+  if (entry.createdBy) {
+    lines.push(`  written by: a ${entry.createdBy.profile} session, `
+      + `under ${entry.createdBy.startedByEmail}`);
+  }
   if (!brief && entry.body) lines.push('', entry.body);
   if (comments?.length) lines.push('', formatComments(comments));
+  return lines.join('\n');
+}
+
+/**
+ * One earlier attempt at this card — R38.
+ *
+ * How it ended first, because that is the whole reason to read it: a card that
+ * failed twice on the same branch is telling you something the status does not.
+ * The commits are named rather than counted — a resumed session wants to know
+ * whether the work it is about to do is already sitting on that branch.
+ *
+ * Deliberately no transcript. It is minutes of reading, it is on the run's own
+ * page, and putting nine of them here would fill the context of the session
+ * this is supposed to orient.
+ */
+function formatPastRun(past, commits = []) {
+  const took = past.startedAt && past.finishedAt
+    ? `, ${Math.round((Date.parse(past.finishedAt) - Date.parse(past.startedAt)) / 60000)}m`
+    : '';
+  const lines = [
+    `[${past.state}${took}] ${past.createdAt ?? ''} on ${past.branch ?? '(no branch)'}`
+      + ` — ${past.model ?? 'the runner default'}, started by ${past.startedByEmail}`,
+  ];
+  if (past.exitSummary) lines.push(`  ended: ${past.exitSummary}`);
+  // Whether it left the machine at all: commits that were never pushed are not
+  // on the branch a later session checks out.
+  if (past.prUrl) lines.push(`  pull request: ${past.prUrl}`);
+  else if (past.pushState) lines.push(`  push: ${past.pushState}`);
+  for (const commit of commits) {
+    lines.push(`  ${commit.sha.slice(0, 8)} ${commit.subject}`);
+  }
+  if (!commits.length) lines.push('  committed nothing');
   return lines.join('\n');
 }
 
