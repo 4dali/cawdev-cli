@@ -2179,14 +2179,48 @@ They asked:
 ${run.openingPrompt}`;
 }
 
-/** One user message, in the shape `--input-format stream-json` expects. */
+/**
+ * One user message, in the shape `--input-format stream-json` expects.
+ *
+ * **Never throws, and never lets the socket throw.** A session that has already
+ * exited has a closed stdin, and writing to one raises EPIPE as an *unhandled*
+ * error event on the socket — which does not fail the write, it kills the
+ * daemon. That took every other run on the machine down with it, from a CI
+ * failure that read as "an ASK session queued behind coding" and was nothing of
+ * the kind.
+ *
+ * The agent being gone is ordinary: it is what a crashed session, a finished
+ * one, and a stubbed one all look like. Its exit is handled elsewhere, so here
+ * it is enough to say the prompt did not land and carry on.
+ *
+ * @returns whether the message reached the session.
+ */
 function writeUserMessage(child, text) {
-  child.stdin.write(
-    `${JSON.stringify({
-      type: 'user',
-      message: { role: 'user', content: [{ type: 'text', text }] },
-    })}\n`,
-  );
+  if (!child.stdin || child.stdin.destroyed || child.stdin.writableEnded) {
+    return false;
+  }
+  try {
+    child.stdin.write(
+      `${JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'text', text }] },
+      })}\n`,
+      // Asynchronous failures arrive here rather than as an error event on the
+      // socket, which is the half that was crashing.
+      (failure) => {
+        if (failure && failure.code !== 'EPIPE') {
+          log(`  could not write to the session: ${failure.message}`);
+        }
+      },
+    );
+    return true;
+  } catch (failure) {
+    // Synchronous EPIPE, on a stdin closed between the check above and here.
+    if (failure.code !== 'EPIPE') {
+      log(`  could not write to the session: ${failure.message}`);
+    }
+    return false;
+  }
 }
 
 /**
@@ -2220,7 +2254,13 @@ function deliverPrompts(config, run, child) {
       for (const prompt of pending) {
         if (stopped || child.stdin.destroyed) break;
         log(`  prompt from the console: ${prompt.body.slice(0, 80)}`);
-        writeUserMessage(child, prompt.body);
+        // Acknowledged only if it actually landed. Marking one delivered to a
+        // session that had already gone is how a prompt disappears with nobody
+        // able to say whether it was seen.
+        if (!writeUserMessage(child, prompt.body)) {
+          log('    the session was already gone; leaving it undelivered');
+          break;
+        }
         delivered.push(prompt.id);
       }
       if (delivered.length) {
@@ -2619,6 +2659,15 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace) {
       branch: run.branch,
       profile: run.profile ?? 'CODE',
     };
+    // A stdin with no error listener turns EPIPE into an unhandled event, and an
+    // unhandled event on a socket ends the process — the daemon, not the run.
+    // The child's own exit is what says the session is over; this only stops it
+    // being said by a crash.
+    child.stdin?.on('error', (failure) => {
+      if (failure.code !== 'EPIPE') {
+        log(`  the session's input failed: ${failure.message}`);
+      }
+    });
     child.cawdevStartedAt = new Date().toISOString();
     // What kind it is, so the queue knows whether it holds the working copy.
     // Whether it holds the working copy, which is what the queue serialises on.
