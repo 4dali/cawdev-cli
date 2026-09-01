@@ -197,6 +197,12 @@ test('a claimed run actually spawns', async (t) => {
   });
 
   await platform.until((transitions) => transitions.length > 0);
+  // And then for the line itself. RUNNING is posted before `spawnAgent` logs
+  // the spawn, so asserting straight after the transition is a race that a
+  // fast machine always wins and CI does not.
+  for (let waited = 0; waited < 200 && !/spawning: \/bin\/echo/.test(said); waited++) {
+    await new Promise((wake) => setTimeout(wake, 100));
+  }
 
   const failed = platform.transitions.find((each) => each.state === 'FAILED');
   assert.equal(

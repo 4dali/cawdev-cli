@@ -26,6 +26,23 @@ import { socketPathFor } from './control.mjs';
 const run = promisify(execFile);
 const DAEMON = new URL('./runner.mjs', import.meta.url).pathname;
 
+/**
+ * Waits for something to appear in the daemon's log.
+ *
+ * These tests assert on what the daemon *said*, so they have to wait for it to
+ * have said it. Waiting on a platform transition instead is a race: RUNNING is
+ * posted before `spawnAgent` writes any of these lines, and a fast machine
+ * simply never loses it. CI did.
+ */
+async function untilSaid(said, pattern, timeout = 20000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (pattern.test(said())) return true;
+    await new Promise((wake) => setTimeout(wake, 100));
+  }
+  return false;
+}
+
 async function aRepository() {
   const path = await mkdtemp(join(tmpdir(), 'cawdev-browser-'));
   await run('git', ['init', '-q', '-b', 'main'], { cwd: path });
@@ -87,8 +104,10 @@ async function daemonWith(t, { name, wants, allows, perProject }) {
     await rm(socketPathFor(name), { force: true });
   });
 
-  await platform.until((transitions) => transitions.some((each) => each.state === 'RUNNING'));
-  return { platform, said: () => said };
+  // The spawn line is what every test here reads, so wait for it rather than
+  // for a transition that precedes it.
+  await untilSaid(() => said, /spawning:/);
+  return { platform, said: () => said, untilSaid: (p) => untilSaid(() => said, p) };
 }
 
 /** The daemon logs the whole spawn line, which is where --chrome shows up. */
@@ -99,15 +118,16 @@ function spawnedWithChrome(said) {
 }
 
 test('the run asks and the machine allows: the session gets a browser', async (t) => {
-  const { said } = await daemonWith(t, { name: 'test-browser-yes', wants: true, allows: true });
+  const { said, untilSaid } = await daemonWith(t,
+    { name: 'test-browser-yes', wants: true, allows: true });
   assert.equal(spawnedWithChrome(said()), true, said());
   // And it is said out loud, so whoever is watching knows what the session can
   // reach — and that the first call will still ask.
-  assert.match(said(), /Claude in Chrome is available/);
+  assert.ok(await untilSaid(/Claude in Chrome is available/), said());
 });
 
 test('the run asks and the machine does not: it runs anyway, and says why', async (t) => {
-  const { platform, said } = await daemonWith(t, {
+  const { platform, said, untilSaid } = await daemonWith(t, {
     name: 'test-browser-no',
     wants: true,
     allows: false,
@@ -118,7 +138,7 @@ test('the run asks and the machine does not: it runs anyway, and says why', asyn
   // and failing here would throw away work over something the session may not
   // even have needed.
   assert.deepEqual(platform.transitions.filter((each) => each.state === 'FAILED'), []);
-  assert.match(said(), /does not allow it/);
+  assert.ok(await untilSaid(/does not allow it/), said());
 });
 
 test('a config that never heard of R61 means no, and keeps meaning it', async (t) => {
