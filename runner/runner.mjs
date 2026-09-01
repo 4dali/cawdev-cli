@@ -149,6 +149,22 @@ const DEFAULTS = {
   pollSeconds: 25,
   heartbeatSeconds: 30,
   /**
+   * Whether a run on this machine may drive Claude in Chrome — R61.
+   *
+   * **Off, and it has to be.** `--chrome` connects the session to the browser
+   * extension in the operator's OWN Chrome — their logged-in sessions, their
+   * cookies, their mail. That is a different kind of permission from
+   * `Bash(mvn *)`, and it must not be reachable by writing a roadmap card in a
+   * project this machine happens to serve.
+   *
+   * This is R51's asymmetry pointed at a browser: the platform records what was
+   * asked for, and the machine decides whether it happens. A run that asks and
+   * is refused is NOT failed — it runs without the browser and says so on its
+   * own transcript, because a capability withheld and a broken run are
+   * different things.
+   */
+  browser: false,
+  /**
    * How often to take what a person has asked of a served checkout — R57.
    *
    * Faster than the heartbeat on purpose: these sit behind a button somebody is
@@ -202,6 +218,8 @@ async function readConfig() {
     allowedTools: file.allowedTools ?? [],
     /** The machine's ceiling on stored rules. Per project ones add to it. */
     grantable: file.grantable ?? DEFAULTS.grantable,
+    /** Whether a run here may reach the operator's browser. Per project too. */
+    browser: file.browser ?? DEFAULTS.browser,
   };
 
   if (!config.token) {
@@ -270,6 +288,10 @@ function normaliseProjects(projects) {
       // that will let one repository run Maven unattended has not said the
       // same about the other three.
       grantable: settings.grantable ?? [],
+      // And whether THIS project's runs may reach the browser — R61. Undefined
+      // falls through to the machine's answer; `false` here refuses it for one
+      // project on a machine that otherwise allows it.
+      browser: settings.browser,
     };
   }
   return normalised;
@@ -2526,6 +2548,19 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace) {
       ];
   const agentArgs = [...config.agentArgs];
 
+  // R61. Whether this session may drive the browser: the run asks, and this
+  // machine answers. Both have to say yes.
+  //
+  // Refusing is NOT a failure. The run goes ahead without a browser and says so
+  // on its own transcript — "I could not look at it" is a thing the session and
+  // whoever reads it later both need to know, and failing the run instead would
+  // throw away work over a capability it may not even have needed.
+  const browserAllowedHere = config.projects[run.projectSlug]?.browser ?? config.browser;
+  const browser = Boolean(run.browser) && Boolean(browserAllowedHere) && writesCodeProfile(run);
+  if (browser) {
+    agentArgs.unshift('--chrome');
+  }
+
   // Which model answers. Passed through verbatim — the CLI validates it, and a
   // run that names none is spawned exactly as it was before R23.
   //
@@ -2596,6 +2631,27 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace) {
 
     let lastText = '';
     const transcript = new Transcript(config, run);
+
+    // R61. Asked for a browser and not given one. Said on the RUN for the same
+    // reason a refused rule is: the session is about to report that it could
+    // not look at the page, and the reason belongs next to that rather than in
+    // a log on somebody's laptop.
+    if (run.browser && !browser) {
+      const line = writesCodeProfile(run)
+        ? 'This run asked to drive the browser, and this machine does not allow it. '
+          + 'It is running without one — set "browser": true in the runner\'s config to '
+          + 'permit it. Nothing else about the run is affected.'
+        : 'This run asked to drive the browser, but its profile writes no code and has '
+          + 'nothing to look at, so it is running without one.';
+      log(`  ${line}`);
+      transcript.push({ kind: 'SYSTEM', body: line });
+    }
+    if (browser) {
+      const line = 'Claude in Chrome is available to this session. The first call still asks '
+        + 'a person — allow mcp__claude-in-chrome for the session to cover the rest.';
+      log(`  ${line}`);
+      transcript.push({ kind: 'SYSTEM', body: line });
+    }
 
     // A rule the project granted that this machine will not apply unattended.
     // Said on the RUN, not only in the daemon's log: "I clicked allow and

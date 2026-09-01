@@ -144,6 +144,35 @@ they are yours to create, and two or three is plenty.
 Nothing is written down about which workspace is busy, so a killed daemon leaks
 nothing: restarting frees them all.
 
+### Letting a run drive the browser
+
+R61. `--chrome` connects a session to Claude in Chrome — verified in print mode
+against 2.1.252, with no terminal and no settings sources: the tools are there
+and a call reaches the extension.
+
+**Off by default, and this machine has the last word.**
+
+```json
+{ "browser": true, "projects": { "cawdev": { "path": "…", "browser": false } } }
+```
+
+It reaches the extension in **your own Chrome**: your logged-in sessions, your
+cookies, your mail. That is a different kind of permission from `Bash(mvn *)`,
+and it must not be reachable by writing a roadmap card in a project this machine
+happens to serve — so the platform records what was asked for and the config
+decides whether it happens. A per-project `browser` overrides the machine's
+answer in either direction.
+
+A run that asks and is refused is **not failed**. It runs without a browser and
+says so on its own transcript, because a capability withheld and a broken run
+are different things.
+
+**Turning it on does not pre-allow it.** The tools become available; the first
+call still stops and asks. `mcp__claude-in-chrome` — the server with no tool
+after it — covers every tool on it, so one answer settles the session rather
+than twenty-six. A machine that wants it unattended puts that string in its own
+`allowedTools`.
+
 ### What a person can ask of a checkout
 
 R57. The daemon polls `workspace-requests/claim` every few seconds and does one
