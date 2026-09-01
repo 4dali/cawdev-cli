@@ -70,6 +70,35 @@ async function aCheckoutGitWillRefuseToSwitch(branch, editing) {
   return path;
 }
 
+/**
+ * What the checkout actually looked like, for a failure message.
+ *
+ * This test failed once in CI with "a branch named 'r57-work' already exists"
+ * from the `checkout -b` path — which the daemon only takes when
+ * `git branch --list` says the branch is NOT there. Both cannot be true, and
+ * neither the daemon's log nor the assertion said which repository it was
+ * looking at. It could not be reproduced locally, under load, or with the
+ * child-process race that first looked like the cause. So the state travels
+ * with the failure now: the next occurrence answers it rather than starting
+ * this again.
+ */
+async function stateOf(path) {
+  const say = async (label, args) => {
+    const shown = await run('git', args, { cwd: path })
+      .then(({ stdout }) => stdout.trim() || '(nothing)')
+      .catch((failure) => `FAILED: ${failure.message.split('\n')[0]}`);
+    return `${label}:\n${shown}`;
+  };
+  return [
+    `path: ${path}`,
+    await say('branch --list', ['branch', '--list']),
+    await say('branch --list r57-work', ['branch', '--list', 'r57-work']),
+    await say('status --porcelain', ['status', '--porcelain']),
+    await say('log --oneline --all', ['log', '--oneline', '--all']),
+    await say('stash list', ['stash', 'list']),
+  ].join('\n');
+}
+
 async function daemonWith(t, { path, name, offers = [], allowDirty = false, workspaceRequests = [] }) {
   const platform = await fakePlatform({ offers, allowDirty, workspaceRequests });
   const home = await mkdtemp(join(tmpdir(), 'cawdev-cfg-'));
@@ -121,7 +150,11 @@ test('Start anyway starts, and the branch carries the uncommitted work', async (
   const failed = platform.transitions.find((each) => each.state === 'FAILED');
   // Before R57 this is where it stopped, in git's own words: "Your local
   // changes to the following files would be overwritten by checkout".
-  assert.equal(failed, undefined, `the run failed: ${failed?.summary}\n${said()}`);
+  assert.equal(
+    failed,
+    undefined,
+    `the run failed: ${failed?.summary}\n${said()}\n${await stateOf(path)}`,
+  );
   assert.ok(started, `the run never started:\n${said()}`);
 
   const branch = (await run('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: path }))
