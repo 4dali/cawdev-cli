@@ -124,6 +124,73 @@ const STATE_COLOUR = {
 };
 
 /**
+ * The question stopping a session, and whether this operator may answer it —
+ * R58.
+ *
+ * Pure, and separate from the drawing, because it is a *rule* rather than a
+ * layout: the API refuses anyone else with a message naming the owner, and a
+ * terminal that offered the key anyway would turn "this is Alice's question"
+ * into "cawdev is broken". The rule is the API's three ways in, by email —
+ * this program never learns a user id, and `sharedWithEmail` is on the share
+ * for exactly this kind of client.
+ *
+ * Returns null when nothing is waiting, which is the common case and the one
+ * the caller wants to say nothing about.
+ */
+export function questionState(questions, email) {
+  const open = (questions ?? []).find((question) => !question.answered);
+  if (!open) {
+    return null;
+  }
+  const handedToYou = (open.shares ?? []).some(
+    (share) => share.open && share.kind === 'DECIDE' && share.sharedWithEmail === email,
+  );
+  return {
+    question: open,
+    // No owner means the run has no starter, which leaves the question open to
+    // the project — the one case R58 deliberately did not narrow.
+    yours: Boolean(email) && (!open.waitingOnEmail || open.waitingOnEmail === email
+      || handedToYou),
+    waitingOn: open.waitingOnEmail ?? null,
+  };
+}
+
+/**
+ * That question, drawn — R58, and a function rather than a method for the
+ * reason `settingsBar` is one: it can then be rendered and looked at without a
+ * terminal, which is how R62 found the two things its tests did not.
+ *
+ * **Two shapes, and the second is why this exists.** When the question is this
+ * operator's, `a` answers it here. When it is not, the banner names the person
+ * it is waiting on instead of offering a key that would 403 — a terminal that
+ * let somebody type an answer and then refused it reads as cawdev being broken
+ * rather than as the question belonging to a colleague.
+ */
+export function questionBanner(asking, width) {
+  if (!asking) return [];
+
+  const options = asking.question.options?.length
+    ? `${DIM} · ${asking.question.options.join(' / ')}${RESET}`
+    : '';
+  // 12 is the label and its spaces: the same arithmetic the permission banner
+  // above uses, and for the same reason — clip counts visible characters.
+  const head = `${ESC}[36m${BOLD} question ${RESET} ${clip(asking.question.question, width - 12)}`;
+  const rule = `${DIM}${'─'.repeat(Math.max(0, width))}${RESET}`;
+
+  if (asking.yours) {
+    return [head, ` ${ESC}[32ma${RESET} answer${options}`, rule];
+  }
+  // The NAME is the last thing to go, the way the session total is on R62's
+  // bar: "waiting on alice@…" is the whole answer to "why is that not moving",
+  // and the clause after it is a courtesy. Truncating the sentence instead
+  // spends the narrow terminal's last columns on the courtesy and cuts the
+  // answer — which is what looking at this at 40 columns showed.
+  const who = ` waiting on ${asking.waitingOn ?? 'somebody else'}`;
+  const whole = `${who} — theirs to answer, or somebody they hand it to`;
+  return [head, `${DIM}${clip(whole.length <= width ? whole : who, width)}${RESET}`, rule];
+}
+
+/**
  * What the top bar counts — R62, and pure so it can be tested.
  *
  * **A queued run is not a session.** It is precisely the run that has NOT
@@ -427,6 +494,8 @@ class Attached {
     this.logs = [];
     /** runId -> the pending permission request on it, from the inbox. */
     this.approvals = new Map();
+    /** runId -> what it is asking, and whose question that is — R58. */
+    this.questions = new Map();
 
     this.mode = 'normal';
     this.input = '';
@@ -450,6 +519,7 @@ class Attached {
     this.open();
     if (this.session.signedIn) {
       void this.watchInbox();
+      void this.watchQuestions();
     }
 
     // One repaint per tick at most. A busy session emits hundreds of lines a
@@ -589,10 +659,51 @@ class Attached {
     return run ? this.approvals.get(run.id) ?? null : null;
   }
 
+  /**
+   * What the selected session is asking — R58.
+   *
+   * The run's own questions rather than the inbox, and that is the point: the
+   * inbox is now only what is *yours*, so a question stopping a session on this
+   * machine that belongs to a colleague would simply not be there — and the one
+   * thing this program exists to answer is "why is that run not moving". Here
+   * the answer is a name.
+   *
+   * Only the selected run, because that is the only one whose banner is drawn.
+   * Polling every session's questions would be a request per run per tick to
+   * render nothing.
+   */
+  async watchQuestions() {
+    while (!this.stopped) {
+      const run = this.current();
+      if (run?.projectSlug) {
+        try {
+          const asked = await this.session.request(
+            `/api/projects/${run.projectSlug}/runs/${run.id}/questions`,
+          );
+          const state = questionState(asked, this.session.email);
+          if (state) {
+            this.questions.set(run.id, state);
+          } else {
+            this.questions.delete(run.id);
+          }
+          this.dirty = true;
+        } catch {
+          // A run this operator cannot read is not an error worth a banner.
+          this.questions.delete(run.id);
+        }
+      }
+      await new Promise((done) => setTimeout(done, 2500));
+    }
+  }
+
+  askingOn(run) {
+    return run ? this.questions.get(run.id) ?? null : null;
+  }
+
   // --- keys ------------------------------------------------------------------
 
   onKey(key) {
-    if (this.mode === 'prompt' || this.mode === 'reason') {
+    if (this.mode === 'prompt' || this.mode === 'reason' || this.mode === 'answer') {
       return this.onTyping(key);
     }
     // Any other key means "no". A confirmation that outlives the moment is one
@@ -622,6 +733,21 @@ class Attached {
         this.mode = 'prompt';
         this.input = '';
         return this.note('');
+      case 'a': {
+        // R58: the refusal is here rather than at the API, so nobody types an
+        // answer into a session that is not going to take it.
+        const asking = this.askingOn(this.current());
+        if (!asking) {
+          return this.note('nothing is waiting for an answer on this one');
+        }
+        if (!asking.yours) {
+          return this.note(`waiting on ${asking.waitingOn} — not yours to answer`);
+        }
+        if (!this.requireSignIn('answer a question')) return undefined;
+        this.mode = 'answer';
+        this.input = '';
+        return this.note('');
+      }
       case 'y':
         return void this.decide(true, false);
       case 'Y':
@@ -670,7 +796,10 @@ class Attached {
       if (!text) {
         return this.note('nothing to send');
       }
-      return was === 'prompt' ? void this.send(text) : void this.decide(false, false, text);
+      if (was === 'prompt') {
+        return void this.send(text);
+      }
+      return was === 'answer' ? void this.answer(text) : void this.decide(false, false, text);
     }
     if (key === '\x7f' || key === '\b') {
       this.input = this.input.slice(0, -1);
@@ -719,6 +848,35 @@ class Attached {
     } catch (failure) {
       this.note(failure.message);
     }
+  }
+
+  /**
+   * Answering the question this session stopped on — R58.
+   *
+   * The guard was already applied when `a` was pressed; this repeats nothing,
+   * because a second copy of the rule here is a second place for it to drift.
+   * If the API refuses anyway — the question was handed on while this was being
+   * typed — its message names who it is waiting on, which is the right thing to
+   * put on the status line.
+   */
+  async answer(text) {
+    const run = this.current();
+    const asking = this.askingOn(run);
+    if (!asking) {
+      return this.note('nothing is waiting for an answer on this one');
+    }
+    try {
+      await this.session.request(
+        `/api/projects/${run.projectSlug}/runs/${run.id}`
+          + `/questions/${asking.question.id}/answer`,
+        { method: 'POST', body: { answer: text } },
+      );
+      this.questions.delete(run.id);
+      this.note('answered');
+    } catch (failure) {
+      this.note(failure.message);
+    }
+    return undefined;
   }
 
   async decide(allow, remember, reason) {
@@ -861,7 +1019,12 @@ class Attached {
     this.runs.forEach((run, at) => {
       const colour = STATE_COLOUR[run.state] ?? '';
       const marker = at === this.selected ? `${BOLD}❯${RESET}` : ' ';
-      const waiting = this.approvals.has(run.id) ? `${ESC}[33m!${RESET}` : ' ';
+      // `!` is a decision waiting; `?` is a question. Different marks because
+      // they are answered with different keys, and since R58 the second may not
+      // even be yours — the banner says which, the rail only says there is one.
+      const waiting = this.approvals.has(run.id)
+        ? `${ESC}[33m!${RESET}`
+        : this.questions.has(run.id) ? `${ESC}[36m?${RESET}` : ' ';
       const number = at < 9 ? `${at + 1}` : ' ';
       lines.push(`${marker}${waiting}${DIM}${number}${RESET} ${colour}${clip(run.label, RAIL - 6)}${RESET}`);
       lines.push(`   ${DIM}${clip(`${run.projectSlug} · ${run.state}`, RAIL - 4)}${RESET}`);
@@ -908,10 +1071,17 @@ class Attached {
     return [...banner, ...visible];
   }
 
-  /** A permission request, above the transcript, because it stops everything. */
+  /**
+   * What is stopping this session, above the transcript.
+   *
+   * A permission request wins when there is one: it is the narrower thing and
+   * the one with two keys behind it. Otherwise a question — and since R58 that
+   * banner has two shapes, because a question stopping a session on this
+   * machine is not necessarily this operator's to answer.
+   */
   bannerLines(run, width) {
     const pending = this.pendingOn(run);
-    if (!pending) return [];
+    if (!pending) return this.questionLines(run, width);
     const approval = pending.approval;
     const rule = approval.suggestion
       ? `${ESC}[33mY${RESET} always allow ${approval.suggestion}   `
@@ -922,6 +1092,20 @@ class Attached {
       ` ${ESC}[32my${RESET} allow once   ${rule}${ESC}[31mn${RESET} refuse`,
       `${DIM}${'─'.repeat(Math.max(0, width))}${RESET}`,
     ];
+  }
+
+  /**
+   * The question a session has stopped on — R58.
+   *
+   * **Two shapes, and the second is the reason this exists.** When it is this
+   * operator's, `a` answers it here. When it is not, the banner says whose it
+   * is instead of offering a key that would 403: a terminal that let somebody
+   * type an answer and then refused it would read as cawdev being broken rather
+   * than as the question belonging to a colleague. The rule is
+   * {@link questionState}, which is the API's rule and is tested on its own.
+   */
+  questionLines(run, width) {
+    return questionBanner(this.askingOn(run), width);
   }
 
   render(line) {
@@ -940,10 +1124,13 @@ class Attached {
     if (this.mode === 'reason') {
       return `${REVERSE}${pad(clip(` refuse, because ▸ ${this.input}`, width - 1), width)}${RESET}`;
     }
+    if (this.mode === 'answer') {
+      return `${REVERSE}${pad(clip(` answer ▸ ${this.input}`, width - 1), width)}${RESET}`;
+    }
     const keys =
       ` ${DIM}tab${RESET} next  ${DIM}1-9${RESET} pick  ${DIM}i${RESET} prompt  ` +
-      `${DIM}y/Y/n${RESET} permission  ${DIM}x${RESET} cancel  ${DIM}g${RESET} log  ` +
-      `${DIM}q${RESET} ${this.options.onQuit ? 'stop' : 'quit'}`;
+      `${DIM}a${RESET} answer  ${DIM}y/Y/n${RESET} permission  ${DIM}x${RESET} cancel  ` +
+      `${DIM}g${RESET} log  ${DIM}q${RESET} ${this.options.onQuit ? 'stop' : 'quit'}`;
     const status = this.status ? `  ${ESC}[33m${this.status}${RESET}` : '';
     return pad(clip(keys + status, width - 1), width);
   }

@@ -360,6 +360,11 @@ try {
   check('the inbox item carries enough to route to the run',
     item?.projectSlug === project && item?.entryNumber === entry.number
       && item?.question.options.length === 2, JSON.stringify(item));
+  // R58: whose question it is, which is what the console reads to decide
+  // between an answer box and the sentence naming who it is waiting on. This
+  // script starts the run itself, so the answer is this script.
+  check('the question names the person it is waiting on',
+    item?.question.waitingOnEmail === EMAIL, JSON.stringify(item?.question));
 
   check('the run is waiting on a person, and says so',
     (await console_(`/api/projects/${project}/runs/${runId}`)).state === 'WAITING_ON_USER');
