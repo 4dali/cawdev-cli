@@ -239,13 +239,48 @@ files at all. R47 removes the need for this by giving each run a workspace.
    round trip per project and the heartbeat runs every thirty seconds. The
    `fetch` is **skipped while an agent is working in that checkout** — it is the
    only part that writes anything, and taking the ref lock out from under a
-   session to refresh a background page is a bad trade. Nothing here writes to
-   git: no merging, no branch deletion, no pushing.
+   session to refresh a background page is a bad trade. Nothing in *this* pass
+   writes to git: no merging, no branch deletion, no pushing. (A project's own
+   rules can ask for all three — see below — but that is a queued action with a
+   name on it, not something the survey does in passing.)
 8. **Reports the lifecycle back** and, if the session dies without saying
    anything, ends the run rather than leaving it `RUNNING` forever.
 
 Cancelling a run reaches the daemon on its next poll and takes down the child's
 whole process group — an agent that started a build should not leave it running.
+
+## What a project's rules can ask of it (R40)
+
+A project may decide that a finished run **pushes its branch**, **opens a pull
+request**, and — if somebody with `OWNER` deliberately turned it on — **merges
+it with nobody reading the diff**. The rules are set in the console, ride along
+with the claim, and the daemon logs them when it takes a run, so you find out
+what is going to happen before it happens rather than afterwards. `auto_merge`
+gets a shouted line of its own.
+
+The daemon does not decide any of this. The platform queues `PUSH`, `OPEN_PR`
+and `MERGE` on the same `run_action` queue the console's *Commit* button uses,
+and the daemon performs them in `settleActions` — one pass right after the
+session ends, because the working-copy watcher stopped with the child and the
+rules queue their work at exactly that moment.
+
+**cawdev still holds no git-host credential.** This machine does, which is why
+the work happens here and why R19 and R25's division is unchanged. All that is
+new is that the platform can ask.
+
+What it actually runs:
+
+- `git push --set-upstream <remote> <branch>`. Never `--force`: a rule that
+  pushes must never be a rule that overwrites somebody else's commits.
+- `gh pr create --head <branch>`, titled with the run's label, after pushing if
+  the branch is not out yet. An existing pull request is a **success**, not a
+  conflict — the rule wanted one to exist and one does.
+- `gh pr merge <url> --squash --delete-branch`, and only if a real pull request
+  is found. A `/compare/` URL is not one, and it refuses rather than guessing.
+
+Every one of them reports a result or a reason, and a machine with no `gh`, no
+remote or no credentials simply says so. **A rule is a request, not a grant** —
+the same asymmetry `grantable` gives the R51 tool rules.
 
 ## What it does after a run is over
 
