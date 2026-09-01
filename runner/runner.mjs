@@ -414,6 +414,24 @@ async function projectRules(config, slug) {
 
 // --- git ---------------------------------------------------------------------
 
+/**
+ * Runs git and returns what it said.
+ *
+ * **Resolved on `close`, never on `exit`.** Node emits `exit` when the child
+ * ends and `close` when its stdio has also been drained, and those are not the
+ * same moment. Waiting on `exit` returns whatever happened to have arrived —
+ * usually everything, which is why it looks correct for years.
+ *
+ * It is not correct. On a loaded Linux runner this returned an EMPTY string
+ * for `git branch --list <branch>` in a repository that had the branch, so
+ * `prepareWorkingCopy` took the "create it" path and failed the run with
+ * "a branch named 'r57-work' already exists" — a contradiction inside one log
+ * line. The same run logged `git fetch --prune origin failed:` with nothing
+ * after the colon, which is the same loss showing through the error path.
+ *
+ * It does not reproduce on macOS at any output size, so this is not something
+ * a local run will ever warn about. Do not put `exit` back.
+ */
 function git(cwd, args) {
   return new Promise((resolvePromise, reject) => {
     const child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -422,10 +440,13 @@ function git(cwd, args) {
     child.stdout.on('data', (chunk) => (out += chunk));
     child.stderr.on('data', (chunk) => (err += chunk));
     child.on('error', reject);
-    child.on('exit', (code) =>
+    child.on('close', (code) =>
       code === 0
         ? resolvePromise(out.trim())
-        : reject(new Error(`git ${args.join(' ')} failed: ${err.trim() || out.trim()}`)),
+        // Naming the code when there is nothing else to say. A bare "failed: "
+        // is how the above hid for as long as it did.
+        : reject(new Error(`git ${args.join(' ')} failed: ${
+            err.trim() || out.trim() || `exit ${code}, and it said nothing`}`)),
     );
   });
 }
@@ -1529,7 +1550,8 @@ async function findPullRequest(cwd, branch) {
     let out = '';
     child.stdout.on('data', (chunk) => (out += chunk));
     child.on('error', () => resolvePromise(null));
-    child.on('exit', (code) => resolvePromise(code === 0 ? out.trim() : null));
+    // `close`, not `exit` — see git() above.
+    child.on('close', (code) => resolvePromise(code === 0 ? out.trim() : null));
   });
   if (viaGh) {
     return viaGh;
@@ -1601,7 +1623,8 @@ function gh(cwd, args) {
         ? 'gh is not installed on this machine, so it cannot talk to the git host.'
         : failure.message,
     }));
-    child.on('exit', (code) => resolvePromise({ code, out: out.trim(), err: err.trim() }));
+    // `close`, not `exit` — see git() above.
+    child.on('close', (code) => resolvePromise({ code, out: out.trim(), err: err.trim() }));
   });
 }
 
@@ -1777,7 +1800,8 @@ async function askGitHub(cwd, branch, prUrl) {
     let text = '';
     child.stdout.on('data', (chunk) => (text += chunk));
     child.on('error', () => resolvePromise(null));
-    child.on('exit', (code) => resolvePromise(code === 0 ? text.trim() : null));
+    // `close`, not `exit` — see git() above.
+    child.on('close', (code) => resolvePromise(code === 0 ? text.trim() : null));
   });
   if (!out) {
     return null;
@@ -1835,6 +1859,10 @@ async function askGit(cwd, head, defaultBranch) {
     // 0 is "yes", 1 is "no", anything else is "I could not tell" — a missing
     // object after a prune reports 128, and treating that as "not merged" is
     // how a merged run would be quietly downgraded.
+    //
+    // `exit` is right here, and it is the only place it is: nothing is piped,
+    // so there is no output to lose. Everything that captures output waits for
+    // `close` instead — see git().
     child.on('exit', (code) => resolvePromise(code === 0 ? true : code === 1 ? false : null));
   });
   if (merged === null) {
@@ -2620,7 +2648,11 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace) {
       resolvePromise();
     });
 
-    child.on('exit', async (code, signal) => {
+    // `close`, not `exit`, for the reason git() gives: the last stream-json
+    // events can still be in flight when the process ends, and on `exit` the
+    // flush below would drop them — losing the end of the transcript, which is
+    // the part somebody reads to find out how the session finished.
+    child.on('close', async (code, signal) => {
       prompts.stop();
       workingCopy.stop();
       // Flushed before the transition, so the last thing the session said is
@@ -2773,7 +2805,10 @@ async function probePermissionPrompt(config) {
       clearTimeout(give_up);
       done(`could not be run: ${failure.message}`);
     });
-    child.on('exit', () => {
+    // `close`, not `exit`: this reads the CLI's own help to decide whether a
+    // flag exists, and a truncated read would answer "no" for a flag that is
+    // there. See git() above.
+    child.on('close', () => {
       clearTimeout(give_up);
       done(text);
     });
