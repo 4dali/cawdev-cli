@@ -18,6 +18,8 @@ import { join, resolve } from 'node:path';
 import { describeTurn } from '../lib/usage.mjs';
 import { withinCeiling } from '../lib/tool-rules.mjs';
 import { serveControl } from './control.mjs';
+import { painter } from '../lib/ansi.mjs';
+import { bannerLines, tintLog } from './banner.mjs';
 
 // --- configuration -----------------------------------------------------------
 
@@ -358,7 +360,12 @@ function log(...parts) {
     beforeQuiet.push(line);
     if (beforeQuiet.length > 200) beforeQuiet.shift();
   } else {
-    console.log(`[${new Date().toISOString()}]`, ...parts);
+    const body = parts
+      .map((part) => (typeof part === 'string' ? part : String(part)))
+      .join(' ');
+    // The timestamp is always dim: it is the least interesting thing on the
+    // line and it is on every single one of them.
+    console.log(`${ink.muted(`[${new Date().toISOString()}]`)} ${tintLog(body, ink)}`);
   }
   // The daemon's own running commentary is half of what makes attaching worth
   // it: "claiming…", "no free workspace", "agent stderr". None of it reaches
@@ -2281,6 +2288,14 @@ function deliverPrompts(config, run, child) {
 const running = new Map();
 
 /**
+ * How this daemon paints its own output — R62.
+ *
+ * Decided once, from the terminal it was actually started in. Piped to a file
+ * or run under NO_COLOR it is a no-op, and every line still reads.
+ */
+const ink = painter();
+
+/**
  * Runs we have decided to take, from the moment we decide.
  *
  * Separate from `running`, which only fills once a child exists: claiming and
@@ -2952,12 +2967,22 @@ async function main() {
   });
   config.runnerId = runner.id;
 
-  log(`registered as "${runner.name}" (${runner.id}) against ${config.url}`);
+  // R62. The mark, and the five settings that decide what this machine will
+  // do. Straight to stdout rather than through log(): it is not an event, it
+  // is the state everything after it happens inside, and a timestamp on each
+  // of nine lines would bury it.
+  //
+  // Skipped when attaching, where the UI takes the screen a moment later and
+  // a banner would only flash.
+  if (!quiet) {
+    console.log(bannerLines(config, ink).join('\n'));
+  }
+
+  log(`registered as "${runner.name}" (${runner.id})`);
   for (const [slug, project] of Object.entries(config.projects)) {
-    const many = project.workspaces.length > 1
-      ? ` (${project.workspaces.length} workspaces, so ${project.workspaces.length} at once)`
-      : '';
-    log(`serving ${slug}${many}: ${project.workspaces.join(', ')}`);
+    // The paths still go to the log — the banner says how many, this says
+    // which, and "which" is what you need when one of them is wrong.
+    log(`serving ${slug}: ${project.workspaces.join(', ')}`);
   }
 
   // Frozen here, before anything can be claimed. A run that checks this very
@@ -2989,6 +3014,14 @@ async function main() {
         name: config.name,
         url: config.url,
         projects: Object.keys(config.projects),
+        // How many checkouts each has — R62. The per-project half of R47's
+        // gate, which the bar shows as `cawdev 1/2`. Added rather than
+        // replacing `projects`: an older attach ignores it and still works,
+        // and a newer one against an older daemon simply shows a count with
+        // nothing to compare it against.
+        workspaces: Object.fromEntries(
+          Object.entries(config.projects).map(([slug, p]) => [slug, p.workspaces.length]),
+        ),
         maxSessions: config.maxSessions,
       },
       snapshot: snapshotRuns,

@@ -23,6 +23,8 @@
 import { connect } from 'node:net';
 import { createInterface } from 'node:readline';
 import { listSockets, socketPathFor } from './control.mjs';
+import { painter } from '../lib/ansi.mjs';
+import { oneLine } from './brand.mjs';
 
 // --- talking to the platform as a person ------------------------------------
 
@@ -121,7 +123,95 @@ const STATE_COLOUR = {
   queued: `${ESC}[90m`,
 };
 
+/**
+ * What the top bar counts — R62, and pure so it can be tested.
+ *
+ * **A queued run is not a session.** It is precisely the run that has NOT
+ * taken a slot, and counting it would make the bar say the machine is full at
+ * the moment it is not — which is exactly backwards, because "full" is the
+ * answer to "why is mine queued".
+ *
+ * `room` is how many checkouts the project has (R47's per-project gate), and
+ * is absent when talking to a daemon older than R62. Then there is nothing to
+ * compare against and the count stands alone, rather than being shown over a
+ * number that was guessed.
+ */
+/**
+ * The bar's second row — R62, and a function rather than a method so the
+ * arithmetic in it can be tested without a terminal.
+ *
+ * The arithmetic is the whole risk here: everything on this row is coloured,
+ * and a coloured string is about ten characters longer than it looks. Padding
+ * or truncating by `length` is what put `2/2sessions` on screen with no space
+ * between them the first time this was rendered and looked at.
+ */
+export function settingsBar(runner, runs, width, ink = painter(3)) {
+  const url = runner?.url ?? '';
+  const { total, cap, projects } = sessionCounts(runner, runs);
+
+  const served = projects.map(({ slug, count, room, full }) => {
+    const of = room ? `${count}/${room}` : String(count);
+    // Busy is worth seeing; idle should not shout. Full is worth seeing most,
+    // because that is the one answering "why is mine waiting".
+    const paint = full ? ink.warn : count ? ink.success : ink.muted;
+    return `${ink.muted(slug)} ${paint(of)}`;
+  });
+
+  const tally = cap ? `${total}/${cap}` : String(total);
+  const right = `${ink.muted('sessions')} ${
+    cap && total >= cap ? ink.warn(tally) : ink.text(tally)} `;
+
+  // Narrow terminals: drop projects from the END until it fits, rather than
+  // dropping the total. Whichever number survives should be the one that
+  // answers "why is mine waiting", and on a machine at its cap that is the
+  // total — the ellipsis says the list was cut.
+  const shown = [...served];
+  const build = () => ` ${ink.accent(url)}${shown.length ? `  ${ink.muted('│')}  ` : ''}`
+    + shown.join(ink.muted('  ·  '))
+    + (shown.length < served.length ? ink.muted('  …') : '');
+
+  let left = build();
+  while (shown.length && visibleWidth(left) + visibleWidth(right) > width - 1) {
+    shown.pop();
+    left = build();
+  }
+
+  // Right-aligned by what is VISIBLE.
+  const room = width - visibleWidth(left) - visibleWidth(right);
+  const line = room > 0
+    ? `${left}${' '.repeat(room)}${right}`
+    : `${clip(left, Math.max(0, width - visibleWidth(right)))}${right}`;
+  // No blanket dim over the row: everything in it already carries its own
+  // colour, and dimming the lot flattens "full" back into "idle", which is the
+  // one distinction this bar exists to make.
+  return pad(clip(line, width), width);
+}
+
+export function sessionCounts(runner, runs) {
+  const live = (runs ?? []).filter((run) => run.state !== 'queued');
+  const here = new Map();
+  for (const run of live) {
+    here.set(run.projectSlug, (here.get(run.projectSlug) ?? 0) + 1);
+  }
+  const projects = (runner?.projects ?? []).map((slug) => {
+    const count = here.get(slug) ?? 0;
+    const room = runner?.workspaces?.[slug];
+    return { slug, count, room, full: Boolean(room) && count >= room };
+  });
+  return { total: live.length, cap: runner?.maxSessions, projects };
+}
+
 const RAIL = 30;
+
+/**
+ * How this client paints — R62.
+ *
+ * Forced on: attach only runs on a terminal it has taken over with the
+ * alternate screen, so `isTTY` is a given, and honouring NO_COLOR here would
+ * mean a full-screen UI drawn in one colour. The daemon's own log is the
+ * surface that has to survive a pipe, and that one asks properly.
+ */
+const ink = painter(3);
 
 /**
  * How wide a string looks, ignoring escape sequences.
@@ -717,7 +807,8 @@ class Attached {
     const width = process.stdout.columns ?? 100;
     const height = process.stdout.rows ?? 30;
     const paneWidth = Math.max(20, width - RAIL - 1);
-    const bodyHeight = Math.max(3, height - 3);
+    // Three chrome rows now: two of header, one of footer.
+    const bodyHeight = Math.max(3, height - 4);
 
     const rail = this.railLines(bodyHeight);
     const pane = this.paneLines(paneWidth, bodyHeight);
@@ -733,12 +824,32 @@ class Attached {
     process.stdout.write(out.join(''));
   }
 
+  /**
+   * The top bar — R62.
+   *
+   * Two rows, because one could not hold it and the second is the half people
+   * actually attach to see: which cawdev this is talking to, what it serves,
+   * and how full it is.
+   *
+   * **Both of R47's gates are on screen.** Per project it is sessions over
+   * checkouts (`cawdev 1/2`), which is that project's own ceiling; on the
+   * right it is the machine's total over `maxSessions`. A run that is waiting
+   * is then explained by the bar above it — before this, the only way to find
+   * out which limit had been hit was to read the source.
+   */
   header(width) {
     const runner = this.runner?.name ?? '…';
     const who = this.session.signedIn ? this.session.email : 'watching only';
-    const link = this.connected ? '' : `${ESC}[31m detached${RESET}`;
-    const left = ` ${BOLD}cawdev${RESET}${DIM} · ${RESET}${runner}${DIM} · ${who}${RESET}${link}`;
-    return `${REVERSE}${pad(clip(left, width - 1), width)}${RESET}`;
+    const link = this.connected ? '' : ` ${ink.danger('detached')}`;
+    const left = ` ${oneLine(ink)} ${ink.muted('·')} ${ink.bold(runner)} `
+      + `${ink.muted('·')} ${ink.muted(who)}${link}`;
+    const top = `${REVERSE}${pad(clip(left, width - 1), width)}${RESET}`;
+    return `${top}\n${this.settingsBar(width)}`;
+  }
+
+  /** The second row: where it points, what it serves, how full it is. */
+  settingsBar(width) {
+    return settingsBar(this.runner, this.runs, width);
   }
 
   railLines(height) {

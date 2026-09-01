@@ -144,6 +144,33 @@ they are yours to create, and two or three is plenty.
 Nothing is written down about which workspace is busy, so a killed daemon leaks
 nothing: restarting frees them all.
 
+### What it looks like
+
+R62. Starting the daemon prints the mark and then the five settings that decide
+what it will actually do — the platform it registered against, this machine's
+name, every project with **how many checkouts it has**, the session cap, and
+whether the browser is allowed. Those five answer nearly every "why did that
+not happen", and they used to be spread across a config file and a shrug.
+
+Attaching adds a second bar row: the URL, each project as **sessions over
+checkouts** (`cawdev 1/2`), and the machine's total against `maxSessions`.
+Both of R47's gates, on screen — a run that is waiting is explained by the bar
+above it rather than by reading the source. A narrow terminal drops projects
+from the end (with an `…`) and never the total, because on a machine at its cap
+the total is the number that answers the question.
+
+Colour is `tools/lib/ansi.mjs`: truecolor where the terminal says so, the
+256-colour cube where it does not, and **nothing at all** under `NO_COLOR`,
+through a pipe, or on a dumb terminal. Nothing carries meaning in colour alone
+— every state that has a colour also has a word — so a piped log reads exactly
+as it always did.
+
+One thing worth knowing about the tinting: a line matching `skipped` is muted
+*before* anything matches `failed`. `fetch skipped: git fetch --prune origin
+failed: no origin` is a repository with no remote, which happens on every
+survey of every scratch checkout and is fine. Painting it red teaches people
+that red means nothing.
+
 ### Letting a run drive the browser
 
 R61. `--chrome` connects a session to Claude in Chrome — verified in print mode
