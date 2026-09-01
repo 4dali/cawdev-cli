@@ -73,11 +73,29 @@ keypress away.
 | `tab`, `j`, `k` | move between sessions |
 | `1`–`9` | pick one |
 | `i` | prompt the session; `enter` sends, `esc` cancels |
+| `a` | answer the question it stopped on — if it is yours (R58) |
 | `y` / `Y` / `n` | allow once / allow always here / refuse a permission request |
 | `x`, twice | cancel the session |
 | `g` | the daemon's log instead of the transcript |
 | `PgUp` / `PgDn` | scroll back |
 | `q` | leave |
+
+### A question on this machine is not necessarily yours
+
+Since R58 a question belongs to the person who **started the run**, and only
+they — or somebody they hand it to — may answer it. The banner has two shapes
+because of that: `a answer` when it is yours, and `waiting on alice@…` when it
+is not.
+
+It shows you the question either way. This program exists to answer "why is that
+run not moving", and on a machine serving a team the answer is often a name. What
+it will not do is offer you a key that the platform would then refuse, because a
+terminal that takes an answer and hands back a 403 reads as cawdev being broken
+rather than as the question belonging to a colleague.
+
+If the person it is waiting on cannot be reached, a project owner can take the
+question over from the console — the run page has the button, and the takeover
+is recorded on the question rather than appearing as an unexplained answer.
 
 ### Watching is free; acting means signing in
 
@@ -85,8 +103,9 @@ It asks for your email and password at startup. **Leave the email blank to just
 watch** — everything on the socket is readable without it.
 
 Anything that *changes* something goes to the platform over HTTP as you, not
-through the daemon. That is not fussiness: prompting a session, cancelling one
-and deciding a permission request all refuse an agent token (R51), so a socket
+through the daemon. That is not fussiness: prompting a session, cancelling one,
+answering a question and deciding a permission request all refuse an agent
+token (R51), so a socket
 that could do them would either lend the daemon's own credential to a guard
 built to prevent exactly that, or keep yours. The password is held in memory for
 the life of the process and written nowhere.
