@@ -1,22 +1,43 @@
 {
   "url": "http://localhost:4200",
   "name": "macbook",
+  "browser": true,
+  "maxSessions": 4,
   "projects": {
     "dycrypt": "/Users/dali/Documents/Dev/dycrypt",
     "medymo": "/Users/dali/Documents/Dev/medymo",
     "saasng": "/Users/dali/Documents/Dev/saasng",
+<<<<<<< Updated upstream
     "cawdev": "/Users/dali/Documents/Dev/cawdev"
+=======
+    "cawdev": {
+      "workspaces": [
+        "/Users/dali/Documents/Dev/cawdev-dev",
+        "/Users/dali/Documents/Dev/cawdev-dev-2"
+      ],
+      "allowedTools": [
+        "Bash"
+      ],
+      "grantable": [
+        "Bash"
+      ]
+    }
+>>>>>>> Stashed changes
   },
   "allowedTools": [
     "Bash(npm *)",
     "Bash(npx *)",
     "Bash(ng *)",
-    "Bash(mvn *)"
+    "Bash(mvn *)",
+    "Bash(node *)",
+    "Bash(env *)"
   ],
   "grantable": [
     "Bash(npm *)",
     "Bash(npx *)",
     "Bash(ng *)",
-    "Bash(mvn *)"
+    "Bash(mvn *)",
+    "Bash(node *)",
+    "Bash(env *)"
   ]
 }
