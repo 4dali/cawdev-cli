@@ -149,6 +149,14 @@ const DEFAULTS = {
   pollSeconds: 25,
   heartbeatSeconds: 30,
   /**
+   * How often to take what a person has asked of a served checkout — R57.
+   *
+   * Faster than the heartbeat on purpose: these sit behind a button somebody is
+   * watching press. Slower than a second, because an idle machine should not
+   * spend its day saying "anything for me?".
+   */
+  workspacePollSeconds: 3,
+  /**
    * How often to read each served repository for the project's Git tab.
    *
    * Deliberately slow, and on a timer of its own rather than riding the
@@ -462,6 +470,62 @@ async function resetWorkspace(path) {
   });
 }
 
+/**
+ * Switches branch and brings the uncommitted work with it — R57.
+ *
+ * `git checkout` refuses when a local change would be overwritten, which is
+ * what R46's *Start anyway* ran into: the flag travelled, the runner accepted
+ * it, and then git said "Please commit your changes or stash them", one step
+ * later than the refusal the whole feature existed to remove.
+ *
+ * Both paths need it, not only the existing-branch one. `checkout -b` off
+ * `origin/main` fails identically when the edit conflicts with what is there;
+ * it had simply not been hit yet, because a fresh branch usually starts from
+ * something close to where the checkout already was.
+ *
+ * Stash and pop rather than `checkout -m`: a three-way merge would leave
+ * conflict markers in somebody's uncommitted work and call it success. If the
+ * pop cannot apply, this fails **naming the stash** — work parked in a stash
+ * nobody was told about is work lost, and that is a worse outcome than the
+ * refusal this replaced.
+ */
+async function checkoutCarrying(path, checkoutArgs, dirty) {
+  if (!dirty) {
+    await git(path, checkoutArgs);
+    return;
+  }
+
+  const label = `cawdev: carried across ${checkoutArgs[checkoutArgs.length - 1]}`;
+  await git(path, ['stash', 'push', '--include-untracked', '-m', label]);
+
+  // Whether anything was actually parked. `stash push` exits 0 having done
+  // nothing when there is nothing to park, and popping then takes somebody
+  // else's older stash — which is the one bug in here that would be silent.
+  const parked = (await git(path, ['stash', 'list', '--format=%gs', '-1']).catch(() => ''))
+    .includes(label);
+
+  try {
+    await git(path, checkoutArgs);
+  } catch (failure) {
+    // Put it back where it was: the checkout is what failed, and leaving the
+    // tree emptied as well would turn one problem into two.
+    if (parked) await git(path, ['stash', 'pop']).catch(() => {});
+    throw failure;
+  }
+
+  if (!parked) {
+    return;
+  }
+  try {
+    await git(path, ['stash', 'pop']);
+  } catch (failure) {
+    throw new Error(
+      `${failure.message}\n\nThe uncommitted work is safe, in the stash as "${label}". ` +
+        `Recover it with: git -C ${path} stash pop`,
+    );
+  }
+}
+
 async function prepareWorkingCopy(path, branch, defaultBranch, allowDirty) {
   await access(join(path, '.git')).catch(() => {
     throw new Error(`${path} is not a git repository.`);
@@ -490,14 +554,14 @@ async function prepareWorkingCopy(path, branch, defaultBranch, allowDirty) {
   const base = defaultBranch || 'main';
   const exists = await git(path, ['branch', '--list', branch]);
   if (exists) {
-    await git(path, ['checkout', branch]);
+    await checkoutCarrying(path, ['checkout', branch], dirty);
   } else {
     // Branch off the *remote* default when there is one, so the agent starts
     // from what everyone else has, not from whatever this checkout was left on.
     const startPoint = await git(path, ['rev-parse', '--verify', `origin/${base}`])
       .then(() => `origin/${base}`)
       .catch(() => base);
-    await git(path, ['checkout', '-b', branch, startPoint]);
+    await checkoutCarrying(path, ['checkout', '-b', branch, startPoint], dirty);
   }
 
   // HEAD *now* is the base: "what did this run produce" means what it added,
@@ -1211,6 +1275,152 @@ async function perform(config, run, cwd, action) {
     `/api/projects/${run.projectSlug}/runs/${run.id}/actions/${action.id}/finished`,
     { method: 'POST', body: { ok, result: String(result).slice(0, 4000) } },
   ).catch((failure) => log(`  could not report the action: ${failure.message}`));
+}
+
+/**
+ * What a person asked of a checkout, done — R57.
+ *
+ * The other half of R46's warning. It named the files and then offered nothing:
+ * you could not see what had changed in them, and the two ways out it
+ * *recommended* — commit or stash — were the two things the console could not
+ * do. All three land here, because this process is the only one that can see
+ * the directory.
+ *
+ * Everything is capped and everything says it was capped. A diff that silently
+ * stops halfway is one somebody reads to the end and then acts on.
+ */
+const WORKSPACE_RESULT_CAP = 120_000;
+
+function capped(text) {
+  const value = String(text ?? '');
+  return value.length <= WORKSPACE_RESULT_CAP
+    ? value
+    : `${value.slice(0, WORKSPACE_RESULT_CAP)}\n\n[… truncated at ${WORKSPACE_RESULT_CAP} characters. `
+      + 'The rest is in the checkout.]';
+}
+
+async function performWorkspaceRequest(config, request) {
+  const cwd = request.path;
+  let ok = false;
+  let result;
+
+  try {
+    await access(join(cwd, '.git'));
+  } catch {
+    await reportWorkspaceRequest(config, request, false, `${cwd} is not a git repository.`);
+    return;
+  }
+
+  if (request.kind === 'SHOW') {
+    // Staged and unstaged together against HEAD, which is what a person means
+    // by "what is uncommitted here". Untracked files are listed rather than
+    // shown: `git diff` cannot see them, and inlining the whole of a new
+    // node_modules-sized file somebody forgot to ignore helps nobody.
+    try {
+      const status = await git(cwd, ['status', '--porcelain']);
+      const diff = await git(cwd, ['diff', 'HEAD']).catch(() => '');
+      const untracked = await git(cwd, ['ls-files', '--others', '--exclude-standard'])
+        .catch(() => '');
+      const parts = [];
+      if (status) parts.push(status);
+      if (untracked) {
+        parts.push(`--- untracked, not shown ---\n${untracked}`);
+      }
+      if (diff) parts.push(diff);
+      result = parts.length ? parts.join('\n\n') : 'Nothing uncommitted.';
+      ok = true;
+    } catch (failure) {
+      result = failure.message;
+    }
+  } else if (request.kind === 'STASH') {
+    log(`  stashing ${cwd}, as asked`);
+    try {
+      // --include-untracked, because a warning that counted an untracked file
+      // and then left it behind would be a stash that did not do what the
+      // count said it would.
+      const label = request.message?.trim()
+        || `cawdev: stashed from the console at ${new Date().toISOString()}`;
+      const said = await git(cwd, ['stash', 'push', '--include-untracked', '-m', label]);
+      // The name it can be recovered by, said out loud. A stash nobody can find
+      // later has eaten somebody's work.
+      const top = await git(cwd, ['stash', 'list', '-1']).catch(() => '');
+      result = top ? `${said}\n\nRecover it with: git -C ${cwd} stash pop\n${top}` : said;
+      ok = true;
+    } catch (failure) {
+      result = failure.message;
+    }
+  } else if (request.kind === 'COMMIT') {
+    log(`  committing ${cwd}, as asked`);
+    try {
+      await git(cwd, ['add', '-A']);
+      // --no-verify is deliberately NOT passed, for the reason the run action
+      // does not pass it either: a repository's hooks are its own business, and
+      // a commit its own hooks reject should fail here rather than land because
+      // it came from a button.
+      await git(cwd, ['commit', '-m',
+        request.message?.trim() || 'Committed from the cawdev console']);
+      const sha = await git(cwd, ['rev-parse', '--short', 'HEAD']);
+      const subject = await git(cwd, ['log', '-1', '--format=%s']).catch(() => '');
+      result = `${sha} ${subject}`.trim();
+      ok = true;
+    } catch (failure) {
+      result = failure.message;
+    }
+  } else {
+    result = `This runner does not know how to ${request.kind}.`;
+  }
+
+  await reportWorkspaceRequest(config, request, ok, result);
+}
+
+function reportWorkspaceRequest(config, request, ok, result) {
+  return api(
+    config,
+    `/api/runners/${config.runnerId}/workspace-requests/${request.id}/finished`,
+    { method: 'POST', body: { ok, result: capped(result) } },
+  ).catch((failure) => log(`  could not report the workspace request: ${failure.message}`));
+}
+
+/**
+ * Whatever a person has asked of this machine's checkouts, taken and done.
+ *
+ * A poll of its own, and a fast one: these sit behind a button somebody is
+ * watching, and riding the thirty-second heartbeat would mean pressing *Show
+ * changes* and staring at a spinner for half a minute. It is one indexed read
+ * of a table that is empty almost always — the cost of the cadence is a request
+ * every few seconds, and the cost of not having it is a panel nobody uses.
+ *
+ * A path this daemon does not serve is refused rather than done. The platform
+ * checked that the runner is yours; only this process knows which directories
+ * it was actually given, and a request naming some other directory is one to
+ * say no to rather than to run `git stash` in.
+ */
+function watchWorkspaceRequests(config) {
+  const served = new Set(
+    Object.values(config.projects).flatMap((project) => project.workspaces),
+  );
+
+  const poll = async () => {
+    const requests = await api(
+      config,
+      `/api/runners/${config.runnerId}/workspace-requests/claim`,
+      { method: 'POST' },
+    ).catch((failure) => {
+      log(`could not read workspace requests: ${failure.message}`);
+      return [];
+    });
+
+    for (const request of requests ?? []) {
+      if (!served.has(request.path)) {
+        await reportWorkspaceRequest(config, request, false,
+          `This runner does not serve ${request.path}.`);
+        continue;
+      }
+      await performWorkspaceRequest(config, request);
+    }
+  };
+
+  return poll;
 }
 
 // --- what the run committed --------------------------------------------------
@@ -2492,6 +2702,13 @@ async function main() {
   const gitSurvey = setInterval(readGit, config.gitSurveySeconds * 1000);
   gitSurvey.unref?.();
 
+  // R57: looking at a checkout, parking what is in it, or keeping it.
+  const takeWorkspaceRequests = watchWorkspaceRequests(config);
+  const workspaceRequests = setInterval(() => {
+    void takeWorkspaceRequests();
+  }, config.workspacePollSeconds * 1000);
+  workspaceRequests.unref?.();
+
   let stopping = false;
   for (const signal of ['SIGINT', 'SIGTERM']) {
     process.on(signal, async () => {
@@ -2503,6 +2720,7 @@ async function main() {
       stopping = true;
       clearInterval(heartbeat);
       clearInterval(gitSurvey);
+      clearInterval(workspaceRequests);
       clearInterval(publishRuns);
       if (tools) {
         await rm(tools.directory, { recursive: true, force: true }).catch(() => undefined);

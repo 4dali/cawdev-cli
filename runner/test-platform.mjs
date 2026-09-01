@@ -15,11 +15,17 @@ import { once } from 'node:events';
 /**
  * @param offers runs to hand over, each ONCE — the queue empties afterwards,
  *   so the daemon claims them and then goes quiet like a real one.
+ * @param allowDirty what the claim says about starting on top of uncommitted
+ *   work. R46's decision, and R57 is the half of it that had to work.
+ * @param workspaceRequests handed over once, the way the real claim does.
  */
-export async function fakePlatform({ offers = [] } = {}) {
+export async function fakePlatform({ offers = [], allowDirty = false, workspaceRequests = [] } = {}) {
   const seen = [];
   const transitions = [];
   const remaining = [...offers];
+  const pending = [...workspaceRequests];
+  /** What the daemon said it did, so a test can read the stash ref back. */
+  const finishedRequests = [];
 
   const server = createServer((request, response) => {
     seen.push(`${request.method} ${request.url.split('?')[0]}`);
@@ -51,8 +57,20 @@ export async function fakePlatform({ offers = [] } = {}) {
         return response.end(JSON.stringify({
           runToken: 'cawdr_fake',
           defaultBranch: 'main',
-          allowDirty: false,
+          allowDirty,
         }));
+      }
+      if (url.endsWith('/workspace-requests/claim') && request.method === 'POST') {
+        // Taken on read, like the real one: handed over once and then gone.
+        const taken = pending.splice(0, pending.length);
+        return response.end(JSON.stringify(taken));
+      }
+      if (url.endsWith('/finished') && url.includes('/workspace-requests/')) {
+        finishedRequests.push({
+          id: url.split('/workspace-requests/')[1].split('/')[0],
+          ...JSON.parse(body),
+        });
+        return response.end('{}');
       }
       if (url.endsWith('/transition') && request.method === 'POST') {
         const transition = JSON.parse(body);
@@ -74,11 +92,21 @@ export async function fakePlatform({ offers = [] } = {}) {
     url: `http://127.0.0.1:${server.address().port}`,
     seen,
     transitions,
+    finishedRequests,
     /** Waits for something to be true of the transitions, or gives up. */
     async until(predicate, timeout = 20000) {
       const deadline = Date.now() + timeout;
       while (Date.now() < deadline) {
         if (predicate(transitions)) return true;
+        await new Promise((done) => setTimeout(done, 150));
+      }
+      return false;
+    },
+    /** The same, for a workspace request coming back. */
+    async untilFinished(predicate, timeout = 20000) {
+      const deadline = Date.now() + timeout;
+      while (Date.now() < deadline) {
+        if (predicate(finishedRequests)) return true;
         await new Promise((done) => setTimeout(done, 150));
       }
       return false;

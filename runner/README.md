@@ -144,6 +144,24 @@ they are yours to create, and two or three is plenty.
 Nothing is written down about which workspace is busy, so a killed daemon leaks
 nothing: restarting frees them all.
 
+### What a person can ask of a checkout
+
+R57. The daemon polls `workspace-requests/claim` every few seconds and does one
+of three things to a checkout it serves:
+
+| | |
+|---|---|
+| `SHOW` | `git status --porcelain`, the untracked list, and `git diff HEAD`. Reads only. |
+| `STASH` | `git stash push --include-untracked`, and reports the ref to recover it by. |
+| `COMMIT` | `git add -A` and commit. `--no-verify` is not passed — a repository's hooks are its own business. |
+
+Two guards, and they are in different places on purpose. The platform checks
+that the runner is **yours**; only this process knows which directories it was
+actually given, so **a request naming a path this daemon does not serve is
+refused rather than run**. Results are capped, and say in the text that they
+were capped: a diff that silently stops halfway is one somebody reads to the
+end and then acts on.
+
 ## The daemon's tooling is frozen when it starts
 
 The runner spawns the cawdev MCP server from this repository — and **cawdev is
@@ -183,6 +201,14 @@ files at all. R47 removes the need for this by giving each run a workspace.
    claim as `allowDirty`. Without it the runner still refuses, with the file
    list, and fails the run saying so: a run that arrives with no flag is one
    nobody was warned about.
+
+   With it, the edits are **carried onto the branch** — stashed, checked out,
+   popped (R57). `git checkout` refuses outright when a locally modified file
+   differs between the two commits, which is what made *Start anyway* fail one
+   step later than the refusal it was meant to replace. If the pop cannot apply
+   — the branch rewrote the same lines — the run fails **naming the stash and
+   the command to recover it**, because work parked somewhere nobody was told
+   about is work lost.
 3. **Spawns the agent** in that directory, in its own process group, with the
    run token in its environment and an `.mcp.json` pointing at cawdev's MCP
    server. **Your own token never reaches the child.**
