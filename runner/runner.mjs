@@ -639,6 +639,13 @@ const SURVEY_FILE_CAP = 20;
  * A project that cannot be read at all reports `unreadable` rather than
  * vanishing: "I could not look" and "I looked and it was clean" must not
  * arrive at the console as the same answer.
+ *
+ * **The order of this list matters, and it is `project.workspaces` order.**
+ * R71 has the console work out which checkout a run would be given by taking
+ * the first entry here that nothing is holding — the queue gate's
+ * `workspaces.find((path) => !held.has(path))`, read from the other side of
+ * the wire. Sorting or de-duplicating this on the way out would move the
+ * warning onto a checkout the run is not headed for, and nothing would fail.
  */
 /**
  * One porcelain line, split into its status and its path.
