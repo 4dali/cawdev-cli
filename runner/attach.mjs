@@ -202,6 +202,13 @@ export function questionBanner(asking, width) {
  * is absent when talking to a daemon older than R62. Then there is nothing to
  * compare against and the count stands alone, rather than being shown over a
  * number that was guessed.
+ *
+ * **Only coding sessions are counted against `room`** — R70. The checkouts are
+ * what that number bounds, and an ASK, a ROADMAP or an AUDIT takes none: a
+ * question asked while the one checkout is busy used to render `cawdev 2/1` in
+ * warning colour, a project over a limit it was never measured against. The
+ * machine's own total on the right stays profile-blind, because `maxSessions`
+ * is, and that is the number a question IS held back by.
  */
 /**
  * The bar's second row — R62, and a function rather than a method so the
@@ -258,6 +265,11 @@ export function sessionCounts(runner, runs) {
   const live = (runs ?? []).filter((run) => run.state !== 'queued');
   const here = new Map();
   for (const run of live) {
+    // R70: the checkouts bound coding alone. Only a run that SAYS it writes no
+    // code is left out — a daemon too old to send the flag is counted as it
+    // always was, because inventing "this is a question" from silence would
+    // show a busy checkout as free, which is the failure worth avoiding.
+    if (run.writesCode === false) continue;
     here.set(run.projectSlug, (here.get(run.projectSlug) ?? 0) + 1);
   }
   const projects = (runner?.projects ?? []).map((slug) => {
@@ -989,11 +1001,12 @@ class Attached {
    * actually attach to see: which cawdev this is talking to, what it serves,
    * and how full it is.
    *
-   * **Both of R47's gates are on screen.** Per project it is sessions over
-   * checkouts (`cawdev 1/2`), which is that project's own ceiling; on the
-   * right it is the machine's total over `maxSessions`. A run that is waiting
-   * is then explained by the bar above it — before this, the only way to find
-   * out which limit had been hit was to read the source.
+   * **Both gates are on screen, and they count different things.** Per project
+   * it is CODING sessions over checkouts (`cawdev 1/2`), which is that
+   * project's own ceiling and bounds nothing else (R70); on the right it is the
+   * machine's total over `maxSessions`, every profile included. A run that is
+   * waiting is then explained by the bar above it — before this, the only way
+   * to find out which limit had been hit was to read the source.
    */
   header(width) {
     const runner = this.runner?.name ?? '…';

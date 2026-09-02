@@ -143,8 +143,14 @@ existed — nothing changes for a machine that serves one checkout per project.
 
 How many coding runs go at once is `min(workspaces, maxSessions)`. A run that
 waits now says **"no free workspace in cawdev (2 here, all busy)"** instead of
-"that project already has a run here", which was a proxy for it. Asking a
-question takes no workspace and never queues behind coding.
+"that project already has a run here", which was a proxy for it.
+
+**This number caps coding and nothing else** (R70). `ASK`, `ROADMAP` and `AUDIT`
+runs take no workspace, so a project whose checkouts are all busy still starts a
+question, an entry-writing session and an audit at once. What holds those back
+is `maxSessions`, which counts every profile — **"at 4 sessions on this machine
+(every profile counts)"** is the other thing a waiting run can say, and the log
+always says which of the two it was.
 
 ### A workspace belongs to the daemon
 
@@ -171,9 +177,11 @@ name, every project with **how many checkouts it has**, the session cap, and
 whether the browser is allowed. Those five answer nearly every "why did that
 not happen", and they used to be spread across a config file and a shrug.
 
-Attaching adds a second bar row: the URL, each project as **sessions over
+Attaching adds a second bar row: the URL, each project as **coding sessions over
 checkouts** (`cawdev 1/2`), and the machine's total against `maxSessions`.
-Both of R47's gates, on screen — a run that is waiting is explained by the bar
+Both gates, on screen, counting what each actually bounds — a question is in the
+total on the right and not in any project's figure, because it took no checkout.
+A run that is waiting is explained by the bar
 above it rather than by reading the source. A narrow terminal drops projects
 from the end (with an `…`) and never the total, because on a machine at its cap
 the total is the number that answers the question.
@@ -407,7 +415,11 @@ rest queue.
 **Questions are not serialised.** An `ASK` run prepares nothing and writes
 nothing, so it runs alongside whatever else is going on — you can ask about a
 project while an agent is working in it. `maxSessions` (4 by default) bounds how
-many agent processes this machine will host at once.
+many agent processes this machine will host at once, and it is the **only**
+thing bounding a question, a roadmap session or an audit (R70). It counts runs
+this daemon has claimed, not children it has spawned: a claim takes a second or
+two to become a process, and counting processes let one pass of the loop claim
+the whole queue.
 
 ## If the daemon dies mid-run
 
