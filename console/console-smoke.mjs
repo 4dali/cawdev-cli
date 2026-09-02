@@ -300,6 +300,94 @@ try {
     body: JSON.stringify({ state: 'CANCELLED', summary: 'Queue check done.' }),
   });
 
+  // --- several at once (R67) ------------------------------------------------
+  //
+  // The board's action bar. Two cards of its own rather than reusing the one
+  // above: the interesting half is what happens to a card that CANNOT start,
+  // and the card above already has a run on it — which is exactly the case to
+  // put in the batch.
+
+  const alsoCards = [];
+  for (const which of ['one', 'two']) {
+    alsoCards.push(await console_(`/api/projects/${project}/roadmap`, {
+      method: 'POST',
+      body: JSON.stringify({
+        title: `console smoke batch ${which} (safe to decline)`,
+        body: 'Created by tools/console/console-smoke.mjs.\n\n**Build:** nothing.',
+      }),
+    }));
+  }
+
+  const batch = await console_(`/api/projects/${project}/runs/batch`, {
+    method: 'POST',
+    body: JSON.stringify({
+      strategy: 'ONE_BRANCH_IN_ORDER',
+      branch: `${branch}-together`,
+      targetRunnerId: runner.id,
+      cards: [
+        { entryNumber: alsoCards[0].number },
+        { entryNumber: alsoCards[1].number },
+        // The card the first run above is still sitting on. It must be named
+        // rather than quietly dropped.
+        { entryNumber: entry.number },
+      ],
+    }),
+  });
+
+  check('a batch starts the cards that can start and names the one that cannot',
+    batch.started.length === 2 && batch.refused.length === 1
+      && batch.refused[0].entryNumber === entry.number,
+    JSON.stringify(batch.refused));
+  check('the answer says which strategy was in force, in words',
+    /one branch/i.test(batch.strategyNote ?? ''), JSON.stringify(batch.strategyNote));
+  check('every run in it landed on the one branch and the one machine',
+    batch.started.every((run) => run.branch === `${branch}-together`
+      && run.targetRunnerName === runner.name),
+    JSON.stringify(batch.started.map((run) => [run.branch, run.targetRunnerName])));
+  // The whole reason this is a batch endpoint: the second one is not offered
+  // to any machine until the first has ended, and it says so by card.
+  check('and the second waits for the first, by card',
+    batch.started[0].waitingFor === null
+      && batch.started[1].waitingFor?.entryNumber === alsoCards[0].number,
+    JSON.stringify(batch.started.map((run) => run.waitingFor)));
+
+  const offered = await asToken(
+    runnerToken, `/api/runners/${runner.id}/queue?wait=0`, undefined, 'GET');
+  check('the runner is offered the first of them and not the second',
+    offered.some((offer) => offer.run.id === batch.started[0].id)
+      && !offered.some((offer) => offer.run.id === batch.started[1].id),
+    JSON.stringify(offered.map((offer) => offer.run.id)));
+
+  // Two cards on one branch at the same time is the concurrent-start race, and
+  // the batch refuses the WHOLE thing rather than starting one of them.
+  const clashing = await console_(`/api/projects/${project}/runs/batch`, {
+    method: 'POST',
+    expect: 400,
+    body: JSON.stringify({
+      strategy: 'QUEUED_ON_ONE',
+      targetRunnerId: runner.id,
+      cards: [
+        { entryNumber: alsoCards[0].number, branch: `${branch}-clash` },
+        { entryNumber: alsoCards[1].number, branch: `${branch}-clash` },
+      ],
+    }),
+  });
+  check('two cards on one branch at the same time is refused outright',
+    /concurrent-start race/i.test(clashing?.message ?? ''), JSON.stringify(clashing));
+
+  for (const run of batch.started) {
+    await console_(`/api/projects/${project}/runs/${run.id}/transition`, {
+      method: 'POST',
+      body: JSON.stringify({ state: 'CANCELLED', summary: 'Batch check done.' }),
+    });
+  }
+  for (const card of alsoCards) {
+    await console_(`/api/projects/${project}/roadmap/${card.number}/decline`, {
+      method: 'POST',
+      body: JSON.stringify({ reason: 'Created by the console smoke.' }),
+    });
+  }
+
   // --- watch ---------------------------------------------------------------
 
   const claimed = await asToken(runnerToken, `/api/runners/${runner.id}/claim/${runId}`);
