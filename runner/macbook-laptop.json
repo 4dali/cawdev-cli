@@ -7,9 +7,6 @@
     "dycrypt": "/Users/dali/Documents/Dev/dycrypt",
     "medymo": "/Users/dali/Documents/Dev/medymo",
     "saasng": "/Users/dali/Documents/Dev/saasng",
-<<<<<<< Updated upstream
-    "cawdev": "/Users/dali/Documents/Dev/cawdev"
-=======
     "cawdev": {
       "workspaces": [
         "/Users/dali/Documents/Dev/cawdev-dev",
@@ -21,8 +18,16 @@
       "grantable": [
         "Bash"
       ]
+    },
+    "ngtechnologies-website": {
+      "path": "/Users/dali/Documents/Dev/ng-technologies-website",
+      "allowedTools": [
+        "Bash"
+      ],
+      "grantable": [
+        "Bash"
+      ]
     }
->>>>>>> Stashed changes
   },
   "allowedTools": [
     "Bash(npm *)",
