@@ -146,6 +146,15 @@ waits now says **"no free workspace in cawdev (2 here, all busy)"** instead of
 "that project already has a run here", which was a proxy for it. Asking a
 question takes no workspace and never queues behind coding.
 
+**One thing this gate cannot express, and does not try to.** It serialises on a
+checkout, so two runs on *the same branch* in two checkouts are, to this daemon,
+two free workspaces and two runs to take. That is right for a branch each and
+wrong for one branch shared — so R67's *one branch, in order* is held by the
+platform instead: a run that follows another is simply not offered here until
+that one has ended. Nothing in this file changes for it, and that is the point.
+Do not add a branch check to the gate; it would be a second, weaker copy of a
+rule that already exists where it can see every machine rather than one.
+
 ### A workspace belongs to the daemon
 
 Before each run it is cleared with `git clean -fd` — **without `-x`**, so
