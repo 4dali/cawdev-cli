@@ -61,7 +61,10 @@ The sequence is fixed, and the second step is the one people skip:
    (`roadmap_set_status`). Not after. The roadmap should be able to answer
    "what is being worked on right now" without asking anyone.
 3. Build to the entry's "Done when" list.
-4. Finish with a PR. Never push to `main`.
+4. Finish with a PR. Never push to `main`. The card belongs in `REVIEW` from
+   then on — work that is written and waiting to be read is not work somebody is
+   doing. A project running `require_review` moves it there itself as your
+   session ends.
 5. When the PR merges, move the entry to `MERGED` naming it. The branch may then
    be deleted — `CODING` is for work somebody is doing, not work that is done.
 
@@ -70,7 +73,9 @@ The sequence is fixed, and the second step is the one people skip:
 `roadmap_statuses` will tell you, and it is worth reading rather than guessing:
 `CODING` needs a branch, `MERGED` needs the merge — a pull request, a merge
 commit, or a sha — `SHIPPED` needs a version that is a real git tag, and
-`DECLINED` needs a reason.
+`DECLINED` needs a reason. `REVIEW` needs nothing, deliberately: the pull
+request it would otherwise carry belongs to the run, and a project that reviews
+without opening pull requests has none to give it.
 
 **Any status may move to any other.** There is no transition diagram — an entry
 really can go from `CONSIDERING` straight to `SHIPPED` if that is what happened.
@@ -133,7 +138,7 @@ what you are allowed to do.
 | Tool | What it does |
 |---|---|
 | `roadmap_where` | Which platform, which token, read from where, and who you are. Start here. |
-| `roadmap_statuses` | The seven statuses, what they mean, what each requires. |
+| `roadmap_statuses` | The eight statuses, what they mean, what each requires. |
 | `roadmap_list` | Entries, optionally by status. `brief` omits bodies — use it to survey. |
 | `roadmap_get` | One entry in full: its body **and the discussion on it**. |
 | `roadmap_create` | Create an entry; the platform allocates its permanent number. |
