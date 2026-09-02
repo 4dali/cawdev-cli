@@ -257,18 +257,44 @@ try {
   check('starting leaves the entry where it was — moving it is the agent\'s first act',
     (await console_(`/api/projects/${project}/roadmap/${entry.number}`)).status === 'PLANNED');
 
-  // Runs share a working copy, so only one RUNS at a time — but a second is
-  // queued behind it rather than refused. Being told to come back later and
-  // remember to press the button again is not a queue.
-  const second = await console_(`/api/projects/${project}/runs`, {
+  // R63: a second session on the SAME card is refused, and the refusal is
+  // actionable — it names the run in the way and hands back its id, which is
+  // what lets the console offer "Watch it" rather than a dead end.
+  const clash = await console_(`/api/projects/${project}/runs`, {
     method: 'POST',
     body: JSON.stringify({ entryNumber: entry.number, branch: `${branch}-again` }),
+    expect: 409,
   });
-  check('a second run is queued behind the first, not refused',
+  check('a second session on one card is refused, naming the first',
+    clash.runId === runId && /already has a session/i.test(clash.message ?? ''),
+    JSON.stringify(clash));
+
+  // Runs share a working copy, so only one RUNS at a time — but a second, on
+  // another card, is queued behind it rather than refused. Being told to come
+  // back later and remember to press the button again is not a queue.
+  const otherCard = await console_(`/api/projects/${project}/roadmap`, {
+    method: 'POST',
+    body: JSON.stringify({
+      title: 'console smoke, the second card (safe to decline)',
+      body: 'Created by tools/console/console-smoke.mjs — the queue needs two cards.',
+    }),
+  });
+  const second = await console_(`/api/projects/${project}/runs`, {
+    method: 'POST',
+    body: JSON.stringify({ entryNumber: otherCard.number, branch: `r${otherCard.number}-queued` }),
+  });
+  check('a second run on another card is queued behind the first, not refused',
     second.state === 'QUEUED' && second.queuedBehind === 1,
     `${second.state} / behind ${second.queuedBehind}`);
   check('the first is still at the front of the queue',
     (await console_(`/api/projects/${project}/runs/${runId}`)).queuedBehind === 0);
+
+  // Tidied away so it does not hold the project's queue — or its own card —
+  // for the rest of this.
+  await console_(`/api/projects/${project}/runs/${second.id}/transition`, {
+    method: 'POST',
+    body: JSON.stringify({ state: 'CANCELLED', summary: 'Queue check done.' }),
+  });
 
   // R34: the start forms name a machine, and the run comes back saying which.
   // Null there is "any runner that serves this project", which is what the two
@@ -280,8 +306,8 @@ try {
   const targeted = await console_(`/api/projects/${project}/runs`, {
     method: 'POST',
     body: JSON.stringify({
-      entryNumber: entry.number,
-      branch: `${branch}-here`,
+      entryNumber: otherCard.number,
+      branch: `r${otherCard.number}-here`,
       targetRunnerId: runner.id,
     }),
   });
@@ -292,12 +318,6 @@ try {
   await console_(`/api/projects/${project}/runs/${targeted.id}/transition`, {
     method: 'POST',
     body: JSON.stringify({ state: 'CANCELLED', summary: 'Target check done.' }),
-  });
-
-  // Tidied away so it does not hold the project's queue for the rest of this.
-  await console_(`/api/projects/${project}/runs/${second.id}/transition`, {
-    method: 'POST',
-    body: JSON.stringify({ state: 'CANCELLED', summary: 'Queue check done.' }),
   });
 
   // --- watch ---------------------------------------------------------------
