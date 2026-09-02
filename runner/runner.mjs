@@ -2432,6 +2432,8 @@ async function startRun(config, offered, workspace) {
   let allowDirty = false;
   // Where the branch stood when this run took it over.
   let baseCommit;
+  // The conversation this run is continuing, when it is continuing one — R69.
+  let resume = null;
 
   try {
     log(`claiming ${run.projectSlug} ${run.label} on ${run.branch}`);
@@ -2453,6 +2455,12 @@ async function startRun(config, offered, workspace) {
     // said out loud here so that whoever is watching this log finds out BEFORE
     // the surprise rather than after it — particularly the last one.
     announceRules(claimed.rules);
+    // R69. Whether this is the same conversation picked back up, and which one.
+    // Null on an ordinary claim, which is nearly all of them.
+    resume = claimed.resume ?? null;
+    if (resume?.agentSessionId) {
+      log(`  resuming session ${short(resume.agentSessionId)}`);
+    }
   } catch (failure) {
     // Losing the race is normal when two runners serve one project, and is not
     // this run's failure — somebody else has it.
@@ -2492,7 +2500,7 @@ async function startRun(config, offered, workspace) {
       body: { state: 'RUNNING', workspace: workspace ?? null },
     });
 
-    await spawnAgent(config, run, runToken, resolve(path), baseCommit, workspace);
+    await spawnAgent(config, run, runToken, resolve(path), baseCommit, workspace, resume);
   } catch (failure) {
     // Anything that goes wrong before or during the spawn is the run's failure,
     // and the reason belongs on the run where someone will see it.
@@ -2523,7 +2531,7 @@ function writesCodeProfile(run) {
  * `cawdr_` token bound to one run, which expires with it — so the worst a
  * confused or misbehaving session can do is act on the run it was started for.
  */
-async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace) {
+async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, resume) {
   // R51: what this machine will let a STORED rule cover. The project's rules
   // are filtered through it before they go anywhere near a spawn, so the
   // platform can narrow what runs here and never widen it.
@@ -2630,6 +2638,18 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace) {
   if (run.effort) {
     agentArgs.unshift('--effort', run.effort);
   }
+  // R69. Which conversation this is. Before --allowedTools for the reason the
+  // model and the effort are: that option is variadic and swallows whatever
+  // follows it.
+  //
+  // The PERMISSIONS are untouched by this. A resumed ask is spawned through
+  // exactly the same argsForProfile below as the first time, because the run's
+  // profile is the same run's profile — being started a second time is not a
+  // reason to be allowed to write files.
+  if (resume?.agentSessionId) {
+    agentArgs.unshift('--resume', resume.agentSessionId);
+  }
+
   if (extras.length) {
     if (!agentArgs.includes('--allowedTools')) {
       agentArgs.push('--allowedTools');
@@ -2691,7 +2711,13 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace) {
 
     // The opening instruction, as a user message. stdin is NOT closed: the
     // session stays open for whatever a person types next.
-    writeUserMessage(child, promptFor(run));
+    //
+    // On a resume it is the FOLLOW-UP and nothing else — R69. The session is
+    // being handed back its own transcript, so it already has the question, the
+    // answer and the preamble that told it what it may do. Writing promptFor()
+    // again would ask it the original question a second time, which is a repeat
+    // wearing a resume's clothes.
+    writeUserMessage(child, resume?.prompt ?? promptFor(run));
 
     let lastText = '';
     const transcript = new Transcript(config, run);
@@ -2741,6 +2767,14 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace) {
         const event = safeJson(line);
         if (event?.type === 'result' && typeof event.result === 'string') {
           lastText = event.result;
+        }
+        // R69. The handle this conversation can be continued with. The CLI
+        // announces it on `init` and nowhere else, so it is caught here rather
+        // than derived — and it is reported EVERY time, because a resumed
+        // session announces itself again and the id a further resume needs is
+        // the most recent one, not the first.
+        if (event?.type === 'system' && event.subtype === 'init' && event.session_id) {
+          reportSessionId(config, run, event.session_id);
         }
         for (const recorded of linesOf(event, line)) {
           transcript.push(recorded);
@@ -2809,6 +2843,20 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace) {
       resolvePromise();
     });
   });
+}
+
+/**
+ * Tells the platform what the CLI calls this session — R69.
+ *
+ * Fire and forget, and deliberately: losing it costs a resume that has to be
+ * asked again as a new question, and failing the run over it would cost the
+ * whole session. The same trade every other reading the daemon reports makes.
+ */
+function reportSessionId(config, run, sessionId) {
+  api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/session`, {
+    method: 'POST',
+    body: { agentSessionId: sessionId },
+  }).catch((failure) => log(`  could not record the session id: ${failure.message}`));
 }
 
 async function finish(config, run, state, summary) {

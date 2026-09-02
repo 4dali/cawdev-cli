@@ -722,6 +722,78 @@ try {
     body: JSON.stringify({ state: 'CANCELLED', summary: 'Question check done.' }),
   });
 
+  // --- R69: the follow-up, in the same conversation --------------------------
+
+  const followed = await console_(`/api/projects/${project}/runs/ask`, {
+    method: 'POST',
+    body: JSON.stringify({ prompt: 'What does the runner do with a question?' }),
+  });
+  const followedPath = `/api/projects/${project}/runs/${followed.id}`;
+  const firstClaim = await asToken(runnerToken, `/api/runners/${runner.id}/claim/${followed.id}`);
+  await asToken(runnerToken, `${followedPath}/transition`, { state: 'RUNNING' });
+
+  // The handle the whole entry turns on, read by the runner off the CLI's
+  // `init` event. Without it there is nothing to resume, and the console says so
+  // rather than offering a button that cannot work.
+  await asToken(runnerToken, `${followedPath}/session`, { agentSessionId: 'smoke-session-1' });
+  await asToken(firstClaim.runToken, `${followedPath}/messages`,
+    { kind: 'DONE', body: 'It long-polls.' });
+
+  const ended = await console_(followedPath);
+  check('a finished ask says it can be picked back up',
+    ended.state === 'FINISHED' && ended.resumable === true && ended.openUntilClosed === false,
+    JSON.stringify([ended.state, ended.resumable, ended.openUntilClosed]));
+
+  const resumedRun = await console_(`${followedPath}/resume`, {
+    method: 'POST',
+    body: JSON.stringify({ prompt: 'No, I meant the runner side.', runnerId: runner.id }),
+  });
+  check('resuming queues the SAME run, held open',
+    resumedRun.id === followed.id && resumedRun.state === 'QUEUED'
+      && resumedRun.openUntilClosed === true,
+    JSON.stringify([resumedRun.id === followed.id, resumedRun.state, resumedRun.openUntilClosed]));
+
+  const resumedTranscript = await console_(`${followedPath}/output`);
+  check('the follow-up is on the transcript, in order, as the person said it',
+    resumedTranscript.some((line) => line.kind === 'USER'
+      && line.body === 'No, I meant the runner side.'),
+    JSON.stringify(resumedTranscript.map((line) => line.kind)));
+
+  const secondClaim = await asToken(runnerToken,
+    `/api/runners/${runner.id}/claim/${followed.id}`);
+  check('the claim carries the conversation and the follow-up, and nothing else changes',
+    secondClaim.resume?.agentSessionId === 'smoke-session-1'
+      && secondClaim.resume?.prompt === 'No, I meant the runner side.'
+      && secondClaim.run.profile === 'ASK' && secondClaim.run.branch === null,
+    JSON.stringify(secondClaim.resume));
+
+  await asToken(runnerToken, `${followedPath}/transition`, { state: 'RUNNING' });
+  await asToken(secondClaim.runToken, `${followedPath}/messages`,
+    { kind: 'DONE', body: 'Ah — the daemon writes it to stdin.' });
+
+  const stillOpen = await console_(followedPath);
+  check('a resumed session does not end itself: done is an answer, not a goodbye',
+    stillOpen.state === 'RUNNING' && stillOpen.live === true,
+    JSON.stringify([stillOpen.state, stillOpen.live]));
+
+  // Being live is what makes it answerable — R22's prompt box, on a session that
+  // is only still there because somebody resumed it.
+  await console_(`${followedPath}/prompts`, {
+    method: 'POST',
+    body: JSON.stringify({ prompt: 'And if the daemon restarts?' }),
+  });
+
+  const closed = await console_(`${followedPath}/close`, { method: 'POST', body: '{}' });
+  check('closing is explicit, and closed means closed',
+    closed.state === 'FINISHED' && closed.openUntilClosed === false && closed.live === false,
+    JSON.stringify([closed.state, closed.openUntilClosed, closed.live]));
+
+  const closedTwice = await console_(`${followedPath}/close`, {
+    method: 'POST', expect: 409, body: '{}',
+  });
+  check('and closing it again is refused rather than silently doing nothing',
+    /already/.test(closedTwice?.message ?? ''), JSON.stringify(closedTwice));
+
   // --- R28: profiles, and what an audit proposes ----------------------------
 
   const audit = await console_(`/api/projects/${project}/runs/ask`, {

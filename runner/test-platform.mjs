@@ -18,14 +18,28 @@ import { once } from 'node:events';
  * @param allowDirty what the claim says about starting on top of uncommitted
  *   work. R46's decision, and R57 is the half of it that had to work.
  * @param workspaceRequests handed over once, the way the real claim does.
+ * @param resume what the claim says about continuing a conversation — R69.
+ *   `{ agentSessionId, prompt }`, or null for an ordinary claim, which is what
+ *   every claim before R69 is.
+ * @param runLive whether a run reads as still going. False by default, which
+ *   makes the daemon reap the child straight away; true for a test that needs
+ *   the spawned session to stay up long enough to be looked at.
  */
-export async function fakePlatform({ offers = [], allowDirty = false, workspaceRequests = [] } = {}) {
+export async function fakePlatform({
+  offers = [],
+  allowDirty = false,
+  workspaceRequests = [],
+  resume = null,
+  runLive = false,
+} = {}) {
   const seen = [];
   const transitions = [];
   const remaining = [...offers];
   const pending = [...workspaceRequests];
   /** What the daemon said it did, so a test can read the stash ref back. */
   const finishedRequests = [];
+  /** Session ids the daemon reported off the CLI's `init` event — R69. */
+  const sessionIds = [];
 
   const server = createServer((request, response) => {
     seen.push(`${request.method} ${request.url.split('?')[0]}`);
@@ -58,7 +72,15 @@ export async function fakePlatform({ offers = [], allowDirty = false, workspaceR
           runToken: 'cawdr_fake',
           defaultBranch: 'main',
           allowDirty,
+          resume,
         }));
+      }
+      if (url.endsWith('/session') && request.method === 'POST') {
+        sessionIds.push({
+          runId: url.split('/runs/')[1]?.split('/')[0],
+          ...JSON.parse(body),
+        });
+        return response.end('{}');
       }
       if (url.endsWith('/workspace-requests/claim') && request.method === 'POST') {
         // Taken on read, like the real one: handed over once and then gone.
@@ -79,8 +101,15 @@ export async function fakePlatform({ offers = [], allowDirty = false, workspaceR
         return response.end('{}');
       }
       if (url.match(/\/runs\/[^/]+$/) && request.method === 'GET') {
-        // Over, so the daemon does not try to finish a run somebody else did.
-        return response.end(JSON.stringify({ live: false }));
+        // Over by default, so the daemon does not try to finish a run somebody
+        // else did — and so `reapCancelled` takes the child down promptly,
+        // which is what a test wanting a quick exit relies on.
+        //
+        // `runLive` is for the tests that need the session to STAY UP long
+        // enough to be looked at: reaping is indistinguishable from the agent
+        // never having been spawned, and a test asserting on what the child did
+        // has to outlive the reaper. R69's does.
+        return response.end(JSON.stringify({ live: runLive, state: runLive ? 'RUNNING' : 'FINISHED' }));
       }
       response.end('{}');
     });
@@ -93,6 +122,16 @@ export async function fakePlatform({ offers = [], allowDirty = false, workspaceR
     seen,
     transitions,
     finishedRequests,
+    sessionIds,
+    /** Waits for a session id to be reported, or gives up — R69. */
+    async untilSessionId(predicate, timeout = 20000) {
+      const deadline = Date.now() + timeout;
+      while (Date.now() < deadline) {
+        if (predicate(sessionIds)) return true;
+        await new Promise((done) => setTimeout(done, 150));
+      }
+      return false;
+    },
     /** Waits for something to be true of the transitions, or gives up. */
     async until(predicate, timeout = 20000) {
       const deadline = Date.now() + timeout;

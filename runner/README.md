@@ -287,10 +287,23 @@ files at all. R47 removes the need for this by giving each run a workspace.
 3. **Spawns the agent** in that directory, in its own process group, with the
    run token in its environment and an `.mcp.json` pointing at cawdev's MCP
    server. **Your own token never reaches the child.**
+
+   When the claim carries a `resume` (R69), it spawns `--resume <session-id>`
+   and writes the **follow-up** to stdin instead of the opening prompt — the
+   session is being handed back its own transcript, so it already has the
+   question, and re-sending it would be a repeat wearing a resume's clothes.
+   Nothing else changes: the same profile, so the same permissions. Being
+   started a second time is not a reason to be allowed to write files.
 4. **Streams the transcript.** Every stream-json event the session emits is
    summarised into a line and batched to the platform, which is what the
    console's live terminal reads. It summarises rather than forwards — the
    `init` event alone is kilobytes of tool inventory nobody reads.
+
+   Two things are kept out of that event rather than summarised away: the model,
+   and — since R69 — the **session id**, which is reported to the platform as
+   the handle `claude --resume` takes. It is reported **every** time an `init`
+   arrives, because a resumed session announces itself again and the id a
+   *further* resume needs is the most recent one.
 5. **Delivers prompts.** It long-polls for prompts typed in the console and
    writes them into the session's stdin, which stays **open** for exactly this
    reason (`--input-format stream-json`). One process, one session, many turns.

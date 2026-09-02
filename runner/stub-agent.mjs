@@ -25,6 +25,9 @@
 //   permission-then-finish       ask permission for a command, wait, then done
 //   crash                        exit non-zero without reporting
 //   hang                         never exit, for testing cancellation
+//
+// It announces a session id on `init`, like the real CLI, so R69's resume path
+// has something to record and hand back.
 
 const url = (process.env.CAWDEV_URL ?? 'http://localhost:8091').replace(/\/+$/, '');
 const token = process.env.CAWDEV_TOKEN;
@@ -36,6 +39,27 @@ function say(text) {
   // this is enough to look like one.
   process.stdout.write(`${JSON.stringify({ type: 'result', result: text })}\n`);
 }
+
+// R69. The real CLI announces its session id on `init`, and that is the handle
+// `--resume` takes — so the stub announces one too, or the whole resume path is
+// untested by anything that runs against the stub.
+//
+// A resumed stub keeps the id it was resumed with. The real CLI is free to hand
+// back a different one, which the runner reports either way; keeping it here
+// makes the stub's own script readable, and the runner's "always report the
+// latest" rule is exercised by the platform's tests rather than guessed at.
+const resumed = process.argv[process.argv.indexOf('--resume') + 1];
+const sessionId =
+  process.argv.includes('--resume') && resumed ? resumed : `stub-${Date.now().toString(36)}`;
+process.stdout.write(
+  `${JSON.stringify({
+    type: 'system',
+    subtype: 'init',
+    session_id: sessionId,
+    model: 'stub',
+    cwd: process.cwd(),
+  })}\n`,
+);
 
 async function api(path, { method = 'GET', body } = {}) {
   const response = await fetch(`${url}${path}`, {
