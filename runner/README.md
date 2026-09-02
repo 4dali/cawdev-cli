@@ -301,7 +301,11 @@ files at all. R47 removes the need for this by giving each run a workspace.
    all. This is the only way the console can know a checkout is dirty before a
    run is started in it — the platform cannot see your machine. A checkout it
    cannot read is reported as unreadable rather than omitted, because "I could
-   not look" and "it was clean" are different answers.
+   not look" and "it was clean" are different answers. One entry **per
+   workspace**, in this daemon's own `workspaces` order and carrying the run
+   holding each: R71 has the console pick the first unheld entry to decide which
+   checkout a run is headed for, so re-ordering this list would move a warning
+   onto a checkout nothing is going to touch.
 7. **Reads each repository for the project's Git tab**, on a slow timer of its
    own — `gitSurveySeconds`, five minutes by default, plus once at startup. Per
    project: `git fetch --prune`, the tail of the default branch's history, and
