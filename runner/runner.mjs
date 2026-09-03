@@ -1292,7 +1292,16 @@ function watchWorkingCopy(config, run, cwd, baseCommit) {
         return [];
       });
 
-      for (const action of actions ?? []) {
+      // `Array.isArray` rather than `?? []`, for the reason the closing-action
+      // reader below spells out — and more sharply here, because this loop runs
+      // for the whole life of a session. `??` only guards null: an answer that
+      // is an object, a string, or an error body dressed as JSON reaches the
+      // `for` intact and throws, and a throw here is not one run failing, it is
+      // the daemon exiting and taking every other session on the machine with
+      // it. That is exactly how it failed: a platform with no such endpoint
+      // answered `{}`, and the runner died mid-session with
+      // "(actions ?? []) is not iterable".
+      for (const action of Array.isArray(actions) ? actions : []) {
         if (stopped) return;
         await perform(config, run, cwd, action);
         last = null; // The tree changed; report it on the next pass.
@@ -1476,7 +1485,9 @@ function watchWorkspaceRequests(config) {
       return [];
     });
 
-    for (const request of requests ?? []) {
+    // The same guard, for the same reason: this poll is on an interval, so a
+    // throw becomes an unhandled rejection and the daemon stops.
+    for (const request of Array.isArray(requests) ? requests : []) {
       if (!served.has(request.path)) {
         await reportWorkspaceRequest(config, request, false,
           `This runner does not serve ${request.path}.`);

@@ -82,6 +82,13 @@ export async function fakePlatform({
         });
         return response.end('{}');
       }
+      if (url.endsWith('/actions/claim') && request.method === 'POST') {
+        // A list, because the real one answers with a list. The catch-all below
+        // answers `{}` to anything unrouted, and a stub that quietly hands an
+        // object to a caller expecting an array tests the daemon's crash
+        // handling instead of the behaviour the test came for.
+        return response.end('[]');
+      }
       if (url.endsWith('/workspace-requests/claim') && request.method === 'POST') {
         // Taken on read, like the real one: handed over once and then gone.
         const taken = pending.splice(0, pending.length);
