@@ -639,6 +639,13 @@ const SURVEY_FILE_CAP = 20;
  * A project that cannot be read at all reports `unreadable` rather than
  * vanishing: "I could not look" and "I looked and it was clean" must not
  * arrive at the console as the same answer.
+ *
+ * **The order of this list matters, and it is `project.workspaces` order.**
+ * R71 has the console work out which checkout a run would be given by taking
+ * the first entry here that nothing is holding — the queue gate's
+ * `workspaces.find((path) => !held.has(path))`, read from the other side of
+ * the wire. Sorting or de-duplicating this on the way out would move the
+ * warning onto a checkout the run is not headed for, and nothing would fail.
  */
 /**
  * One porcelain line, split into its status and its path.
@@ -1285,7 +1292,16 @@ function watchWorkingCopy(config, run, cwd, baseCommit) {
         return [];
       });
 
-      for (const action of actions ?? []) {
+      // `Array.isArray` rather than `?? []`, for the reason the closing-action
+      // reader below spells out — and more sharply here, because this loop runs
+      // for the whole life of a session. `??` only guards null: an answer that
+      // is an object, a string, or an error body dressed as JSON reaches the
+      // `for` intact and throws, and a throw here is not one run failing, it is
+      // the daemon exiting and taking every other session on the machine with
+      // it. That is exactly how it failed: a platform with no such endpoint
+      // answered `{}`, and the runner died mid-session with
+      // "(actions ?? []) is not iterable".
+      for (const action of Array.isArray(actions) ? actions : []) {
         if (stopped) return;
         await perform(config, run, cwd, action);
         last = null; // The tree changed; report it on the next pass.
@@ -1469,7 +1485,9 @@ function watchWorkspaceRequests(config) {
       return [];
     });
 
-    for (const request of requests ?? []) {
+    // The same guard, for the same reason: this poll is on an interval, so a
+    // throw becomes an unhandled rejection and the daemon stops.
+    for (const request of Array.isArray(requests) ? requests : []) {
       if (!served.has(request.path)) {
         await reportWorkspaceRequest(config, request, false,
           `This runner does not serve ${request.path}.`);
@@ -2340,6 +2358,21 @@ function heldBy(path) {
   return undefined;
 }
 
+/**
+ * How many sessions this machine is holding — claimed or spawned, any profile.
+ *
+ * The number `maxSessions` is measured against, and it reads both maps for the
+ * same reason `heldWorkspaces` does: a run lives in `taken` from the moment it
+ * is claimed and only reaches `running` when its child exists, seconds later.
+ * A live session is in both at once, which is why this is a union and not a
+ * sum — `snapshotRuns` skips the same duplicate for the same reason.
+ */
+function sessionsInFlight() {
+  const ids = new Set(running.keys());
+  for (const id of taken.keys()) ids.add(id);
+  return ids.size;
+}
+
 /** Every workspace spoken for right now. */
 function heldWorkspaces() {
   const held = new Set();
@@ -2353,7 +2386,13 @@ function heldWorkspaces() {
 }
 
 function noteQueued(run, why) {
-  if (noted.has(run.id)) {
+  // Once per REASON, not once per run — R70, now that there are two gates a run
+  // can be held by. A run refused by the machine's cap and then, when a session
+  // ends, by the project's checkouts is waiting for a different thing, and
+  // keeping the first answer would leave the log and the terminal explaining a
+  // wait with a limit that is no longer the one in the way. Still not chatter:
+  // the reason only changes when a session starts or finishes.
+  if (noted.get(run.id)?.why === why) {
     return;
   }
   // A Map since R52, and the value is the point: the REASON a run is waiting is
@@ -2432,6 +2471,8 @@ async function startRun(config, offered, workspace) {
   let allowDirty = false;
   // Where the branch stood when this run took it over.
   let baseCommit;
+  // The conversation this run is continuing, when it is continuing one — R69.
+  let resume = null;
 
   try {
     log(`claiming ${run.projectSlug} ${run.label} on ${run.branch}`);
@@ -2453,6 +2494,12 @@ async function startRun(config, offered, workspace) {
     // said out loud here so that whoever is watching this log finds out BEFORE
     // the surprise rather than after it — particularly the last one.
     announceRules(claimed.rules);
+    // R69. Whether this is the same conversation picked back up, and which one.
+    // Null on an ordinary claim, which is nearly all of them.
+    resume = claimed.resume ?? null;
+    if (resume?.agentSessionId) {
+      log(`  resuming session ${short(resume.agentSessionId)}`);
+    }
   } catch (failure) {
     // Losing the race is normal when two runners serve one project, and is not
     // this run's failure — somebody else has it.
@@ -2492,7 +2539,7 @@ async function startRun(config, offered, workspace) {
       body: { state: 'RUNNING', workspace: workspace ?? null },
     });
 
-    await spawnAgent(config, run, runToken, resolve(path), baseCommit, workspace);
+    await spawnAgent(config, run, runToken, resolve(path), baseCommit, workspace, resume);
   } catch (failure) {
     // Anything that goes wrong before or during the spawn is the run's failure,
     // and the reason belongs on the run where someone will see it.
@@ -2523,7 +2570,7 @@ function writesCodeProfile(run) {
  * `cawdr_` token bound to one run, which expires with it — so the worst a
  * confused or misbehaving session can do is act on the run it was started for.
  */
-async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace) {
+async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, resume) {
   // R51: what this machine will let a STORED rule cover. The project's rules
   // are filtered through it before they go anywhere near a spawn, so the
   // platform can narrow what runs here and never widen it.
@@ -2630,6 +2677,18 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace) {
   if (run.effort) {
     agentArgs.unshift('--effort', run.effort);
   }
+  // R69. Which conversation this is. Before --allowedTools for the reason the
+  // model and the effort are: that option is variadic and swallows whatever
+  // follows it.
+  //
+  // The PERMISSIONS are untouched by this. A resumed ask is spawned through
+  // exactly the same argsForProfile below as the first time, because the run's
+  // profile is the same run's profile — being started a second time is not a
+  // reason to be allowed to write files.
+  if (resume?.agentSessionId) {
+    agentArgs.unshift('--resume', resume.agentSessionId);
+  }
+
   if (extras.length) {
     if (!agentArgs.includes('--allowedTools')) {
       agentArgs.push('--allowedTools');
@@ -2691,7 +2750,13 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace) {
 
     // The opening instruction, as a user message. stdin is NOT closed: the
     // session stays open for whatever a person types next.
-    writeUserMessage(child, promptFor(run));
+    //
+    // On a resume it is the FOLLOW-UP and nothing else — R69. The session is
+    // being handed back its own transcript, so it already has the question, the
+    // answer and the preamble that told it what it may do. Writing promptFor()
+    // again would ask it the original question a second time, which is a repeat
+    // wearing a resume's clothes.
+    writeUserMessage(child, resume?.prompt ?? promptFor(run));
 
     let lastText = '';
     const transcript = new Transcript(config, run);
@@ -2741,6 +2806,14 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace) {
         const event = safeJson(line);
         if (event?.type === 'result' && typeof event.result === 'string') {
           lastText = event.result;
+        }
+        // R69. The handle this conversation can be continued with. The CLI
+        // announces it on `init` and nowhere else, so it is caught here rather
+        // than derived — and it is reported EVERY time, because a resumed
+        // session announces itself again and the id a further resume needs is
+        // the most recent one, not the first.
+        if (event?.type === 'system' && event.subtype === 'init' && event.session_id) {
+          reportSessionId(config, run, event.session_id);
         }
         for (const recorded of linesOf(event, line)) {
           transcript.push(recorded);
@@ -2811,6 +2884,20 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace) {
   });
 }
 
+/**
+ * Tells the platform what the CLI calls this session — R69.
+ *
+ * Fire and forget, and deliberately: losing it costs a resume that has to be
+ * asked again as a new question, and failing the run over it would cost the
+ * whole session. The same trade every other reading the daemon reports makes.
+ */
+function reportSessionId(config, run, sessionId) {
+  api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/session`, {
+    method: 'POST',
+    body: { agentSessionId: sessionId },
+  }).catch((failure) => log(`  could not record the session id: ${failure.message}`));
+}
+
 async function finish(config, run, state, summary) {
   await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/transition`, {
     method: 'POST',
@@ -2870,14 +2957,17 @@ async function reapCancelled(config) {
 function capabilities(config) {
   return JSON.stringify({
     projects: Object.keys(config.projects),
-    // The gate the queue loop actually enforces. Without it the console can say
-    // a machine is live and serving a project, and still not explain why a
-    // fourth run is sitting there while three others go.
+    // The machine's own ceiling, and every profile counts against it. Without
+    // it the console can say a machine is live and serving a project, and still
+    // not explain why a fifth run is sitting there while four others go.
     maxSessions: config.maxSessions,
-    // How many checkouts each project has here — R47. Coding concurrency is
-    // min(workspaces, maxSessions), so maxSessions alone stopped being the
-    // whole answer: a machine with four sessions and one checkout still runs
-    // one coding session at a time, and the console should be able to say so.
+    // How many checkouts each project has here — R47 — which is the same thing
+    // as this project's cap on CODING runs and nothing else (R70). Coding
+    // concurrency is min(workspaces, maxSessions), so maxSessions alone stopped
+    // being the whole answer: a machine with four sessions and one checkout
+    // still runs one coding session at a time, and the console should be able
+    // to say so. The two numbers bound different things, which is why both are
+    // here and why the console words them differently.
     workspaces: Object.fromEntries(
       Object.entries(config.projects).map(([slug, project]) => [slug, project.workspaces.length]),
     ),
@@ -3187,8 +3277,15 @@ async function main() {
         `/api/runners/${config.runnerId}/queue?wait=${config.pollSeconds}`,
       );
 
-      // One run at a time per WORKSPACE — R47, and only for runs that use one.
+      // TWO gates, and they are not the same gate applied twice — R70.
       //
+      // `maxSessions` bounds this MACHINE and is profile-blind: every run
+      // claimed here costs a process. A project's workspaces bound its CODING
+      // runs and nothing else: they are checkouts, and only a coding run needs
+      // one. A run that is not claimed was refused by one of the two, and the
+      // log says which.
+      //
+      // One run at a time per WORKSPACE — R47, and only for runs that use one.
       // The gate used to key on the project, because there was one checkout per
       // project and the two were the same thing. They are not any more: a
       // project with three workspaces takes three coding runs, and the reason a
@@ -3218,6 +3315,34 @@ async function main() {
         }
         const writes = writesCodeProfile(offered.run);
 
+        // The machine's ceiling FIRST, because it is the one that applies to
+        // everything — R70. A bound on how many agent processes this laptop
+        // will host at once, whatever their profile: a question costs a
+        // process, a model call and memory even though it costs no checkout,
+        // and without this a queue of them is a fork bomb with better manners.
+        //
+        // Counted over both maps, not `running` alone. A claimed run has no
+        // child for a second or two, and the queue re-offers everything in that
+        // window — so counting live children only let one pass of this loop
+        // claim the entire queue, which is exactly the burst the cap exists to
+        // stop and exactly what R47 made reachable by freeing questions from
+        // the checkout gate.
+        if (sessionsInFlight() >= config.maxSessions) {
+          noteQueued(
+            offered.run,
+            `at ${config.maxSessions} session${config.maxSessions === 1 ? '' : 's'} `
+              + 'on this machine (every profile counts)',
+          );
+          skipped += 1;
+          continue;
+        }
+
+        // Then the project's own gate, which counts CODING runs only — R70.
+        // It is a checkout, and the checkout is the whole reason for it: an
+        // ASK, a ROADMAP or an AUDIT contends for no working copy, no branch
+        // and no dev-stack port, so measuring it against a per-project budget
+        // bounds it by a constraint it does not have.
+        //
         // Which checkout this one gets. Null for a run that needs none.
         let workspace = null;
         if (writes) {
@@ -3231,13 +3356,6 @@ async function main() {
             skipped += 1;
             continue;
           }
-        }
-        if (running.size >= config.maxSessions) {
-          // A bound on how many agent processes this machine will host at once.
-          // Without it a queue of questions is a fork bomb with better manners.
-          noteQueued(offered.run, `at ${config.maxSessions} sessions`);
-          skipped += 1;
-          continue;
         }
         if (workspace) {
           held.add(workspace);

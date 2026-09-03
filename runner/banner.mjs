@@ -13,8 +13,10 @@
 //   the name      it is the identity runs are claimed under
 //   projects      with how many checkouts each has, because R47 made a
 //                 project's concurrency min(workspaces, maxSessions) and
-//                 neither number was ever on screen
-//   the cap       the other half of that
+//                 neither number was ever on screen. It is a cap on CODING
+//                 runs and on nothing else — R70
+//   the cap       the other half of that, and the one that counts every
+//                 profile: a question is bounded here and nowhere else
 //   the browser   R61, and the one line that says an agent may reach Chrome
 //
 // It prints once, at boot. Anything that changes afterwards belongs in the
@@ -42,15 +44,23 @@ export function bannerLines(config, ink) {
   projects.forEach(([slug, project], at) => {
     const count = project.workspaces.length;
     // The number is the point: it is this project's ceiling on concurrent
-    // coding runs, and it is the one people are surprised by.
-    const many = ink.muted(`${count} checkout${count === 1 ? '' : 's'}`);
+    // coding runs, and it is the one people are surprised by. The word is
+    // "coding" because that is all it bounds — R70. A question, a roadmap
+    // session and an audit take no checkout and are held back by the cap
+    // below and by nothing here.
+    const s = count === 1 ? '' : 's';
+    const many = ink.muted(`${count} checkout${s}, so ${count} coding run${s}`);
     say(at === 0 ? 'serving' : '', `${ink.text(padVisible(slug, 14))}${many}`);
   });
   if (!projects.length) {
     say('serving', ink.danger('nothing'));
   }
 
-  say('at once', `${ink.text(String(config.maxSessions))} ${ink.muted('sessions, this machine')}`);
+  // The machine's own ceiling, and it counts EVERY profile — R70. Said here
+  // because the line above it counts only one, and two numbers that bound
+  // different things read as one number applied twice unless each says which.
+  say('at once', `${ink.text(String(config.maxSessions))} `
+    + ink.muted('sessions, this machine — any profile'));
 
   // Said either way. "Off" is the answer to a question somebody will ask when
   // a run reports it could not look at the page, and a line that only appears

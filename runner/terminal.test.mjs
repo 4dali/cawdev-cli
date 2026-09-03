@@ -36,6 +36,12 @@ test('the banner carries the five settings that decide what the machine does', (
   assert.match(said, /dycrypt\s+1 checkout/);
   assert.match(said, /cawdev\s+2 checkouts/, "R47's per-project ceiling");
   assert.match(said, /4 sessions/, "the machine's own cap");
+  // R70: two numbers that bound different things read as one number applied
+  // twice unless each says which, and this banner is where somebody looks
+  // first when a question is sitting in a queue.
+  assert.match(said, /2 checkouts, so 2 coding runs/, 'what the per-project number caps');
+  assert.match(said, /1 checkout, so 1 coding run\b/, 'and it counts in ones too');
+  assert.match(said, /4 sessions, this machine — any profile/, 'and what the cap does not');
 });
 
 test('the browser line is there when it is off, because that is the question', () => {
@@ -145,6 +151,22 @@ test('a project is full when its checkouts are, not when the machine is', () => 
   assert.equal(cawdev.full, true, 'both checkouts are busy');
   assert.equal(counts.total, 2, 'but the machine has room for four');
   assert.equal(counts.projects.find((p) => p.slug === 'dycrypt').count, 0);
+});
+
+test('a question is a session on this machine, and not one of the checkouts', () => {
+  // R70. The per-project number is a count of checkouts, and an ASK is given
+  // none — so counting it there rendered `cawdev 2/1` in warning colour, a
+  // project over a limit it was never measured against. It still counts on the
+  // right, because `maxSessions` is what it IS held back by.
+  const counts = sessionCounts(runner, [
+    { projectSlug: 'cawdev', state: 'running', writesCode: true },
+    { projectSlug: 'cawdev', state: 'running', writesCode: false },
+    { projectSlug: 'cawdev', state: 'claiming', writesCode: false },
+  ]);
+  const cawdev = counts.projects.find((p) => p.slug === 'cawdev');
+  assert.equal(cawdev.count, 1, 'one coding session, in one of the two checkouts');
+  assert.equal(cawdev.full, false, 'the spare checkout is still spare');
+  assert.equal(counts.total, 3, 'but three sessions are running here');
 });
 
 test('an older daemon sends no workspace counts, and nothing is invented', () => {

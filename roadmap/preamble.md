@@ -34,20 +34,25 @@ it.
 | `PLANNED` | — | Agreed, specified enough to start, not started. |
 | `IN PROGRESS` | — | Started: being designed or investigated. No branch yet. |
 | `CODING` | a branch | A branch exists, and the entry names it. |
+| `REVIEW` | — | Written, and waiting for somebody to read it. The session has ended; the branch, usually a pull request, is still there. |
 | `MERGED` | the merge | Landed, waiting on a release. Names the PR, the merge commit or the sha. The branch may go. |
 | `SHIPPED v0.2.0` | a version | Released. The version must be an existing git tag. |
 | `DECLINED` | a reason | Decided against. The reason stays, so it is not re-proposed. |
 
 **How work starts (the fixed sequence):** branch off an up-to-date `main`,
 named after the entry (`r4-roadmap-entries`); move the entry to `CODING` naming
-the branch — before the first commit; finish with a PR; move the entry to
-`MERGED` when that PR lands; never push work to `main` directly. Every release
-updates both this roadmap and CHANGELOG.md.
+the branch — before the first commit; finish with a PR, which puts the entry in
+`REVIEW`; move the entry to `MERGED` when that PR lands; never push work to
+`main` directly. Every release updates both this roadmap and CHANGELOG.md.
+
+A project running `require_review` moves the card to `REVIEW` itself as the
+session ends — once, and only out of `CODING`, so somebody who moves it back to
+carry on working keeps it.
 
 `roadmap.mjs` validates this file's shape on every push, and `--live` also
-checks that every `SHIPPED` version is a real git tag and every `CODING` branch
-exists in this clone. `MERGED` is checked against neither, because its branch is
-meant to be gone.
+checks that every `SHIPPED` version is a real git tag and every `CODING` or
+`REVIEW` branch exists in this clone. `MERGED` is checked against neither,
+because its branch is meant to be gone.
 
 ## Decisions already made (do not relitigate without a reason)
 
