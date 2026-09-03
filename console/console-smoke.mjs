@@ -320,12 +320,6 @@ try {
     body: JSON.stringify({ state: 'CANCELLED', summary: 'Target check done.' }),
   });
 
-  // Tidied away so it does not hold the project's queue for the rest of this.
-  await console_(`/api/projects/${project}/runs/${second.id}/transition`, {
-    method: 'POST',
-    body: JSON.stringify({ state: 'CANCELLED', summary: 'Queue check done.' }),
-  });
-
   // --- several at once (R67) ------------------------------------------------
   //
   // The board's action bar. Two cards of its own rather than reusing the one
