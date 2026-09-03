@@ -308,9 +308,9 @@ const TOOLS = [
   {
     name: 'roadmap_statuses',
     description:
-      'The seven roadmap statuses, what each means, and what each one requires — CODING a ' +
-      'branch, MERGED the merge, SHIPPED a version, DECLINED a reason. Read this rather than ' +
-      'guessing.',
+      'The eight roadmap statuses, what each means, and what each one requires — CODING a ' +
+      'branch, MERGED the merge, SHIPPED a version, DECLINED a reason. REVIEW, between CODING ' +
+      'and MERGED, requires nothing. Read this rather than guessing.',
     inputSchema: { type: 'object', properties: {} },
     handler: async (config) => {
       const statuses = await api(config, '/api/roadmap/statuses');
@@ -334,7 +334,16 @@ const TOOLS = [
         ...PROJECT_ARGUMENT,
         status: {
           type: 'string',
-          enum: ['CONSIDERING', 'PLANNED', 'IN_PROGRESS', 'CODING', 'MERGED', 'SHIPPED', 'DECLINED'],
+          enum: [
+            'CONSIDERING',
+            'PLANNED',
+            'IN_PROGRESS',
+            'CODING',
+            'REVIEW',
+            'MERGED',
+            'SHIPPED',
+            'DECLINED',
+          ],
         },
         brief: { type: 'boolean', description: 'Omit bodies. Default true.' },
       },
@@ -416,7 +425,16 @@ const TOOLS = [
         body: { type: 'string', description: 'Markdown.' },
         status: {
           type: 'string',
-          enum: ['CONSIDERING', 'PLANNED', 'IN_PROGRESS', 'CODING', 'MERGED', 'SHIPPED', 'DECLINED'],
+          enum: [
+            'CONSIDERING',
+            'PLANNED',
+            'IN_PROGRESS',
+            'CODING',
+            'REVIEW',
+            'MERGED',
+            'SHIPPED',
+            'DECLINED',
+          ],
         },
         branch: { type: 'string' },
         merge: { type: 'string', description: 'What MERGED needs: the PR, the merge commit, or the sha.' },
@@ -468,8 +486,10 @@ const TOOLS = [
     description:
       'Move an entry to a status. Any status may move to any other — the rules are about what ' +
       'a status must carry, not a permitted path. CODING needs a branch, MERGED the merge — the ' +
-      'PR, the merge commit or the sha — and SHIPPED a version. Move a card to MERGED when its ' +
-      'pull request lands; the branch may then be deleted.',
+      'PR, the merge commit or the sha — and SHIPPED a version. REVIEW, between the two, needs ' +
+      'nothing: it is work that is written and waiting to be read, and a session that has ' +
+      'opened a pull request and finished belongs there rather than in CODING. Move a card to ' +
+      'MERGED when its pull request lands; the branch may then be deleted.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -477,7 +497,16 @@ const TOOLS = [
         number: { type: 'integer' },
         status: {
           type: 'string',
-          enum: ['CONSIDERING', 'PLANNED', 'IN_PROGRESS', 'CODING', 'MERGED', 'SHIPPED', 'DECLINED'],
+          enum: [
+            'CONSIDERING',
+            'PLANNED',
+            'IN_PROGRESS',
+            'CODING',
+            'REVIEW',
+            'MERGED',
+            'SHIPPED',
+            'DECLINED',
+          ],
         },
         branch: { type: 'string' },
         merge: { type: 'string', description: 'What MERGED needs: the PR, the merge commit, or the sha.' },

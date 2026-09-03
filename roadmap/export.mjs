@@ -31,6 +31,10 @@ const SECTION_ORDER = [
   'Phase 3 — the console becomes the workplace',
   'Phase 3 — the console drives the agent',
   'The generated files and the tools',
+  // Named rather than appended: six entries were arriving here silently, which
+  // is the state R45's note exists to end. Last, because a finding somebody
+  // accepted is work that was not planned into a phase.
+  'Found by an audit',
 ];
 
 async function main() {
