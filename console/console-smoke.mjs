@@ -251,11 +251,15 @@ try {
   runId = started.id;
   check('start returns a queued run on the entry', started.state === 'QUEUED'
     && started.entryNumber === entry.number && started.branch === branch, JSON.stringify(started));
-  // The platform deliberately does *not* move the entry: the agent moves it to
-  // CODING itself, naming the branch, before its first commit. If starting did
-  // it, CODING would mean "queued" rather than "someone is working on this".
-  check('starting leaves the entry where it was — moving it is the agent\'s first act',
-    (await console_(`/api/projects/${project}/roadmap/${entry.number}`)).status === 'PLANNED');
+  // R72: starting moves the card, and to IN PROGRESS rather than CODING. The
+  // distinction is the whole two-step — a run in the queue has a branch it
+  // *intends* to cut, and a card claiming CODING would be claiming the branch
+  // exists, which is what CODING means and what the exporter checks. CODING
+  // arrives when the run does, below.
+  const afterStart = await console_(`/api/projects/${project}/roadmap/${entry.number}`);
+  check('starting moves the card to IN PROGRESS, and names no branch yet',
+    afterStart.status === 'IN_PROGRESS' && !afterStart.branch,
+    `${afterStart.status} / ${afterStart.branch}`);
 
   // R63: a second session on the SAME card is refused, and the refusal is
   // actionable — it names the run in the way and hands back its id, which is
