@@ -120,6 +120,12 @@ const DEFAULTS = {
     'mcp__cawdev__ask_user',
     'mcp__cawdev__await_answer',
     'mcp__cawdev__roadmap_where',
+    // R77. Reading the map is how a session finds its way around a repository
+    // without a dozen searches, so it is allowed by default like every other
+    // read here — asking permission to look at a map cawdev computed itself
+    // would be a question with one sensible answer.
+    'mcp__cawdev__code_map',
+    'mcp__cawdev__file_deps',
     'mcp__cawdev__roadmap_statuses',
     'mcp__cawdev__roadmap_list',
     'mcp__cawdev__roadmap_get',
@@ -1560,7 +1566,11 @@ The working method here:
    already. The roadmap should be able to answer "what is being worked on right
    now" without asking anyone.
 2. Build what the entry's "Done when" list asks for. Read the repository's
-   CLAUDE.md and follow it.
+   CLAUDE.md and follow it. Before searching around a part of the tree you do
+   not know, call \`code_map\` — it is one call and it already knows every
+   directory and what depends on what. \`file_deps\` on a file you are about to
+   change tells you what imports it, which is the blast radius and the thing a
+   search for the filename gets wrong.
 3. Call \`report\` with kind "progress" as you go — someone is watching.
 4. If a decision is genuinely the user's — an architectural choice, a trade-off
    with no right answer, something the entry does not settle — call \`ask_user\`

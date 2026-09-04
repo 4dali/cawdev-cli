@@ -387,6 +387,64 @@ const TOOLS = [
   },
 
   {
+    name: 'code_map',
+    description:
+      "The shape of this project's code: every directory, how many files it holds, and which " +
+      'directories depend on which. READ THIS BEFORE GREPPING AROUND A REPOSITORY YOU DO NOT ' +
+      'KNOW. It is one call, it is already computed, and it answers "where does this live" and ' +
+      '"what would I break" without opening a single file — the same questions a dozen searches ' +
+      'answer more slowly and less completely.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_ARGUMENT,
+        under: {
+          type: 'string',
+          description:
+            'Only this directory and below, e.g. "backend/src/main/java". Omit for the whole ' +
+            'project, which is the right first call.',
+        },
+      },
+    },
+    handler: async (config, args) => {
+      const slug = await resolveProject(config, args.project);
+      const map = await codeMapOrNothing(config, slug);
+      if (!map) {
+        return `No machine has mapped ${slug} yet, so there is nothing to read here. ` +
+          'Work as you would have anyway.';
+      }
+      return formatCodeMap(map, args.under);
+    },
+  },
+
+  {
+    name: 'file_deps',
+    description:
+      'What one file imports, and what imports it. Use it before changing a file: the second ' +
+      'half is the blast radius, and it is the half that grepping for a filename does not give ' +
+      'you reliably.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_ARGUMENT,
+        path: {
+          type: 'string',
+          description: 'Repository-relative, e.g. "tools/runner/runner.mjs".',
+        },
+      },
+      required: ['path'],
+    },
+    handler: async (config, args) => {
+      const slug = await resolveProject(config, args.project);
+      const map = await codeMapOrNothing(config, slug);
+      if (!map) {
+        return `No machine has mapped ${slug} yet, so there is nothing to read here.`;
+      }
+      return formatFileDeps(map, args.path);
+    },
+  },
+
+  {
     name: 'roadmap_comment',
     description:
       'Say something about an entry, beside the entry rather than inside it. Use it for the ' +
@@ -1112,6 +1170,123 @@ function pick(source, keys) {
     if (source[key] !== undefined) out[key] = source[key];
   }
   return out;
+}
+
+/**
+ * The project's code map, or null if nobody has taken one — R77.
+ *
+ * <p>Null rather than a throw: a project nobody has mapped is the ordinary
+ * case, not an error, and a tool that fails there teaches the session to stop
+ * calling it.
+ */
+async function codeMapOrNothing(config, slug) {
+  try {
+    const stored = await api(config, `/api/projects/${slug}/code-map`);
+    const graph = JSON.parse(stored.graph);
+    return {
+      ...stored,
+      files: Array.isArray(graph.files) ? graph.files : [],
+      edges: Array.isArray(graph.edges) ? graph.edges : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Everything at or under a directory. */
+function under(path, directory) {
+  return !directory || path === directory || path.startsWith(`${directory}/`);
+}
+
+/**
+ * The map as a session should read it: directories, sizes, and what they lean on.
+ *
+ * <p>Directories rather than files, because four hundred filenames is the thing
+ * the session was going to produce for itself and the reason this tool exists.
+ * A directory with what it depends on is orientation; a file list is a `find`.
+ */
+function formatCodeMap(map, directory) {
+  const dirs = new Map();
+  for (const file of map.files) {
+    if (!under(file.path, directory)) continue;
+    dirs.set(file.dir, (dirs.get(file.dir) ?? 0) + 1);
+  }
+  if (!dirs.size) {
+    return directory
+      ? `Nothing under ${directory}. Check the path — this map has ${map.files.length} files.`
+      : 'This project has no source files on the map.';
+  }
+
+  // Folded to directories, so "frontend leans on core" is one line rather than
+  // forty. The count is what makes it worth reading: a dependency used once and
+  // one used ninety times are different facts about a design.
+  const between = new Map();
+  for (const edge of map.edges) {
+    if (!under(edge.from, directory) || !under(edge.to, directory)) continue;
+    const from = edge.from.split('/').slice(0, -1).join('/');
+    const to = edge.to.split('/').slice(0, -1).join('/');
+    if (from === to) continue;
+    const key = `${from} -> ${to}`;
+    between.set(key, (between.get(key) ?? 0) + edge.weight);
+  }
+
+  const lines = [
+    `${map.files.length} files in ${dirs.size} directories`
+      + (directory ? ` under ${directory}` : '')
+      + (map.headSha ? `, mapped at ${map.headSha.slice(0, 7)}` : '')
+      + (map.stale ? ' (the branch has moved since)' : ''),
+    '',
+    'DIRECTORIES, largest first:',
+  ];
+  for (const [dir, count] of [...dirs.entries()].sort((a, b) => b[1] - a[1]).slice(0, 60)) {
+    lines.push(`  ${String(count).padStart(4)}  ${dir || '(root)'}`);
+  }
+
+  const heavy = [...between.entries()].sort((a, b) => b[1] - a[1]).slice(0, 40);
+  if (heavy.length) {
+    lines.push('', 'WHAT LEANS ON WHAT, heaviest first:');
+    for (const [pair, weight] of heavy) {
+      lines.push(`  ${String(weight).padStart(4)}  ${pair}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+/**
+ * One file's dependencies, both ways.
+ *
+ * <p>The second list is the one worth having: what would break. Searching for a
+ * filename finds the string, misses re-exports and relative paths written from
+ * a different directory, and cannot tell an import from a mention in a comment.
+ */
+function formatFileDeps(map, path) {
+  const known = map.files.some((file) => file.path === path);
+  if (!known) {
+    const near = map.files
+      .filter((file) => file.path.endsWith(`/${path.split('/').pop()}`))
+      .slice(0, 8)
+      .map((file) => `  ${file.path}`);
+    return `${path} is not on this map.`
+      + (near.length ? `\n\nDid you mean:\n${near.join('\n')}` : '');
+  }
+
+  const imports = map.edges.filter((edge) => edge.from === path);
+  const importers = map.edges.filter((edge) => edge.to === path);
+  const lines = [path, ''];
+
+  lines.push(imports.length ? 'IT IMPORTS:' : 'It imports nothing inside this repository.');
+  for (const edge of imports.sort((a, b) => b.weight - a.weight)) {
+    lines.push(`  ${edge.to}${edge.weight > 1 ? ` (${edge.weight}x)` : ''}`);
+  }
+
+  lines.push('');
+  lines.push(importers.length
+    ? `IMPORTED BY ${importers.length} — this is what changing it reaches:`
+    : 'Nothing in this repository imports it.');
+  for (const edge of importers.sort((a, b) => b.weight - a.weight)) {
+    lines.push(`  ${edge.from}${edge.weight > 1 ? ` (${edge.weight}x)` : ''}`);
+  }
+  return lines.join('\n');
 }
 
 function formatEntry(entry, { brief, comments }) {
