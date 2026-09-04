@@ -546,6 +546,51 @@ Do **not** reach for `agentArgs` to add a permission: it replaces the whole
 default list, so you would have to repeat all sixteen MCP tool names to add one
 `Bash` pattern.
 
+#### `skills`: what this machine will run at all — R76
+
+A skill is a capability a project turns on in cawdev, and the runner attaches it
+to the session as an MCP server. **The machine keeps a veto**, in exactly the
+shape `browser` has: a skill runs third-party code here, with read access to the
+repositories on this disk, and that must not be reachable by writing a roadmap
+card.
+
+The key is **absent by default**, and absent means none — a config written
+before R76 keeps behaving as it did.
+
+```json
+{
+  "skills": ["codegraph"],
+  "projects": {
+    "dycrypt": {
+      "path": "/Users/you/code/dycrypt",
+      "skills": []
+    }
+  }
+}
+```
+
+A project's own list overrides the machine's, so a machine that allows a skill
+everywhere can still refuse it for one repository.
+
+**A project asking for a skill this machine has not allowed is not an error.**
+The session runs without it and its transcript says which side refused —
+R61 settled that a refused capability and a broken run are different things.
+
+**Being attached is not being approved.** The skill's tools are not added to
+`--allowedTools`: the first call still asks a person, and *allow
+`mcp__codegraph` for this session* (R60) is the answer that fits. A machine
+that wants it unattended says so in its own `allowedTools`, where that decision
+already lives.
+
+**The index lives outside the checkout.** CodeGraph parses the repository into a
+graph beside it; the runner builds that once per repository, keeps it in
+`~/.cawdev/skills/<skill>/<project>`, and copies it into each workspace — so
+R47's several checkouts of one project do not each pay for a parse. The
+pidfile and socket are never copied: they name a live process, and in another
+workspace they point at a daemon serving another tree. The index directory is
+added to that checkout's `.git/info/exclude`, so it neither shows up as a dirty
+tree nor gets deleted by the reset between runs.
+
 #### `grantable`: what this machine lets a saved rule cover
 
 A rule stored on the platform applies to sessions **nobody is watching**, so the
