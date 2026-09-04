@@ -189,6 +189,16 @@ lying about is removed. What goes is always logged.
 files. It is skipped when a run was deliberately started on top of uncommitted
 work, but the rule stands: a workspace is the machine's, not yours.
 
+**A held workspace is not cleaned and not offered** (R80). When a code run
+fails, the platform marks its checkout *held* — the uncommitted work is still
+in it — and tells this daemon so on every heartbeat (`heldWorkspaces`). The
+daemon counts it as busy: a new run does not land there, and `git clean` does
+not run there, until somebody on the run page either **carries on** (the run
+re-queues onto this machine and picks up its own session in the same
+directory) or **discards** it, which is the only thing that frees it. The
+runners page lists what each machine is holding, so a workspace nobody
+remembers cannot quietly sit taken.
+
 Provision them however you like — `git clone`, then whatever the project needs
 to build. R48 makes them cheap by cloning a golden checkout per run; until then
 they are yours to create, and two or three is plenty.
@@ -464,11 +474,41 @@ the whole queue.
 ## If the daemon dies mid-run
 
 The platform notices. `StaleRunSweeper` fails a run whose runner has stopped
-heartbeating for five minutes, with a reason saying so — otherwise the run would
-sit `RUNNING` forever and block the project from starting anything else.
+heartbeating for five minutes, with `failureReason: RUNNER_VANISHED` and a
+summary saying so — otherwise the run would sit `RUNNING` forever and block the
+project from starting anything else. The workspace is **kept**, not reclaimed:
+when the daemon comes back, the run page offers *Carry on*, which re-queues the
+run onto this machine and resumes its own session in the same checkout, with
+whatever it had written still there. Nothing is lost by a crash that a person
+does not choose to discard.
 
 A run **`WAITING_ON_USER` is never swept.** That is the one state where nothing
 happening is correct: it is stalled on a person, who may reasonably take a day.
+Nor is a `PAUSED` or `USAGE_LIMITED` one (below) — there is no process to lose.
+
+## When the usage limit hits (R73)
+
+Claude Code stops with a message naming the window — the five-hour one or the
+weekly one — and when it resets. The daemon reads that off the session's last
+output (`tools/lib/usage-limit.mjs`, tested) and reports the run as
+**`USAGE_LIMITED`** with the window and the reset time, rather than `FAILED`
+with a stack of text. The run page says *Usage limit — resumes after …*; the
+card stays where it was; the workspace stays taken. It also posts the reading
+to `POST /api/runners/{id}/limits`, so the runners page shows what this machine
+has used of each window.
+
+**Pause** is the same state with a person's hand on it: the run page's *Pause*
+button moves a `RUNNING` run to `PAUSED`, and the runners page's *Pause* switch
+stops a machine claiming anything new without stopping what it is driving.
+Both are yours to undo. *Carry on* re-queues the run onto its runner, which
+resumes the session it already had.
+
+**Auto-resume** is per machine, off by default, on the runners page. With it
+on, the platform re-queues a `USAGE_LIMITED` run the minute its window opens,
+onto the same machine. It never touches a `PAUSED` run: a person stopped that,
+and only a person starts it. The runner has no say in any of this beyond
+obeying its heartbeat — `paused` and `heldWorkspaces` come from the platform,
+and `runner.mjs` reads them rather than deciding them.
 
 ## Trying it without spending Claude usage
 

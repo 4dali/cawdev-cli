@@ -23,6 +23,7 @@ import { serveControl } from './control.mjs';
 import { painter } from '../lib/ansi.mjs';
 import { bannerLines, tintLog } from './banner.mjs';
 import { codeMapOf } from '../lib/code-map.mjs';
+import { usageLimitOf } from '../lib/usage-limit.mjs';
 
 // --- configuration -----------------------------------------------------------
 
@@ -3059,6 +3060,16 @@ function deliverPrompts(config, run, child) {
 const running = new Map();
 
 /**
+ * What the platform said about this machine on the last heartbeat — R73, R80.
+ *
+ * `paused` is "claim nothing new": a person's switch in the console. What is
+ * running finishes. `heldWorkspaces` are checkouts a FAILED run is keeping,
+ * uncommitted work and all, until somebody discards the run — they are not
+ * free, whatever `running` says, and must not be reset for the next claim.
+ */
+const told = { paused: false, autoResume: false, heldWorkspaces: [] };
+
+/**
  * How this daemon paints its own output — R62.
  *
  * Decided once, from the terminal it was actually started in. Piped to a file
@@ -3135,6 +3146,10 @@ function heldWorkspaces() {
   for (const claim of taken.values()) {
     if (claim.workspace) held.add(claim.workspace);
   }
+  // R80. A failed run's checkout is held for as long as the run is not
+  // discarded — with no child and no claim, but with somebody's half-written
+  // branch in it. Resetting it for the next run is how that work is lost.
+  for (const path of told.heldWorkspaces) held.add(path);
   return held;
 }
 
@@ -3558,6 +3573,10 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     writeUserMessage(child, resume?.prompt ?? promptFor(run));
 
     let lastText = '';
+    // The last of what the CLI said on stderr, for the exit decision below.
+    // The usage-limit notice is written there, and a decision made on stdout
+    // alone would call every window a crash.
+    let stderrTail = '';
     const transcript = new Transcript(config, run);
 
     // R61. Asked for a browser and not given one. Said on the RUN for the same
@@ -3660,6 +3679,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       const text = String(chunk).trim();
       if (!text) return;
       log(`  agent stderr: ${text.slice(0, 400)}`);
+      stderrTail = (stderrTail + '\n' + text).slice(-2000);
       transcript.push({ kind: 'ERROR', body: text.slice(0, 4000) });
     });
 
@@ -3696,10 +3716,46 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       const current = await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}`)
         .catch(() => null);
       if (current?.live) {
-        const summary = signal
-          ? `The agent was terminated (${signal}).`
-          : `The agent exited with code ${code} without reporting. ${lastText}`.trim();
-        await finish(config, run, code === 0 ? 'FINISHED' : 'FAILED', summary);
+        // R73. The clock said no; the work did not. A stop the CLI attributed
+        // to its usage window is USAGE_LIMITED, with the window and the reset
+        // it stated — not FAILED, which is the word for a crash. Recognised by
+        // the Claude Code adapter only: a second CLI supplies its own, or none.
+        const limit = code === 0 ? null : usageLimitOf(`${lastText}\n${stderrTail}`);
+        if (limit) {
+          log(`  the ${limit.window === 'WEEKLY' ? 'weekly' : 'five-hour'} usage window closed`
+            + (limit.resetsAt ? `; resets ${limit.resetsAt.toISOString()}` : ''));
+          await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/transition`, {
+            method: 'POST',
+            body: {
+              state: 'USAGE_LIMITED',
+              summary: `Usage limit reached (${limit.window === 'WEEKLY' ? 'weekly' : 'five-hour'}`
+                + ` window). ${lastText}`.trim(),
+              limitWindow: limit.window,
+              limitResetsAt: limit.resetsAt ? limit.resetsAt.toISOString() : null,
+            },
+          }).catch((failure) => log(`  could not report the usage limit: ${failure.message}`));
+          // R73's worst case, shipped: the CLI reports its windows to a person
+          // more readily than to a program, so the one moment this daemon
+          // KNOWS a window is closed is when a run was refused. Report that —
+          // no numbers, the reset it stated — and the runners page shows the
+          // last refusal and when it opens, which is infinitely more than
+          // nothing and better than a meter cawdev computed for itself.
+          await api(config, `/api/runners/${config.runnerId}/limits`, {
+            method: 'POST',
+            body: [{
+              provider: 'claude',
+              window: limit.window,
+              used: null,
+              limit: null,
+              resetsAt: limit.resetsAt ? limit.resetsAt.toISOString() : null,
+            }],
+          }).catch((failure) => log(`  could not report the window: ${failure.message}`));
+        } else {
+          const summary = signal
+            ? `The agent was terminated (${signal}).`
+            : `The agent exited with code ${code} without reporting. ${lastText}`.trim();
+          await finish(config, run, code === 0 ? 'FINISHED' : 'FAILED', summary);
+        }
       }
 
       // The run has ended, which is the moment its project's rules queue a
@@ -4027,6 +4083,21 @@ async function main() {
         workingCopies: workingCopies ? JSON.stringify(workingCopies) : null,
         skillIndexes: skillIndexes ? JSON.stringify(skillIndexes) : null,
       },
+    }).then((me) => {
+      // R73/R80. The heartbeat's answer is what the platform decided about
+      // this machine, and it changes what the queue loop does next.
+      if (me && typeof me === 'object') {
+        if (told.paused !== !!me.paused) {
+          log(me.paused
+            ? 'paused from the console: claiming nothing new, finishing what is running'
+            : 'unpaused from the console');
+        }
+        told.paused = !!me.paused;
+        told.autoResume = !!me.autoResume;
+        told.heldWorkspaces = Array.isArray(me.heldWorkspaces)
+          ? me.heldWorkspaces.map((each) => each.path).filter(Boolean)
+          : [];
+      }
     }).catch((failure) => log(`heartbeat failed: ${failure.message}`));
   };
 
@@ -4173,6 +4244,14 @@ async function main() {
         const slug = offered.run.projectSlug;
         if (!config.projects[slug]) {
           continue; // Not ours to run.
+        }
+        // R73. Paused is "claim nothing new". Everything already running is
+        // left to finish; that is the default because killing a machine's work
+        // to stop it taking more is the surprising reading.
+        if (told.paused) {
+          noteQueued(offered.run, 'this machine is paused from the console');
+          skipped += 1;
+          continue;
         }
         if (taken.has(offered.run.id)) {
           continue; // Already being claimed or prepared by us.
