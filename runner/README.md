@@ -74,7 +74,7 @@ keypress away.
 | `1`–`9` | pick one |
 | `i` | prompt the session; `enter` sends, `esc` cancels |
 | `a` | answer the question it stopped on — if it is yours (R58) |
-| `y` / `Y` / `n` | allow once / allow always here / refuse a permission request |
+| `y` / `s` / `Y` / `n` | a permission request: allow once / for the rest of this run / always here / refuse |
 | `x`, twice | cancel the session |
 | `g` | the daemon's log instead of the transcript |
 | `PgUp` / `PgDn` | scroll back |
@@ -96,6 +96,24 @@ rather than as the question belonging to a colleague.
 If the person it is waiting on cannot be reached, a project owner can take the
 question over from the console — the run page has the button, and the takeover
 is recorded on the question rather than appearing as an unexplained answer.
+
+`i` is refused while a session is asking, and says so: a run blocked inside
+`ask_user` cannot read a prompt, and the words typed into one queue behind the
+answer they were meant to be. R78 put that refusal in the API, so this client,
+the run page and the home composer cannot disagree about it.
+
+### Three lengths of yes
+
+A permission request has R60's three answers here as well as in the console.
+`y` is this call; `s` is the rest of this run and no longer; `Y` writes a
+project rule that outlives the session, the person and the reason they said yes.
+
+`s` names what it covers — `Bash(mvn *)` when the server could render a rule for
+the command, and `every Bash` when it could not, because those are two different
+promises and a banner that said the same words for both would be lying about one
+of them. `Y` is offered only when there is a rule to write: a compound command
+like `cd backend && ./mvnw test` cannot be settled by a pattern about its first
+word, and a key that quietly became an allow-once would be worse than no key.
 
 ### Watching is free; acting means signing in
 

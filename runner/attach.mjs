@@ -191,6 +191,96 @@ export function questionBanner(asking, width) {
 }
 
 /**
+ * What a key means for a permission request — R51, R60, R78.
+ *
+ * The terminal offered two of R60's three: `y` for this one call and `Y` for a
+ * project rule that outlives the session, the person and the reason they said
+ * yes. The middle answer — allow it for the rest of *this* run — is the one
+ * people actually want when a build session asks the same thing every ninety
+ * seconds, and it had no key here while the console had a button.
+ *
+ * Pure, and returning null for a key that cannot be honoured, because `Y`
+ * cannot always be: `suggestion` is the server's rendering of a rule, and it is
+ * absent for a compound command that no pattern can settle. The caller says so
+ * rather than sending a decision with nothing to write.
+ */
+export function permissionDecision(approval, key) {
+  switch (key) {
+    case 'y':
+      return { allow: true, scope: 'ONCE' };
+    case 's':
+      // The whole tool when there is no narrower rule to name — the same two
+      // sizes the console offers, chosen for you because a terminal has one
+      // key. It dies with the run either way.
+      return { allow: true, scope: 'SESSION',
+          pattern: approval.suggestion ?? approval.toolName };
+    case 'Y':
+      return approval.suggestion
+          ? { allow: true, scope: 'PROJECT', pattern: approval.suggestion }
+          : null;
+    default:
+      return null;
+  }
+}
+
+/**
+ * The permission banner — R51, and R60's three choices since R78.
+ *
+ * A function rather than a method for the reason {@link questionBanner} is one:
+ * it can be rendered and read without a terminal, which is where the arithmetic
+ * mistakes in a coloured line get caught.
+ */
+export function permissionBanner(approval, width) {
+  if (!approval) return [];
+
+  const choices = [
+    `${ESC}[32my${RESET} allow once`,
+    // The session-scoped grant names what it covers, because the two sizes are
+    // not the same promise: one command, or every call to a tool.
+    `${ESC}[32ms${RESET} allow ${approval.suggestion ?? `every ${approval.toolName}`} this session`,
+    ...(approval.suggestion
+      ? [`${ESC}[33mY${RESET} always allow ${approval.suggestion} here`]
+      : []),
+    `${ESC}[31mn${RESET} refuse`,
+  ];
+
+  return [
+    `${ESC}[33m${BOLD} permission ${RESET} ${clip(approval.summary, width - 14)}`,
+    `${DIM} ${approval.toolName} · waiting since ${approval.askedAt?.slice(11, 19) ?? ''}${RESET}`,
+    ...wrapChoices(choices, width),
+    `${DIM}${'─'.repeat(Math.max(0, width))}${RESET}`,
+  ];
+}
+
+/**
+ * The choices across as few lines as fit, wrapping rather than truncating.
+ *
+ * **Never cut a grant short.** "allow every Bash this s" describes a promise
+ * nobody made, and this is the one banner in the program where the words are a
+ * decision about what a machine may do rather than a status. A narrow terminal
+ * gets more rows; it does not get a smaller grant that reads like the same one.
+ */
+function wrapChoices(choices, width, gap = '   ') {
+  const lines = [];
+  let line = '';
+  for (const choice of choices) {
+    const next = line ? `${line}${gap}${choice}` : ` ${choice}`;
+    if (line && visibleWidth(next) > width) {
+      lines.push(line);
+      line = ` ${choice}`;
+    } else {
+      line = next;
+    }
+  }
+  if (line) {
+    lines.push(line);
+  }
+  // Only a terminal too narrow for one choice on its own reaches this, and
+  // there is nothing better than a cut line to give it.
+  return lines.map((each) => clip(each, width));
+}
+
+/**
  * What the top bar counts — R62, and pure so it can be tested.
  *
  * **A queued run is not a session.** It is precisely the run that has NOT
@@ -740,11 +830,22 @@ class Attached {
         this.showLog = !this.showLog;
         this.scroll = 0;
         return this.note(this.showLog ? "the daemon's log" : 'the session');
-      case 'i':
+      case 'i': {
+        // R78: a session stopped on a question cannot read a prompt — it is
+        // blocked inside `ask_user`, and the API refuses this now. Said here so
+        // nobody types a paragraph first and is told afterwards; `a` is where
+        // those words belong, and the note points at it.
+        const stopped = this.askingOn(this.current());
+        if (stopped) {
+          return this.note(stopped.yours
+            ? 'stopped on a question — press a to answer it, a prompt will not'
+            : `stopped on a question, waiting on ${stopped.waitingOn}`);
+        }
         if (!this.requireSignIn('prompt a session')) return undefined;
         this.mode = 'prompt';
         this.input = '';
         return this.note('');
+      }
       case 'a': {
         // R58: the refusal is here rather than at the API, so nobody types an
         // answer into a session that is not going to take it.
@@ -761,9 +862,9 @@ class Attached {
         return this.note('');
       }
       case 'y':
-        return void this.decide(true, false);
+      case 's':
       case 'Y':
-        return void this.decide(true, true);
+        return void this.allow(key);
       case 'n':
         if (!this.pendingOn(this.current())) {
           return this.note('nothing is waiting for permission on this one');
@@ -811,7 +912,9 @@ class Attached {
       if (was === 'prompt') {
         return void this.send(text);
       }
-      return was === 'answer' ? void this.answer(text) : void this.decide(false, false, text);
+      return was === 'answer'
+        ? void this.answer(text)
+        : void this.decide({ allow: false, reason: text }, 'refused');
     }
     if (key === '\x7f' || key === '\b') {
       this.input = this.input.slice(0, -1);
@@ -891,7 +994,33 @@ class Attached {
     return undefined;
   }
 
-  async decide(allow, remember, reason) {
+  /**
+   * Allowing it, for how long — R60's three, from a key.
+   *
+   * The scope travels with the decision rather than as a second call, the same
+   * way the console sends it: "allow this and stop asking" is one act, and
+   * splitting it gives you a client that can half-succeed.
+   */
+  async allow(key) {
+    const pending = this.pendingOn(this.current());
+    if (!pending) {
+      return this.note('nothing is waiting for permission on this one');
+    }
+    const decision = permissionDecision(pending.approval, key);
+    if (!decision) {
+      // `Y` on a compound command: the server can write no rule for it, and a
+      // decision with nothing to remember would silently be an allow-once.
+      return this.note(
+        'no project rule can be written for that one — s allows it for this session');
+    }
+    return this.decide(decision, decision.scope === 'PROJECT'
+      ? `allowed, and ${pending.approval.suggestion} is now a project rule`
+      : decision.scope === 'SESSION'
+        ? `allowed ${decision.pattern} for the rest of this run`
+        : 'allowed, once');
+  }
+
+  async decide(decision, said) {
     const run = this.current();
     const pending = this.pendingOn(run);
     if (!pending) {
@@ -904,10 +1033,10 @@ class Attached {
       await this.session.request(
         `/api/projects/${pending.projectSlug}/runs/${pending.runId}` +
           `/approvals/${pending.approval.id}/decision`,
-        { method: 'POST', body: { allow, remember, reason } },
+        { method: 'POST', body: decision },
       );
       this.approvals.delete(run.id);
-      this.note(allow ? (remember ? 'allowed, and remembered' : 'allowed') : 'refused');
+      this.note(said);
     } catch (failure) {
       this.note(failure.message);
     }
@@ -1095,16 +1224,7 @@ class Attached {
   bannerLines(run, width) {
     const pending = this.pendingOn(run);
     if (!pending) return this.questionLines(run, width);
-    const approval = pending.approval;
-    const rule = approval.suggestion
-      ? `${ESC}[33mY${RESET} always allow ${approval.suggestion}   `
-      : '';
-    return [
-      `${ESC}[33m${BOLD} permission ${RESET} ${clip(approval.summary, width - 14)}`,
-      `${DIM} ${approval.toolName} · waiting since ${approval.askedAt?.slice(11, 19) ?? ''}${RESET}`,
-      ` ${ESC}[32my${RESET} allow once   ${rule}${ESC}[31mn${RESET} refuse`,
-      `${DIM}${'─'.repeat(Math.max(0, width))}${RESET}`,
-    ];
+    return permissionBanner(pending.approval, width);
   }
 
   /**
@@ -1142,7 +1262,7 @@ class Attached {
     }
     const keys =
       ` ${DIM}tab${RESET} next  ${DIM}1-9${RESET} pick  ${DIM}i${RESET} prompt  ` +
-      `${DIM}a${RESET} answer  ${DIM}y/Y/n${RESET} permission  ${DIM}x${RESET} cancel  ` +
+      `${DIM}a${RESET} answer  ${DIM}y/s/Y/n${RESET} permission  ${DIM}x${RESET} cancel  ` +
       `${DIM}g${RESET} log  ${DIM}q${RESET} ${this.options.onQuit ? 'stop' : 'quit'}`;
     const status = this.status ? `  ${ESC}[33m${this.status}${RESET}` : '';
     return pad(clip(keys + status, width - 1), width);
