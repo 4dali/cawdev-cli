@@ -35,50 +35,92 @@ The name is how you will recognise it in the console's runner picker.
 Registering is idempotent by (owner, name), so restarting the daemon is the same
 runner rather than a third entry in the list.
 
-## Watching it from a terminal
-
-Start the machine and watch it with one command:
+## `cawdev` — the terminal, in one word
 
 ```sh
-node runner.mjs --config macbook-laptop.json --attach
+cawdev
 ```
 
-Or attach to a daemon that is already running, from another window:
+That is the whole of it. Install the command once — `npm i -g ./tools`, or
+`npm link` from `tools/` while you are working on it — and typing `cawdev` gets
+you a working machine: it looks for a daemon here, **starts one if it finds
+none**, and drops you into the UI.
 
-```sh
-node runner.mjs attach
+Signing in happens **in your browser**. The first launch opens cawdev's sign-in
+page and waits for you to approve a code; after that it is remembered, and
+`/login` does it again on demand. No password is ever typed into the terminal —
+that belongs on a page your browser has told you the origin of.
+
+```
+cawdev                    the runner here, starting one if there is none
+cawdev --runner <name>    when this machine runs more than one
+cawdev --url <url>        which cawdev to sign in to (or CAWDEV_URL)
+cawdev --config <path>    the runner config to start a daemon from
+cawdev --no-start         attach only; never launch a daemon
+cawdev --watch-only       do not sign in; watch without being able to act
 ```
 
-With `--attach` there is **one process and one terminal**: the daemon's log
-stops printing (it would paint over the UI) and moves to the `g` pane, and `q`
-stops the daemon rather than just closing the view. With sessions live it asks
-first — `q` must not be a way to lose three hours of work by leaning on the
-keyboard.
+**Quitting does not stop the daemon.** It is driving runs, and it keeps going —
+the goodbye names it and the `kill` that stops it, because a background process
+you did not know you started is the cost of one word doing all this, and it is
+not a cost to leave somebody to discover.
 
-A detached daemon would have been the other option, and is worse: it outlives
-the window and then has to be found and stopped by pid.
+The other two ways in still work and are not deprecated. `node runner.mjs
+--config macbook-laptop.json --attach` runs the daemon and the UI in **one
+process and one terminal**, which is what you want when the daemon should die
+with the window — there `q` stops it, and asks first when sessions are live.
+`node runner.mjs attach` joins a daemon started elsewhere.
+
+### What it shows you
 
 The console shows you a session. This shows you **the machine** — and the
 difference is the runs that are *not* moving. The daemon knows why the fifth run
 is waiting ("cawdev already has a run here", "at 4 sessions"); nothing else
-does, and until now that reason existed only as a line in a log nobody was
-tailing.
+does, and that reason exists nowhere but here.
 
-A rail of every session on this machine — running, claimed, or queued with its
-reason — the selected transcript streaming beside it, and the daemon's own log a
-keypress away.
+**The transcript is in your terminal's own scrollback.** Session output is
+printed rather than painted, so the wheel, `shift+PgUp`, your terminal's search
+and its copy all work exactly as they always have, and scrolling up reaches the
+start of the session. The only thing pinned is the footer at the bottom, and it
+never scrolls away: which cawdev, who you are signed in as, this machine's
+runner, the per-project session counts against their checkouts and the machine's
+total against `maxSessions` — plus the run you are watching and the keys that
+work right now. Anything *stopping* a session sits above all of that, because it
+is the only thing in there waiting on a person.
+
+`L` lists the runs as an overlay: every one this machine is driving, claiming or
+leaving queued, with the reason each waiting one waits. Arrows move, `enter`
+opens that run — laying its history into the scrollback so you are not staring
+at a blank terminal — and `esc` leaves without changing anything.
 
 | Key | |
 |---|---|
-| `tab`, `j`, `k` | move between sessions |
-| `1`–`9` | pick one |
-| `i` | prompt the session; `enter` sends, `esc` cancels |
+| `enter`, `i` | prompt the session you are watching |
+| `/` | a command — `/help` lists them |
+| `L` | the run list; arrows, `enter` to open, `esc` to leave |
+| `1`–`9` | jump straight to a run |
 | `a` | answer the question it stopped on — if it is yours (R58) |
-| `y` / `Y` / `n` | allow once / allow always here / refuse a permission request |
+| `y` / `s` / `n` | allow once / allow for this session / refuse (R51, R60) |
+| `Y` | allow always, here — writes a project rule |
 | `x`, twice | cancel the session |
-| `g` | the daemon's log instead of the transcript |
-| `PgUp` / `PgDn` | scroll back |
-| `q` | leave |
+| `g` | print the daemon's own log instead of the transcript |
+| `q` | leave; the runner keeps going |
+
+| Command | |
+|---|---|
+| `/help` | the list |
+| `/login` | sign in through the browser |
+| `/logout` | forget the stored session on this machine |
+| `/runs` | the run list — the same as `L` |
+| `/cancel` | cancel the session you are watching |
+| `/log` | the daemon's own log, on or off |
+| `/quit` | leave |
+
+Under `NO_COLOR`, through a pipe, or on a dumb terminal it degrades to plain
+text and every state carries a word as well as a colour. Through a pipe there is
+nothing to pin to, so the fixed answers are printed when they change and the
+escape codes are stripped — a log file full of `ESC[32m` is not legible, whatever
+else it is.
 
 ### A question on this machine is not necessarily yours
 
@@ -99,18 +141,29 @@ is recorded on the question rather than appearing as an unexplained answer.
 
 ### Watching is free; acting means signing in
 
-It asks for your email and password at startup. **Leave the email blank to just
-watch** — everything on the socket is readable without it.
+Everything on the socket is readable without signing in — `--watch-only` skips
+the browser entirely, and watching is the larger half of what this is for.
 
 Anything that *changes* something goes to the platform over HTTP as you, not
 through the daemon. That is not fussiness: prompting a session, cancelling one,
 answering a question and deciding a permission request all refuse an agent
-token (R51), so a socket
-that could do them would either lend the daemon's own credential to a guard
-built to prevent exactly that, or keep yours. The password is held in memory for
-the life of the process and written nowhere.
+token (R51), so a socket that could do them would either lend the daemon's own
+credential to a guard built to prevent exactly that, or keep yours.
 
-`--email you@example.com` skips one prompt; `--watch-only` skips both.
+**Signing in is a browser round trip, and no password reaches this process.**
+`cawdev` asks the platform for a code, opens R55's sign-in page, and waits.
+You approve the code there; the page names the machine that asked, and the code
+is on both screens so you can check they match. What comes back is *your*
+session, stored in `~/.cawdev/session.json` at mode `0600` and keyed by URL — so
+one machine can hold sessions for two different cawdevs without either
+pretending to be the other.
+
+Over ssh, where there is no browser to open, the URL is printed: carry it to a
+browser anywhere and the terminal collects the session when you approve.
+
+`/logout` forgets it. A stored session the platform no longer honours is not an
+error — it is what an expired session looks like, and the answer is the same as
+having none.
 
 ### Where the socket is
 
@@ -119,10 +172,16 @@ daemon stops. **Permission to read it is permission to read this machine's
 transcripts** — which is why it is under your home directory and shows only this
 machine's own work.
 
-More than one daemon here? `attach --runner <name>`. One is chosen for you.
+More than one daemon here? `cawdev --runner <name>`. One is chosen for you.
 
-If `attach` says nothing is offering a socket, the daemon is not running — or it
-predates R52.
+A named runner is never started for you: naming one is a claim that it is there,
+and launching a *different* daemon under that name because the first was not
+answering is not what was asked.
+
+A killed daemon leaves its socket file behind, and a stale file is
+indistinguishable from a live one until you try it — so `cawdev` connects before
+it believes one, which is what stops it attaching to nothing instead of starting
+a daemon. `CAWDEV_RUN_DIR` moves the directory, which is mostly for tests.
 
 ## Workspaces: more than one run at a time
 
