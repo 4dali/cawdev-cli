@@ -3113,6 +3113,12 @@ async function main() {
           Object.entries(config.projects).map(([slug, p]) => [slug, p.workspaces.length]),
         ),
         maxSessions: config.maxSessions,
+        // R81. `cawdev` starts a daemon for you when it finds none, and
+        // quitting the UI leaves it running — it is driving sessions. A
+        // background process you did not know you started is the cost of that
+        // choice, so the goodbye has to name it precisely enough to stop, and
+        // this is the only place the number is known.
+        pid: process.pid,
       },
       snapshot: snapshotRuns,
     });

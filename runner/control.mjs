@@ -22,14 +22,21 @@
 // 0700 directory under the operator's home, and why it discloses only this
 // machine's own work.
 
-import { createServer } from 'node:net';
+import { connect as connectTo, createServer } from 'node:net';
 import { mkdir, readdir, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-/** Where a daemon puts its socket. 0700: the transcripts are in here. */
+/**
+ * Where a daemon puts its socket. 0700: the transcripts are in here.
+ *
+ * `CAWDEV_RUN_DIR` overrides it, and exists because R81 made "how many daemons
+ * are on this machine" a question the `cawdev` command ANSWERS rather than one
+ * a person answers for it — so a test of that answer has to be able to stand
+ * somewhere the operator's own daemon is not.
+ */
 export function socketDirectory() {
-  return join(homedir(), '.cawdev', 'run');
+  return process.env.CAWDEV_RUN_DIR ?? join(homedir(), '.cawdev', 'run');
 }
 
 /**
@@ -55,6 +62,45 @@ export async function listSockets() {
   } catch {
     return [];
   }
+}
+
+/**
+ * Whether anything is actually listening on a socket — R81.
+ *
+ * A killed daemon leaves its file behind, and a stale socket is
+ * indistinguishable from a live one until you try it. That did not matter while
+ * attaching was something you did after starting a daemon by hand; it matters
+ * now that `cawdev` decides whether to START one from what it finds here, and
+ * a leftover file would make it attach to nothing for ever instead.
+ */
+export function probeSocket(path, timeoutMs = 750) {
+  return new Promise((done) => {
+    const client = connectTo(path);
+    const settle = (alive) => {
+      clearTimeout(timer);
+      try {
+        client.destroy();
+      } catch {
+        // Already gone.
+      }
+      done(alive);
+    };
+    const timer = setTimeout(() => settle(false), timeoutMs);
+    client.on('connect', () => settle(true));
+    client.on('error', () => settle(false));
+  });
+}
+
+/** Every socket on this machine that something is answering on. */
+export async function liveSockets() {
+  const found = await listSockets();
+  const alive = [];
+  for (const socket of found) {
+    if (await probeSocket(socket.path)) {
+      alive.push(socket);
+    }
+  }
+  return alive;
 }
 
 /**

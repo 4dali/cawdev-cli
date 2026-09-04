@@ -1,4 +1,4 @@
-// `node runner.mjs attach` — this machine's sessions, in the terminal. R52.
+// The cawdev terminal client — R52, rewritten around the scrollback by R81.
 //
 // Two channels, on purpose, because they answer to different authorities:
 //
@@ -15,113 +15,48 @@
 // signing in, and you cannot act without it.** Watching is disclosed to whoever
 // can already read the socket in your home directory; acting is you.
 //
+// **R81 took the alternate screen away, and that is the whole change.** This
+// used to own the viewport and repaint a pane into it, which meant the
+// terminal's own scroll, its wheel, its search and its copy all stopped working
+// the moment you attached. Now the transcript is PRINTED — it goes into the
+// scrollback and stays there — and the only thing drawn is a footer at the
+// bottom. See scrollback.mjs for the mechanism; it is less machinery than the
+// pane manager it replaced, not more.
+//
+// Three consequences worth stating, because they are what the rewrite bought:
+//
+//   - Scrolling up reaches the start of the session, using the scrollbar you
+//     already had.
+//   - The rail of runs is gone. It cost width on every line of every transcript
+//     to answer a question asked a few times an hour; `L` is an overlay now.
+//   - R62's five settings are in the footer, where they never scroll away,
+//     rather than in a top bar that did.
+//
 // Zero dependencies, so this is ANSI escapes and `setRawMode` rather than a
-// curses library. It redraws the whole screen on change rather than diffing:
-// at eighty by fifty that is four thousand characters, and a diffing renderer
-// is where a terminal UI goes to acquire bugs nobody can reproduce.
+// curses library.
 
 import { connect } from 'node:net';
-import { createInterface } from 'node:readline';
 import { listSockets, socketPathFor } from './control.mjs';
-import { painter } from '../lib/ansi.mjs';
+import { clip, painter, stripAnsi, visibleWidth, wrap } from '../lib/ansi.mjs';
 import { oneLine } from './brand.mjs';
+import { Scrollback } from './scrollback.mjs';
+import { Session, signInThroughBrowser, storedSession } from './sign-in.mjs';
+import { clearSession } from './session-store.mjs';
 
-// --- talking to the platform as a person ------------------------------------
-
-/**
- * A cookie jar and the CSRF dance, in the smallest form that works.
- *
- * The API uses a session cookie plus a double-submit CSRF cookie, because it
- * was built for a browser. A client that is not a browser has to do by hand
- * what Angular's HttpClient does for free: read `XSRF-TOKEN` and echo it back
- * as `X-XSRF-TOKEN`.
- */
-class Session {
-  constructor(url) {
-    this.url = url.replace(/\/+$/, '');
-    this.cookies = new Map();
-    this.email = null;
-  }
-
-  get signedIn() {
-    return this.email !== null;
-  }
-
-  #cookieHeader() {
-    return [...this.cookies].map(([name, value]) => `${name}=${value}`).join('; ');
-  }
-
-  #remember(response) {
-    // Node exposes repeated Set-Cookie headers through getSetCookie().
-    for (const cookie of response.headers.getSetCookie?.() ?? []) {
-      const [pair] = cookie.split(';');
-      const at = pair.indexOf('=');
-      if (at > 0) {
-        this.cookies.set(pair.slice(0, at).trim(), pair.slice(at + 1).trim());
-      }
-    }
-  }
-
-  async request(path, { method = 'GET', body } = {}) {
-    const response = await fetch(`${this.url}${path}`, {
-      method,
-      headers: {
-        ...(body ? { 'content-type': 'application/json' } : {}),
-        ...(this.cookies.size ? { cookie: this.#cookieHeader() } : {}),
-        // Sent on every write. The server checks it against the cookie; a
-        // missing one is a 403 that looks exactly like "wrong password".
-        ...(this.cookies.has('XSRF-TOKEN')
-          ? { 'x-xsrf-token': this.cookies.get('XSRF-TOKEN') }
-          : {}),
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    this.#remember(response);
-    const text = await response.text();
-    if (!response.ok) {
-      const message = (() => {
-        try {
-          return JSON.parse(text).message;
-        } catch {
-          return null;
-        }
-      })();
-      throw new Error(message ?? `${method} ${path} failed: HTTP ${response.status}`);
-    }
-    return text ? JSON.parse(text) : null;
-  }
-
-  /** One open GET first, purely to be handed the CSRF cookie. */
-  async login(email, password) {
-    await this.request('/api/health').catch(() => undefined);
-    const me = await this.request('/api/auth/login', {
-      method: 'POST',
-      body: { email, password },
-    });
-    this.email = me.email;
-    return me;
-  }
-}
-
-// --- the terminal ------------------------------------------------------------
+// Re-exported because they were this file's before R81 moved them into the
+// shared ANSI helpers, and the tests that pin the arithmetic import them here.
+export { clip, stripAnsi, visibleWidth, wrap };
 
 const ESC = '\x1b';
-const ALT_SCREEN_ON = `${ESC}[?1049h`;
-const ALT_SCREEN_OFF = `${ESC}[?1049l`;
-const HIDE_CURSOR = `${ESC}[?25l`;
-const SHOW_CURSOR = `${ESC}[?25h`;
-const CLEAR = `${ESC}[2J${ESC}[H`;
-const RESET = `${ESC}[0m`;
-const DIM = `${ESC}[2m`;
-const BOLD = `${ESC}[1m`;
-const REVERSE = `${ESC}[7m`;
 
 /** Colours for a run's state. Muted, because the transcript is the content. */
 const STATE_COLOUR = {
-  running: `${ESC}[32m`,
-  claiming: `${ESC}[33m`,
-  queued: `${ESC}[90m`,
+  running: 'success',
+  claiming: 'warn',
+  queued: 'muted',
 };
+
+// --- the rules, which are pure and therefore testable -------------------------
 
 /**
  * The question stopping a session, and whether this operator may answer it —
@@ -156,9 +91,8 @@ export function questionState(questions, email) {
 }
 
 /**
- * That question, drawn — R58, and a function rather than a method for the
- * reason `settingsBar` is one: it can then be rendered and looked at without a
- * terminal, which is how R62 found the two things its tests did not.
+ * That question, drawn — R58, and a function rather than a method so it can be
+ * rendered and looked at without a terminal.
  *
  * **Two shapes, and the second is why this exists.** When the question is this
  * operator's, `a` answers it here. When it is not, the banner names the person
@@ -166,19 +100,18 @@ export function questionState(questions, email) {
  * let somebody type an answer and then refused it reads as cawdev being broken
  * rather than as the question belonging to a colleague.
  */
-export function questionBanner(asking, width) {
+export function questionBanner(asking, width, ink = painter(3)) {
   if (!asking) return [];
 
   const options = asking.question.options?.length
-    ? `${DIM} · ${asking.question.options.join(' / ')}${RESET}`
+    ? ink.muted(` · ${asking.question.options.join(' / ')}`)
     : '';
   // 12 is the label and its spaces: the same arithmetic the permission banner
-  // above uses, and for the same reason — clip counts visible characters.
-  const head = `${ESC}[36m${BOLD} question ${RESET} ${clip(asking.question.question, width - 12)}`;
-  const rule = `${DIM}${'─'.repeat(Math.max(0, width))}${RESET}`;
+  // uses, and for the same reason — clip counts visible characters.
+  const head = `${ink.bold(ink.accent(' question '))} ${clip(asking.question.question, width - 12)}`;
 
   if (asking.yours) {
-    return [head, ` ${ESC}[32ma${RESET} answer${options}`, rule];
+    return [head, ` ${ink.success('a')} answer${options}`];
   }
   // The NAME is the last thing to go, the way the session total is on R62's
   // bar: "waiting on alice@…" is the whole answer to "why is that not moving",
@@ -187,15 +120,30 @@ export function questionBanner(asking, width) {
   // answer — which is what looking at this at 40 columns showed.
   const who = ` waiting on ${asking.waitingOn ?? 'somebody else'}`;
   const whole = `${who} — theirs to answer, or somebody they hand it to`;
-  return [head, `${DIM}${clip(whole.length <= width ? whole : who, width)}${RESET}`, rule];
+  return [head, ink.muted(clip(whole.length <= width ? whole : who, width))];
+}
+
+/** A pending permission request, drawn — R51 and R60's three answers. */
+export function permissionBanner(pending, width, ink = painter(3)) {
+  if (!pending) return [];
+  const approval = pending.approval;
+  const always = approval.suggestion
+    ? `   ${ink.warn('Y')} always allow ${approval.suggestion}`
+    : '';
+  return [
+    `${ink.bold(ink.warn(' permission '))} ${clip(approval.summary, width - 14)}`,
+    ink.muted(` ${approval.toolName} · waiting since ${approval.askedAt?.slice(11, 19) ?? ''}`),
+    ` ${ink.success('y')} allow once   ${ink.success('s')} allow for this session   `
+      + `${ink.danger('n')} refuse${always}`,
+  ];
 }
 
 /**
- * What the top bar counts — R62, and pure so it can be tested.
+ * What the footer counts — R62, unchanged by R81 except in where it is drawn.
  *
  * **A queued run is not a session.** It is precisely the run that has NOT
- * taken a slot, and counting it would make the bar say the machine is full at
- * the moment it is not — which is exactly backwards, because "full" is the
+ * taken a slot, and counting it would make the footer say the machine is full
+ * at the moment it is not — which is exactly backwards, because "full" is the
  * answer to "why is mine queued".
  *
  * `room` is how many checkouts the project has (R47's per-project gate), and
@@ -204,15 +152,29 @@ export function questionBanner(asking, width) {
  * number that was guessed.
  *
  * **Only coding sessions are counted against `room`** — R70. The checkouts are
- * what that number bounds, and an ASK, a ROADMAP or an AUDIT takes none: a
- * question asked while the one checkout is busy used to render `cawdev 2/1` in
- * warning colour, a project over a limit it was never measured against. The
- * machine's own total on the right stays profile-blind, because `maxSessions`
- * is, and that is the number a question IS held back by.
+ * what that number bounds, and an ASK, a ROADMAP or an AUDIT takes none.
  */
+export function sessionCounts(runner, runs) {
+  const live = (runs ?? []).filter((run) => run.state !== 'queued');
+  const here = new Map();
+  for (const run of live) {
+    // R70: the checkouts bound coding alone. Only a run that SAYS it writes no
+    // code is left out — a daemon too old to send the flag is counted as it
+    // always was, because inventing "this is a question" from silence would
+    // show a busy checkout as free, which is the failure worth avoiding.
+    if (run.writesCode === false) continue;
+    here.set(run.projectSlug, (here.get(run.projectSlug) ?? 0) + 1);
+  }
+  const projects = (runner?.projects ?? []).map((slug) => {
+    const count = here.get(slug) ?? 0;
+    const room = runner?.workspaces?.[slug];
+    return { slug, count, room, full: Boolean(room) && count >= room };
+  });
+  return { total: live.length, cap: runner?.maxSessions, projects };
+}
+
 /**
- * The bar's second row — R62, and a function rather than a method so the
- * arithmetic in it can be tested without a terminal.
+ * The footer's counting row — R62, moved down by R81 and otherwise untouched.
  *
  * The arithmetic is the whole risk here: everything on this row is coloured,
  * and a coloured string is about ten characters longer than it looks. Padding
@@ -257,92 +219,84 @@ export function settingsBar(runner, runs, width, ink = painter(3)) {
     : `${clip(left, Math.max(0, width - visibleWidth(right)))}${right}`;
   // No blanket dim over the row: everything in it already carries its own
   // colour, and dimming the lot flattens "full" back into "idle", which is the
-  // one distinction this bar exists to make.
+  // one distinction this footer exists to make.
   return pad(clip(line, width), width);
 }
 
-export function sessionCounts(runner, runs) {
-  const live = (runs ?? []).filter((run) => run.state !== 'queued');
-  const here = new Map();
-  for (const run of live) {
-    // R70: the checkouts bound coding alone. Only a run that SAYS it writes no
-    // code is left out — a daemon too old to send the flag is counted as it
-    // always was, because inventing "this is a question" from silence would
-    // show a busy checkout as free, which is the failure worth avoiding.
-    if (run.writesCode === false) continue;
-    here.set(run.projectSlug, (here.get(run.projectSlug) ?? 0) + 1);
+/**
+ * A run, as one line of the overlay — R81.
+ *
+ * The reason a queued run is queued goes on the SAME line as the run, because
+ * that reason is the whole argument for this program existing and a list that
+ * makes you press a key for it has hidden the answer behind the question.
+ */
+export function runLine(run, { chosen, marker, number }, width, ink = painter(3)) {
+  const colour = ink[STATE_COLOUR[run.state] ?? 'text'];
+  const head = `${chosen ? ink.bold('❯') : ' '}${marker ?? ' '}${ink.muted(number ?? ' ')} `;
+  const name = `${colour(run.label)}`;
+  const where = ink.muted(` ${run.projectSlug} · ${run.state}`);
+  const why = run.why ? ink.warn(` — ${run.why}`) : '';
+  return clip(`${head}${name}${where}${why}`, width);
+}
+
+/**
+ * The footer: everything that never changes, and the few things that do.
+ *
+ * **Pure, and rendered from a plain object.** R62 learned this the hard way —
+ * a bar built inside a draw method can only be checked by looking at it, and
+ * the arithmetic in it is exactly the kind that is wrong by ten characters in
+ * a way nobody notices until a session goes red.
+ *
+ * The order is deliberate. What is stopping somebody is at the top, because it
+ * is the only thing here that is blocking a person. Then the fixed answers,
+ * then who and where, then the keys that work right now.
+ */
+export function footerLines(state, width, ink = painter(3)) {
+  const {
+    runner, runs = [], email, watching, connected = true,
+    banner = [], overlay = [], input = null, keys = '', status = '',
+  } = state;
+
+  const rule = ink.muted('─'.repeat(Math.max(0, width)));
+  const lines = [rule];
+
+  for (const line of overlay) {
+    lines.push(line);
   }
-  const projects = (runner?.projects ?? []).map((slug) => {
-    const count = here.get(slug) ?? 0;
-    const room = runner?.workspaces?.[slug];
-    return { slug, count, room, full: Boolean(room) && count >= room };
-  });
-  return { total: live.length, cap: runner?.maxSessions, projects };
-}
+  if (overlay.length) {
+    lines.push(rule);
+  }
+  for (const line of banner) {
+    lines.push(line);
+  }
+  if (banner.length) {
+    lines.push(rule);
+  }
 
-const RAIL = 30;
+  lines.push(settingsBar(runner, runs, width, ink));
 
-/**
- * How this client paints — R62.
- *
- * Forced on: attach only runs on a terminal it has taken over with the
- * alternate screen, so `isTTY` is a given, and honouring NO_COLOR here would
- * mean a full-screen UI drawn in one colour. The daemon's own log is the
- * surface that has to survive a pipe, and that one asks properly.
- */
-const ink = painter(3);
+  // Who and where. The runner's NAME is what the console shows and what
+  // `--runner` takes, so it is the word somebody would type; the email is what
+  // every action here is done as, and "watching only" is not a lesser state,
+  // it is the honest one.
+  const who = email ? ink.text(email) : ink.muted('watching only');
+  const link = connected ? '' : `  ${ink.danger('detached')}`;
+  const here = ` ${oneLine(ink)}${ink.enabled ? '' : ' '} ${ink.muted('·')} `
+    + `${ink.bold(runner?.name ?? '…')} ${ink.muted('·')} ${who}${link}`;
+  const now = watching
+    ? `  ${ink.muted('▸')} ${clip(watching.label, Math.max(8, width / 2))} `
+      + ink.muted(`(${watching.projectSlug} · ${watching.state})`)
+    : `  ${ink.muted('▸ no session — L lists what this machine has')}`;
+  lines.push(pad(clip(`${here}${now}`, width), width));
 
-/**
- * How wide a string looks, ignoring escape sequences.
- *
- * Transcripts carry ANSI colour (R23), and measuring it as plain text makes
- * every coloured line look forty characters longer than it is — which wraps the
- * pane into nonsense exactly when a session is doing something interesting.
- */
-export function visibleWidth(text) {
-  return stripAnsi(text).length;
-}
-
-export function stripAnsi(text) {
-  // eslint-disable-next-line no-control-regex
-  return text.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
-}
-
-/** Wraps to a width, keeping escape sequences where they fall. */
-export function wrap(text, width) {
-  const lines = [];
-  for (const paragraph of String(text).split('\n')) {
-    if (visibleWidth(paragraph) <= width) {
-      lines.push(paragraph);
-      continue;
-    }
-    let current = '';
-    let visible = 0;
-    for (let i = 0; i < paragraph.length; i++) {
-      const escape = /^\x1b\[[0-9;?]*[a-zA-Z]/.exec(paragraph.slice(i));
-      if (escape) {
-        current += escape[0];
-        i += escape[0].length - 1;
-        continue;
-      }
-      current += paragraph[i];
-      visible += 1;
-      if (visible >= width) {
-        lines.push(current);
-        current = '';
-        visible = 0;
-      }
-    }
-    if (current) {
-      // Trailing escapes with nothing after them — the reset at the end of a
-      // coloured line — belong to the line they close, not to a new empty one.
-      // Without this every coloured line in the pane is followed by a blank.
-      if (visible === 0 && lines.length) {
-        lines[lines.length - 1] += current;
-      } else {
-        lines.push(current);
-      }
-    }
+  // The last row is either what you are typing or what you can press. Never
+  // both: a key list under a half-typed prompt is a list of keys that would
+  // land in the prompt.
+  if (input) {
+    lines.push(pad(clip(` ${ink.accent(input.label)} ${input.text}${ink.reverse(' ')}`, width), width));
+  } else if (keys || status) {
+    const said = status ? `  ${ink.warn(status)}` : '';
+    lines.push(pad(clip(` ${keys}${said}`, width), width));
   }
   return lines;
 }
@@ -352,91 +306,30 @@ function pad(text, width) {
   return short > 0 ? text + ' '.repeat(short) : text;
 }
 
-/** Cuts to a width without cutting an escape sequence in half. */
-export function clip(text, width) {
-  if (visibleWidth(text) <= width) return text;
-  let out = '';
-  let visible = 0;
-  for (let i = 0; i < text.length && visible < width; i++) {
-    const escape = /^\x1b\[[0-9;?]*[a-zA-Z]/.exec(text.slice(i));
-    if (escape) {
-      out += escape[0];
-      i += escape[0].length - 1;
-      continue;
-    }
-    out += text[i];
-    visible += 1;
-  }
-  return `${out}${RESET}`;
-}
-
-// --- asking for a password without echoing it --------------------------------
-
-function ask(question) {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((done) => rl.question(question, (answer) => {
-    rl.close();
-    done(answer.trim());
-  }));
-}
-
-/**
- * Reads a line with nothing echoed.
- *
- * Hand-rolled because there is no dependency to reach for, and because the
- * usual trick — overriding readline's private `_writeToOutput` — reaches into
- * Node's internals for the same result.
- */
-function askSecret(question) {
-  return new Promise((done) => {
-    process.stdout.write(question);
-    const wasRaw = process.stdin.isRaw;
-    process.stdin.setRawMode?.(true);
-    process.stdin.resume();
-    let secret = '';
-    const onData = (chunk) => {
-      const text = chunk.toString('utf8');
-      for (const character of text) {
-        if (character === '\r' || character === '\n') {
-          process.stdin.removeListener('data', onData);
-          process.stdin.setRawMode?.(wasRaw ?? false);
-          process.stdout.write('\n');
-          return done(secret);
-        }
-        if (character === '\x03') {
-          process.stdout.write('\n');
-          process.exit(130);
-        }
-        if (character === '\x7f' || character === '\b') {
-          secret = secret.slice(0, -1);
-          continue;
-        }
-        secret += character;
-      }
-    };
-    process.stdin.on('data', onData);
-  });
-}
-
 // --- the client ---------------------------------------------------------------
 
 /**
- * @param argv the command line, for `--runner`, `--email`, `--watch-only`
+ * @param argv the command line, for `--runner`, `--url`, `--watch-only`
  * @param options set when the daemon is running IN THIS PROCESS (`--attach`):
  *   its socket is already known, quitting means stopping it, and it can say how
  *   much work would be lost if you did.
  */
 export async function attach(argv, options = {}) {
   const socket = options.socketPath ?? (await chooseSocket(valueOf(argv, '--runner')));
-  const session = await maybeSignIn(argv);
+  const session = await openSession(argv);
 
   const ui = new Attached(socket, session, options);
   await ui.start();
 }
 
-function valueOf(argv, flag) {
+export function valueOf(argv, flag) {
   const at = argv.indexOf(flag);
   return at === -1 ? null : argv[at + 1];
+}
+
+export function urlFrom(argv) {
+  return (valueOf(argv, '--url') ?? process.env.CAWDEV_URL ?? 'http://localhost:8091')
+    .replace(/\/+$/, '');
 }
 
 /**
@@ -452,69 +345,111 @@ async function chooseSocket(wanted) {
   const sockets = await listSockets();
   if (!sockets.length) {
     throw new Error(
-      'No runner is offering a socket on this machine. Start the daemon first:\n\n' +
-        '  node runner.mjs --config <your config>.json\n\n' +
-        'A daemon older than R52 does not offer one at all.',
+      'No runner is offering a socket on this machine. Start one with `cawdev`, which\n' +
+        'launches a daemon when it finds none, or run it yourself:\n\n' +
+        '  node runner.mjs --config <your config>.json',
     );
   }
   if (sockets.length === 1) {
     return sockets[0].path;
   }
   const names = sockets.map((each) => each.name).join(', ');
-  throw new Error(`More than one runner here (${names}). Choose one: attach --runner <name>`);
+  throw new Error(`More than one runner here (${names}). Choose one: cawdev --runner <name>`);
 }
 
-async function maybeSignIn(argv) {
-  const url = valueOf(argv, '--url') ?? process.env.CAWDEV_URL ?? 'http://localhost:8091';
-  const session = new Session(url);
-
+/**
+ * The session this launch starts with — R81.
+ *
+ * Stored first, because the entry's promise is that signing in once is enough.
+ * A stored cookie the platform no longer honours is not an error: it is what an
+ * expired session looks like, and the answer is the same as having none — the
+ * browser, once, and then remembered again.
+ */
+async function openSession(argv) {
+  const url = urlFrom(argv);
   if (argv.includes('--watch-only')) {
+    return new Session(url);
+  }
+  const session = await storedSession(url);
+  if (session.signedIn) {
     return session;
   }
 
-  console.log(
-    'Sign in to prompt a session, cancel one, or answer a permission request.\n' +
-      'Leave the email blank to watch without signing in.\n',
-  );
-  const email = valueOf(argv, '--email') ?? process.env.CAWDEV_EMAIL ?? (await ask('Email: '));
-  if (!email) {
-    return session;
-  }
-  const password = await askSecret('Password: ');
-  try {
-    await session.login(email, password);
-    console.log(`Signed in as ${session.email}.`);
-  } catch (failure) {
-    // Not fatal. Watching is the larger half of what this is for, and refusing
-    // to start over a typo would be a poor trade.
-    console.log(`Could not sign in (${failure.message}). Watching only.`);
+  const ink = painter();
+  console.log(`${ink.muted('Not signed in.')} Opening ${ink.accent(url)} in your browser —`);
+  console.log(`${ink.muted('a session is what lets you prompt a run, cancel one, or decide a request.')}\n`);
+  const outcome = await runSignIn(session, ink);
+  if (!outcome.signedIn) {
+    console.log(`${ink.muted('Watching only. Press')} / ${ink.muted('and type')} /login ${ink.muted('to try again.')}\n`);
   }
   return session;
 }
+
+/**
+ * The browser dance, printed plainly. Shared by the first launch and `/login`.
+ *
+ * The code is printed as well as opened, because the point of a code is that
+ * two screens show the same one and a person compares them. Printing the URL
+ * too is not belt and braces: a machine over ssh has no browser to open, and
+ * this is the only thing that makes it work at all.
+ */
+async function runSignIn(session, ink = painter()) {
+  const outcome = await signInThroughBrowser(session, ({ url, code }) => {
+    console.log(`  ${ink.muted('If your browser did not open, go to')}`);
+    console.log(`      ${ink.accent(url)}`);
+    console.log(`  ${ink.muted('and check it is showing')}  ${ink.bold(code)}\n`);
+    console.log(`  ${ink.muted('Waiting…')}`);
+  });
+  if (outcome.signedIn) {
+    console.log(`  ${ink.success('Signed in')} as ${ink.bold(outcome.email)}.\n`);
+  } else if (outcome.refused) {
+    console.log(`  ${ink.danger('Refused')} in the browser.\n`);
+  } else {
+    console.log(`  ${ink.warn('The code expired.')}\n`);
+  }
+  return outcome;
+}
+
+/** The slash commands, and the one place they are described. */
+const COMMANDS = [
+  ['/help', 'this list'],
+  ['/login', 'sign in through the browser'],
+  ['/logout', 'forget the stored session on this machine'],
+  ['/runs', 'the run list — the same as L'],
+  ['/cancel', 'cancel the session you are watching'],
+  ['/log', "the daemon's own log, on or off"],
+  ['/quit', 'leave; the runner keeps going'],
+];
 
 class Attached {
   constructor(socketPath, session, options = {}) {
     this.socketPath = socketPath;
     this.session = session;
     this.options = options;
+    this.ink = painter();
+    this.screen = new Scrollback(process.stdout);
 
     this.runner = null;
     this.runs = [];
-    this.selected = 0;
-    /** runId -> rendered transcript lines. */
+    /** The run whose output is being printed. An id, not an index: the list
+     *  moves under you, and watching your transcript switch because a third
+     *  session finished is how you send a prompt to the wrong place. */
+    this.watching = null;
+    /** runId -> transcript lines, for a run that is not the one printing. */
     this.lines = new Map();
-    this.logs = [];
+    /** Which runs have had their history laid into the scrollback already. */
+    this.printed = new Set();
     /** runId -> the pending permission request on it, from the inbox. */
     this.approvals = new Map();
     /** runId -> what it is asking, and whose question that is — R58. */
     this.questions = new Map();
 
-    this.mode = 'normal';
+    this.mode = 'keys';
     this.input = '';
+    this.inputKind = null;
     this.status = '';
     this.showLog = false;
-    /** Lines scrolled back from the tail. Zero follows the session. */
-    this.scroll = 0;
+    this.listAt = 0;
     this.asked = new Set();
     this.connected = false;
     this.stopped = false;
@@ -522,11 +457,19 @@ class Attached {
   }
 
   async start() {
-    process.stdout.write(ALT_SCREEN_ON + HIDE_CURSOR);
-    process.stdin.setRawMode?.(true);
-    process.stdin.resume();
-    process.stdin.on('data', (chunk) => this.onKey(chunk.toString('utf8')));
-    process.stdout.on('resize', () => this.draw());
+    this.screen.open();
+    // Raw mode only where there is a terminal to put in it. Through a pipe
+    // there are no keys, the transcript is the whole output, and that is the
+    // honest degradation rather than a broken one.
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode?.(true);
+      process.stdin.resume();
+      process.stdin.on('data', (chunk) => this.onKey(chunk.toString('utf8')));
+    }
+    process.stdout.on('resize', () => {
+      this.screen.resize();
+      this.dirty = true;
+    });
 
     this.open();
     if (this.session.signedIn) {
@@ -534,18 +477,18 @@ class Attached {
       void this.watchQuestions();
     }
 
-    // One repaint per tick at most. A busy session emits hundreds of lines a
-    // second and redrawing per line would spend the whole terminal on escape
-    // codes.
-    const painter = setInterval(() => {
+    // One footer repaint per tick at most. A busy session emits hundreds of
+    // lines a second; the transcript is printed as it arrives, but redrawing
+    // the footer per line would spend the terminal on escape codes.
+    const tick = setInterval(() => {
       if (this.dirty) {
         this.dirty = false;
-        this.draw();
+        this.drawFooter();
       }
     }, 60);
-    painter.unref?.();
+    tick.unref?.();
 
-    this.draw();
+    this.drawFooter();
     await new Promise((done) => {
       this.finish = done;
     });
@@ -596,31 +539,90 @@ class Attached {
     if (event.type === 'hello') {
       this.runner = event.runner;
       this.runs = event.runs;
-      this.requestBacklog();
+      this.chooseWatched();
     } else if (event.type === 'runs') {
-      const before = this.current()?.id;
       this.runs = event.runs;
-      // Keep the selection on the SAME run when the list moves under it.
-      // Watching your cursor jump to another session because a third one
-      // finished is how you send a prompt to the wrong place.
-      const at = this.runs.findIndex((run) => run.id === before);
-      this.selected = at === -1 ? Math.min(this.selected, Math.max(0, this.runs.length - 1)) : at;
-      this.requestBacklog();
+      this.chooseWatched();
     } else if (event.type === 'output') {
       const kept = this.lines.get(event.runId) ?? [];
       kept.push(event.line);
       if (kept.length > 5000) kept.splice(0, kept.length - 5000);
       this.lines.set(event.runId, kept);
+      if (event.runId === this.watching && !this.showLog) {
+        this.say(this.render(event.line));
+      }
     } else if (event.type === 'backlog') {
       this.lines.set(event.runId, event.lines);
+      if (event.runId === this.watching && !this.printed.has(event.runId)) {
+        this.layHistoryIn(event.runId, event.lines);
+      }
     } else if (event.type === 'log') {
-      this.logs.push(event);
-      if (this.logs.length > 2000) this.logs.splice(0, this.logs.length - 2000);
+      if (this.showLog) {
+        this.say(`${this.ink.muted(event.at?.slice(11, 19) ?? '')} ${event.line}`);
+      }
     }
     this.dirty = true;
   }
 
-  /** The backlog of whatever is selected, once per run. */
+  /**
+   * Print into the scrollback.
+   *
+   * Wrapped here rather than left to the terminal for one reason: a transcript
+   * line carries the agent's own colour and can be a paragraph with newlines in
+   * it, and `wrap` is the function that knows the difference between a
+   * character and an escape sequence.
+   */
+  say(text) {
+    this.screen.print(wrap(text, this.screen.width));
+  }
+
+  /**
+   * A run's history, laid into the scrollback when you switch to it — R81.
+   *
+   * Without this, opening a session that started an hour ago is a blank
+   * terminal until the agent next speaks. The daemon has kept the last four
+   * thousand lines for exactly this (control.mjs), and putting them in the
+   * scrollback rather than in a pane is what makes scrolling up reach the
+   * start of the session.
+   */
+  layHistoryIn(runId, lines) {
+    this.printed.add(runId);
+    const run = this.runs.find((each) => each.id === runId);
+    const ink = this.ink;
+    this.say(ink.muted('─'.repeat(Math.max(0, this.screen.width))));
+    this.say(`${ink.bold(run?.label ?? 'a session')} ${ink.muted(
+      `${run?.projectSlug ?? ''}${run?.branch ? ` · ${run.branch}` : ''}`)}`);
+    if (!lines.length) {
+      this.say(ink.muted(run?.state === 'queued'
+        ? `  waiting — ${run.why ?? 'no reason recorded'}`
+        : '  nothing said yet on this session'));
+    }
+    this.say('');
+    for (const line of lines) {
+      this.say(this.render(line));
+    }
+  }
+
+  /**
+   * What is being watched, after the list changed.
+   *
+   * A run that is gone releases the screen to the newest one, and a first run
+   * on an idle machine takes it — the common case is one session, and making
+   * somebody press a key to see the only thing happening is a poor greeting.
+   */
+  chooseWatched() {
+    if (this.watching && this.runs.some((run) => run.id === this.watching)) {
+      this.requestBacklog();
+      return;
+    }
+    const next = this.runs[0];
+    this.watching = next?.id ?? null;
+    if (next) {
+      this.requestBacklog();
+    }
+  }
+
+  /** The backlog of whatever is being watched, once per run. */
   requestBacklog() {
     const run = this.current();
     if (!run || this.asked.has(run.id) || !this.connected) {
@@ -635,7 +637,23 @@ class Attached {
   }
 
   current() {
-    return this.runs[this.selected] ?? null;
+    return this.runs.find((run) => run.id === this.watching) ?? null;
+  }
+
+  /** Switch which session is printing, and lay its history in. */
+  watch(runId) {
+    if (runId === this.watching) {
+      return;
+    }
+    this.watching = runId;
+    this.printed.delete(runId);
+    this.asked.delete(runId);
+    const kept = this.lines.get(runId);
+    if (kept) {
+      this.layHistoryIn(runId, kept);
+    }
+    this.requestBacklog();
+    this.note('');
   }
 
   note(text) {
@@ -672,17 +690,13 @@ class Attached {
   }
 
   /**
-   * What the selected session is asking — R58.
+   * What the watched session is asking — R58.
    *
    * The run's own questions rather than the inbox, and that is the point: the
    * inbox is now only what is *yours*, so a question stopping a session on this
    * machine that belongs to a colleague would simply not be there — and the one
    * thing this program exists to answer is "why is that run not moving". Here
    * the answer is a name.
-   *
-   * Only the selected run, because that is the only one whose banner is drawn.
-   * Polling every session's questions would be a request per run per tick to
-   * render nothing.
    */
   async watchQuestions() {
     while (!this.stopped) {
@@ -715,13 +729,15 @@ class Attached {
   // --- keys ------------------------------------------------------------------
 
   onKey(key) {
-    if (this.mode === 'prompt' || this.mode === 'reason' || this.mode === 'answer') {
+    if (this.mode === 'typing') {
       return this.onTyping(key);
+    }
+    if (this.mode === 'list') {
+      return this.onListKey(key);
     }
     // Any other key means "no". A confirmation that outlives the moment is one
     // somebody answers by accident three keystrokes later.
-    if (key !== 'q' && key !== 'x') {
-      this.confirmQuit = false;
+    if (key !== 'x') {
       this.confirming = null;
     }
 
@@ -729,22 +745,18 @@ class Attached {
       case 'q':
       case '\x03': // Ctrl-C
         return this.quit();
-      case '\t':
-      case 'j':
-      case `${ESC}[B`:
-        return this.move(1);
-      case 'k':
-      case `${ESC}[A`:
-        return this.move(-1);
+      case '\r':
+      case '\n':
+      case 'i':
+        return this.type('prompt', 'prompt ▸', '');
+      case '/':
+        return this.type('command', 'cawdev ▸', '/');
+      case 'l':
+      case 'L':
+        return this.openList();
       case 'g':
         this.showLog = !this.showLog;
-        this.scroll = 0;
-        return this.note(this.showLog ? "the daemon's log" : 'the session');
-      case 'i':
-        if (!this.requireSignIn('prompt a session')) return undefined;
-        this.mode = 'prompt';
-        this.input = '';
-        return this.note('');
+        return this.note(this.showLog ? "printing the daemon's log" : 'printing the session');
       case 'a': {
         // R58: the refusal is here rather than at the API, so nobody types an
         // answer into a session that is not going to take it.
@@ -756,37 +768,28 @@ class Attached {
           return this.note(`waiting on ${asking.waitingOn} — not yours to answer`);
         }
         if (!this.requireSignIn('answer a question')) return undefined;
-        this.mode = 'answer';
-        this.input = '';
-        return this.note('');
+        return this.type('answer', 'answer ▸', '');
       }
       case 'y':
-        return void this.decide(true, false);
+        return void this.decide({ allow: true, scope: 'ONCE' });
+      case 's':
+        return void this.decide({ allow: true, scope: 'SESSION' });
       case 'Y':
-        return void this.decide(true, true);
-      case 'n':
+        return void this.decide({ allow: true, scope: 'PROJECT' });
+      case 'n': {
         if (!this.pendingOn(this.current())) {
           return this.note('nothing is waiting for permission on this one');
         }
         if (!this.requireSignIn('refuse a request')) return undefined;
-        this.mode = 'reason';
-        this.input = '';
-        return this.note('');
+        return this.type('reason', 'refuse, because ▸', '');
+      }
       case 'x':
         return void this.cancel();
-      case `${ESC}[5~`: // PgUp
-        this.scroll += 10;
-        return this.note('');
-      case `${ESC}[6~`: // PgDn
-        this.scroll = Math.max(0, this.scroll - 10);
-        return this.note('');
       default:
         if (/^[1-9]$/.test(key)) {
           const at = Number(key) - 1;
           if (at < this.runs.length) {
-            this.selected = at;
-            this.scroll = 0;
-            this.requestBacklog();
+            this.watch(this.runs[at].id);
           }
           return this.note('');
         }
@@ -794,24 +797,40 @@ class Attached {
     }
   }
 
+  type(kind, label, start) {
+    if (kind === 'prompt' && !this.requireSignIn('prompt a session')) {
+      return undefined;
+    }
+    this.mode = 'typing';
+    this.inputKind = kind;
+    this.inputLabel = label;
+    this.input = start;
+    return this.note('');
+  }
+
   onTyping(key) {
     if (key === '\x03' || key === ESC) {
-      this.mode = 'normal';
+      this.mode = 'keys';
       this.input = '';
       return this.note('cancelled');
     }
     if (key === '\r' || key === '\n') {
       const text = this.input.trim();
-      const was = this.mode;
-      this.mode = 'normal';
+      const was = this.inputKind;
+      this.mode = 'keys';
       this.input = '';
-      if (!text) {
-        return this.note('nothing to send');
+      if (!text || text === '/') {
+        return this.note('');
+      }
+      if (was === 'command' || text.startsWith('/')) {
+        return void this.runCommand(text);
       }
       if (was === 'prompt') {
         return void this.send(text);
       }
-      return was === 'answer' ? void this.answer(text) : void this.decide(false, false, text);
+      return was === 'answer'
+        ? void this.answer(text)
+        : void this.decide({ allow: false, reason: text });
     }
     if (key === '\x7f' || key === '\b') {
       this.input = this.input.slice(0, -1);
@@ -826,12 +845,80 @@ class Attached {
     return undefined;
   }
 
-  move(by) {
-    if (!this.runs.length) return;
-    this.selected = (this.selected + by + this.runs.length) % this.runs.length;
-    this.scroll = 0;
-    this.requestBacklog();
-    this.note('');
+  // --- the run list, as an overlay ------------------------------------------
+
+  /**
+   * `L` — every run this machine is driving, claiming or leaving queued.
+   *
+   * An overlay rather than a rail, because that is the trade R81 reversed: the
+   * rail cost thirty columns on every line of every transcript to answer a
+   * question asked a few times an hour.
+   */
+  openList() {
+    this.mode = 'list';
+    this.listAt = Math.max(0, this.runs.findIndex((run) => run.id === this.watching));
+    return this.note('');
+  }
+
+  onListKey(key) {
+    if (key === ESC || key === 'q' || key === '\x03') {
+      this.mode = 'keys';
+      // Escape leaves without changing anything, which is the promise the key
+      // makes everywhere else.
+      return this.note('');
+    }
+    if (key === '\r' || key === '\n') {
+      const run = this.runs[this.listAt];
+      this.mode = 'keys';
+      if (run) {
+        this.watch(run.id);
+      }
+      return undefined;
+    }
+    if (key === `${ESC}[B` || key === 'j' || key === '\t') {
+      this.listAt = this.runs.length ? (this.listAt + 1) % this.runs.length : 0;
+      this.dirty = true;
+      return undefined;
+    }
+    if (key === `${ESC}[A` || key === 'k') {
+      this.listAt = this.runs.length
+        ? (this.listAt - 1 + this.runs.length) % this.runs.length
+        : 0;
+      this.dirty = true;
+      return undefined;
+    }
+    return undefined;
+  }
+
+  overlayLines(width) {
+    if (this.mode !== 'list') return [];
+    const ink = this.ink;
+    const lines = [`${ink.muted(' sessions on this machine')}`];
+    if (!this.runs.length) {
+      lines.push(ink.muted('  nothing running, claiming or queued here'));
+    }
+    // The window walks with the cursor rather than the list scrolling under it:
+    // a machine with twenty runs should still show the one you are on.
+    const room = Math.max(3, Math.min(this.runs.length, Math.floor(this.screen.height / 3)));
+    const from = Math.max(0, Math.min(this.listAt - Math.floor(room / 2), this.runs.length - room));
+    this.runs.slice(from, from + room).forEach((run, offset) => {
+      const at = from + offset;
+      lines.push(runLine(run, {
+        chosen: at === this.listAt,
+        // `!` is a decision waiting; `?` is a question. Different marks because
+        // they are answered with different keys, and since R58 the second may
+        // not even be yours.
+        marker: this.approvals.has(run.id)
+          ? ink.warn('!')
+          : this.questions.has(run.id) ? ink.accent('?') : ' ',
+        number: at < 9 ? String(at + 1) : ' ',
+      }, width, ink));
+    });
+    if (this.runs.length > room) {
+      lines.push(ink.muted(`  … ${this.runs.length - room} more`));
+    }
+    lines.push(ink.muted('  ↑↓ move · enter open · esc leave'));
+    return lines;
   }
 
   requireSignIn(what) {
@@ -842,11 +929,73 @@ class Attached {
     // client being awkward, it is the platform refusing anything that is not a
     // person, and a message that says "403" would send somebody looking in the
     // wrong place.
-    this.note(`sign in to ${what} — a session may only be changed by a person`);
+    this.note(`sign in with /login to ${what} — a session may only be changed by a person`);
     return false;
   }
 
-  // --- the three things a person can do -------------------------------------
+  // --- slash commands ---------------------------------------------------------
+
+  async runCommand(text) {
+    const [word, ...rest] = text.slice(1).split(/\s+/);
+    switch (word) {
+      case 'help':
+        this.say('');
+        this.say(this.ink.bold(' commands'));
+        for (const [name, what] of COMMANDS) {
+          this.say(`   ${this.ink.accent(name.padEnd(9))} ${this.ink.muted(what)}`);
+        }
+        this.say('');
+        this.say(this.ink.bold(' keys'));
+        this.say(this.ink.muted('   enter prompt · / command · L runs · 1-9 pick a run'));
+        this.say(this.ink.muted('   a answer · y/s/Y/n permission · x cancel · g log · q quit'));
+        this.say('');
+        return this.note('');
+      case 'login':
+        return this.signIn();
+      case 'logout':
+        await this.session.signOut();
+        await clearSession(this.session.url);
+        return this.note('signed out — /login to sign in again');
+      case 'runs':
+        return this.openList();
+      case 'cancel':
+        return void this.cancel();
+      case 'log':
+        this.showLog = !this.showLog;
+        return this.note(this.showLog ? "printing the daemon's log" : 'printing the session');
+      case 'quit':
+      case 'exit':
+        return this.quit();
+      default:
+        return this.note(`no such command: /${word}${rest.length ? ' …' : ''} — try /help`);
+    }
+  }
+
+  /**
+   * `/login`, from inside the UI.
+   *
+   * The screen is given back for the duration, because this prints a URL and a
+   * code somebody has to read and possibly copy — and a URL that scrolls under
+   * a footer three lines later is a URL nobody can click. The footer comes back
+   * the moment it is decided.
+   */
+  async signIn() {
+    this.screen.live([]);
+    this.say('');
+    const outcome = await runSignIn(this.session, this.ink)
+      .catch((failure) => ({ signedIn: false, message: failure.message }));
+    if (outcome.message) {
+      this.say(this.ink.danger(`  could not sign in: ${outcome.message}`));
+    }
+    if (this.session.signedIn) {
+      void this.watchInbox();
+      void this.watchQuestions();
+    }
+    this.dirty = true;
+    return undefined;
+  }
+
+  // --- the things a person can do ---------------------------------------------
 
   async send(text) {
     const run = this.current();
@@ -891,7 +1040,14 @@ class Attached {
     return undefined;
   }
 
-  async decide(allow, remember, reason) {
+  /**
+   * R51's decision, with R60's three reaches.
+   *
+   * `scope` rather than `remember`: the useful answer was the missing one —
+   * somebody unblocking a session at 2am wants neither "ask me again in ninety
+   * seconds" nor "decide policy for every agent that ever runs here".
+   */
+  async decide({ allow, scope, reason }) {
     const run = this.current();
     const pending = this.pendingOn(run);
     if (!pending) {
@@ -904,10 +1060,12 @@ class Attached {
       await this.session.request(
         `/api/projects/${pending.projectSlug}/runs/${pending.runId}` +
           `/approvals/${pending.approval.id}/decision`,
-        { method: 'POST', body: { allow, remember, reason } },
+        { method: 'POST', body: { allow, scope, reason } },
       );
       this.approvals.delete(run.id);
-      this.note(allow ? (remember ? 'allowed, and remembered' : 'allowed') : 'refused');
+      this.note(allow
+        ? { ONCE: 'allowed, once', SESSION: 'allowed for this session', PROJECT: 'allowed, and remembered' }[scope]
+        : 'refused');
     } catch (failure) {
       this.note(failure.message);
     }
@@ -941,12 +1099,19 @@ class Attached {
     return undefined;
   }
 
+  /**
+   * Leaving.
+   *
+   * **The daemon keeps going, and the goodbye says so.** `cawdev` starts one
+   * for you when it finds none, and a background process somebody did not know
+   * they started is the price of that convenience — so it is paid out loud,
+   * naming the runner and how to stop it. The one exception is `--attach`,
+   * where the daemon IS this process and quitting really does take the
+   * sessions with it; that one asks twice.
+   */
   quit() {
     const live = this.options.liveSessions?.() ?? 0;
     if (this.options.onQuit && live > 0 && !this.confirmQuit) {
-      // Started with `--attach`, so this window IS the daemon: quitting takes
-      // the sessions with it. `q` must not be a way to lose three hours of work
-      // by leaning on the keyboard.
       this.confirmQuit = true;
       return this.note(
         `${live} session${live === 1 ? '' : 's'} running here — press q again to stop the daemon too`,
@@ -959,8 +1124,14 @@ class Attached {
     } catch {
       // Going anyway.
     }
+    this.screen.close();
     process.stdin.setRawMode?.(false);
-    process.stdout.write(SHOW_CURSOR + ALT_SCREEN_OFF);
+
+    if (!this.options.onQuit) {
+      for (const line of this.goodbye()) {
+        console.log(line);
+      }
+    }
     this.finish?.();
 
     if (this.options.onQuit) {
@@ -971,180 +1142,111 @@ class Attached {
     return process.exit(0);
   }
 
-  // --- drawing -----------------------------------------------------------------
-
-  draw() {
-    const width = process.stdout.columns ?? 100;
-    const height = process.stdout.rows ?? 30;
-    const paneWidth = Math.max(20, width - RAIL - 1);
-    // Three chrome rows now: two of header, one of footer.
-    const bodyHeight = Math.max(3, height - 4);
-
-    const rail = this.railLines(bodyHeight);
-    const pane = this.paneLines(paneWidth, bodyHeight);
-
-    const out = [CLEAR, this.header(width), '\n'];
-    for (let row = 0; row < bodyHeight; row++) {
-      out.push(pad(rail[row] ?? '', RAIL));
-      out.push(`${DIM}│${RESET}`);
-      out.push(clip(pane[row] ?? '', paneWidth));
-      out.push('\n');
-    }
-    out.push(this.footer(width));
-    process.stdout.write(out.join(''));
-  }
-
-  /**
-   * The top bar — R62.
-   *
-   * Two rows, because one could not hold it and the second is the half people
-   * actually attach to see: which cawdev this is talking to, what it serves,
-   * and how full it is.
-   *
-   * **Both gates are on screen, and they count different things.** Per project
-   * it is CODING sessions over checkouts (`cawdev 1/2`), which is that
-   * project's own ceiling and bounds nothing else (R70); on the right it is the
-   * machine's total over `maxSessions`, every profile included. A run that is
-   * waiting is then explained by the bar above it — before this, the only way
-   * to find out which limit had been hit was to read the source.
-   */
-  header(width) {
-    const runner = this.runner?.name ?? '…';
-    const who = this.session.signedIn ? this.session.email : 'watching only';
-    const link = this.connected ? '' : ` ${ink.danger('detached')}`;
-    const left = ` ${oneLine(ink)} ${ink.muted('·')} ${ink.bold(runner)} `
-      + `${ink.muted('·')} ${ink.muted(who)}${link}`;
-    const top = `${REVERSE}${pad(clip(left, width - 1), width)}${RESET}`;
-    return `${top}\n${this.settingsBar(width)}`;
-  }
-
-  /** The second row: where it points, what it serves, how full it is. */
-  settingsBar(width) {
-    return settingsBar(this.runner, this.runs, width);
-  }
-
-  railLines(height) {
-    const lines = [];
-    lines.push(` ${DIM}sessions here${RESET}`);
-    if (!this.runs.length) {
-      lines.push(` ${DIM}nothing running${RESET}`);
-    }
-    this.runs.forEach((run, at) => {
-      const colour = STATE_COLOUR[run.state] ?? '';
-      const marker = at === this.selected ? `${BOLD}❯${RESET}` : ' ';
-      // `!` is a decision waiting; `?` is a question. Different marks because
-      // they are answered with different keys, and since R58 the second may not
-      // even be yours — the banner says which, the rail only says there is one.
-      const waiting = this.approvals.has(run.id)
-        ? `${ESC}[33m!${RESET}`
-        : this.questions.has(run.id) ? `${ESC}[36m?${RESET}` : ' ';
-      const number = at < 9 ? `${at + 1}` : ' ';
-      lines.push(`${marker}${waiting}${DIM}${number}${RESET} ${colour}${clip(run.label, RAIL - 6)}${RESET}`);
-      lines.push(`   ${DIM}${clip(`${run.projectSlug} · ${run.state}`, RAIL - 4)}${RESET}`);
-      if (run.why) {
-        // The reason a run is queued is the whole argument for this program
-        // existing, so it is on the rail rather than a keypress away.
-        lines.push(`   ${DIM}${ESC}[33m${clip(run.why, RAIL - 4)}${RESET}`);
-      }
-    });
-    return lines.slice(0, height);
-  }
-
-  paneLines(width, height) {
-    const run = this.current();
-    const source = this.showLog
-      ? this.logs.map((entry) => `${DIM}${entry.at?.slice(11, 19) ?? ''}${RESET} ${entry.line}`)
-      : (this.lines.get(run?.id) ?? []).map((line) => this.render(line));
-
-    const wrapped = source.flatMap((line) => wrap(line, width));
-
-    const banner = this.bannerLines(run, width);
-    const room = Math.max(1, height - banner.length);
-    const end = Math.max(0, wrapped.length - this.scroll);
-    const visible = wrapped.slice(Math.max(0, end - room), end);
-
-    if (run?.state === 'queued' && !this.showLog) {
-      // A queued run has no transcript, and "nothing said yet" would be a poor
-      // answer to the question somebody actually has. The rail can only show
-      // twenty-odd characters of the reason; here it fits.
-      return [
-        ...banner,
-        ` ${BOLD}waiting${RESET}`,
-        ` ${ESC}[33m${clip(run.why ?? 'no reason recorded', width - 2)}${RESET}`,
-        '',
-        `${DIM} This machine has claimed nothing for it yet. Nothing is wrong —${RESET}`,
-        `${DIM} the daemon re-offers it every poll and takes it when it can.${RESET}`,
-      ];
-    }
-    if (!visible.length && !banner.length) {
-      return [
-        `${DIM} ${run ? 'nothing said yet on this session' : 'no session selected'}${RESET}`,
-      ];
-    }
-    return [...banner, ...visible];
-  }
-
-  /**
-   * What is stopping this session, above the transcript.
-   *
-   * A permission request wins when there is one: it is the narrower thing and
-   * the one with two keys behind it. Otherwise a question — and since R58 that
-   * banner has two shapes, because a question stopping a session on this
-   * machine is not necessarily this operator's to answer.
-   */
-  bannerLines(run, width) {
-    const pending = this.pendingOn(run);
-    if (!pending) return this.questionLines(run, width);
-    const approval = pending.approval;
-    const rule = approval.suggestion
-      ? `${ESC}[33mY${RESET} always allow ${approval.suggestion}   `
-      : '';
-    return [
-      `${ESC}[33m${BOLD} permission ${RESET} ${clip(approval.summary, width - 14)}`,
-      `${DIM} ${approval.toolName} · waiting since ${approval.askedAt?.slice(11, 19) ?? ''}${RESET}`,
-      ` ${ESC}[32my${RESET} allow once   ${rule}${ESC}[31mn${RESET} refuse`,
-      `${DIM}${'─'.repeat(Math.max(0, width))}${RESET}`,
-    ];
-  }
-
-  /**
-   * The question a session has stopped on — R58.
-   *
-   * **Two shapes, and the second is the reason this exists.** When it is this
-   * operator's, `a` answers it here. When it is not, the banner says whose it
-   * is instead of offering a key that would 403: a terminal that let somebody
-   * type an answer and then refused it would read as cawdev being broken rather
-   * than as the question belonging to a colleague. The rule is
-   * {@link questionState}, which is the API's rule and is tested on its own.
-   */
-  questionLines(run, width) {
-    return questionBanner(this.askingOn(run), width);
+  goodbye() {
+    return farewell(this.runner, this.runs, this.ink);
   }
 
   render(line) {
     const kind = line.kind ?? 'SYSTEM';
-    const colour = kind === 'ERROR' ? `${ESC}[31m` : kind === 'USER' ? `${ESC}[36m` : '';
+    const paint = kind === 'ERROR' ? this.ink.danger : kind === 'USER' ? this.ink.accent : null;
     // The body already carries the agent's own colour; ours goes in front and
     // is closed after, so a line that sets a colour and never resets it cannot
-    // paint the rest of the pane.
-    return `${colour}${line.body}${RESET}`;
+    // paint the rest of the terminal.
+    return paint ? paint(line.body) : `${line.body}${ESC}[0m`;
   }
 
-  footer(width) {
-    if (this.mode === 'prompt') {
-      return `${REVERSE}${pad(clip(` prompt ▸ ${this.input}`, width - 1), width)}${RESET}`;
+  /**
+   * The footer, or what stands in for it through a pipe.
+   *
+   * **A pipe has nothing to pin to**, so the live region stops existing and the
+   * fixed answers are PRINTED instead — once, and again only when they change.
+   * Repeating them per tick would drown the transcript, and dropping them
+   * entirely would make the piped form the one place cawdev refuses to say
+   * which platform it is talking to. The keys and the status line are left out
+   * there on purpose: neither means anything without a keyboard.
+   */
+  drawFooter() {
+    const width = this.screen.width;
+    const run = this.current();
+    const pending = this.pendingOn(run);
+    const state = {
+      runner: this.runner,
+      runs: this.runs,
+      email: this.session.email,
+      watching: run,
+      connected: this.connected,
+      // A permission request wins when there is one: it is the narrower thing
+      // and the one with three keys behind it. Otherwise a question — and
+      // since R58 that banner has two shapes.
+      banner: pending
+        ? permissionBanner(pending, width, this.ink)
+        : questionBanner(this.askingOn(run), width, this.ink),
+    };
+
+    if (this.screen.tty) {
+      this.screen.live(footerLines({
+        ...state,
+        overlay: this.overlayLines(width),
+        input: this.mode === 'typing' ? { label: this.inputLabel, text: this.input } : null,
+        keys: this.keys(),
+        status: this.status,
+      }, width, this.ink));
+      return;
     }
-    if (this.mode === 'reason') {
-      return `${REVERSE}${pad(clip(` refuse, because ▸ ${this.input}`, width - 1), width)}${RESET}`;
+
+    const lines = footerLines(state, width, this.ink);
+    const said = stripAnsi(lines.join('\n'));
+    if (said !== this.lastSaid) {
+      this.lastSaid = said;
+      this.screen.print(lines);
     }
-    if (this.mode === 'answer') {
-      return `${REVERSE}${pad(clip(` answer ▸ ${this.input}`, width - 1), width)}${RESET}`;
-    }
-    const keys =
-      ` ${DIM}tab${RESET} next  ${DIM}1-9${RESET} pick  ${DIM}i${RESET} prompt  ` +
-      `${DIM}a${RESET} answer  ${DIM}y/Y/n${RESET} permission  ${DIM}x${RESET} cancel  ` +
-      `${DIM}g${RESET} log  ${DIM}q${RESET} ${this.options.onQuit ? 'stop' : 'quit'}`;
-    const status = this.status ? `  ${ESC}[33m${this.status}${RESET}` : '';
-    return pad(clip(keys + status, width - 1), width);
   }
+
+  /** What you can press right now, which is not the same list at all times. */
+  keys() {
+    const ink = this.ink;
+    if (this.mode === 'list') {
+      return ink.muted('↑↓ move · enter open · esc leave');
+    }
+    const parts = [
+      `${ink.text('enter')} ${ink.muted('prompt')}`,
+      `${ink.text('/')} ${ink.muted('commands')}`,
+      `${ink.text('L')} ${ink.muted('runs')}`,
+    ];
+    if (this.askingOn(this.current())?.yours) {
+      parts.push(`${ink.success('a')} ${ink.muted('answer')}`);
+    }
+    if (this.pendingOn(this.current())) {
+      parts.push(`${ink.warn('y/s/n')} ${ink.muted('permission')}`);
+    }
+    parts.push(`${ink.text('x')} ${ink.muted('cancel')}`);
+    parts.push(`${ink.text('q')} ${ink.muted(this.options.onQuit ? 'stop' : 'quit')}`);
+    return parts.join(ink.muted(' · '));
+  }
+}
+
+/**
+ * What is said on the way out — R81, and a function so it can be read without
+ * quitting anything.
+ *
+ * The entry is explicit about this: quitting does not kill the daemon, and
+ * "a background process you did not know you started is the cost of this choice
+ * and it should be paid out loud". So the goodbye names the runner, what it is
+ * still driving, and the exact command that stops it.
+ */
+export function farewell(runner, runs, ink = painter(3)) {
+  const name = runner?.name ?? 'the runner';
+  const busy = (runs ?? []).filter((run) => run.state !== 'queued').length;
+  const doing = busy
+    ? `still driving ${busy} session${busy === 1 ? '' : 's'}`
+    : 'still claiming work';
+  const stop = runner?.pid
+    ? `  Stop it with:  ${ink.text(`kill ${runner.pid}`)}`
+    : `  Stop it by ending the process serving ${name}.`;
+  return [
+    '',
+    `  ${ink.bold(name)} ${ink.muted(`is ${doing} on this machine, and keeps going.`)}`,
+    stop,
+    '',
+  ];
 }

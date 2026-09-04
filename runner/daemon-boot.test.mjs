@@ -145,13 +145,25 @@ test('--attach starts the machine and shows it, in one terminal', async (t) => {
   await new Promise((done) => setTimeout(done, 2500));
   const plain = drawn.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
 
-  assert.match(plain, /sessions here/, 'the UI never drew');
+  // R81: the footer is what proves the UI drew. The rail of runs it used to
+  // look for is gone — it cost width on every line of every transcript to
+  // answer a question asked a few times an hour, and `L` answers it now.
+  assert.match(plain, /sessions \d/, 'the UI never drew its footer');
   assert.match(plain, new RegExp(`${RUNNER}-3`), 'the UI did not name the runner it started');
-  // The daemon's log must NOT be on the terminal: it would paint over the UI,
-  // and it is one keypress away in a pane instead.
+  // The daemon's log must NOT be on the terminal: it would land in the middle
+  // of a transcript, and `g` prints it instead when it is wanted.
   assert.doesNotMatch(plain, /registered as/, "the daemon's log leaked onto the UI's terminal");
-  // Its own daemon, so the key is "stop", not "quit".
-  assert.match(plain, /q stop/);
+  // Legible through a pipe — R81's last "done when". Nothing is pinned here
+  // because there is nothing to pin to and no keyboard to offer keys for, so
+  // what has to survive is the fixed half: which cawdev, what it serves, and
+  // how full it is. The key list is not in this list on purpose.
+  assert.match(plain, new RegExp(platform.url.replace(/[.]/g, '\\.')), 'which cawdev');
+  assert.match(plain, /board 0\/1/, 'what it serves, and how full');
+  // And the whole point of R81: the alternate screen is never entered, because
+  // entering it is what took the terminal's scroll, wheel, search and copy
+  // away. If this ever matches again, the transcript has stopped being the
+  // terminal's own scrollback.
+  assert.doesNotMatch(drawn, /\x1b\[\?1049h/, 'the client took the alternate screen');
 });
 
 test('a claimed run actually spawns', async (t) => {
