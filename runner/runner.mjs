@@ -22,6 +22,7 @@ import { withinCeiling } from '../lib/tool-rules.mjs';
 import { serveControl } from './control.mjs';
 import { painter } from '../lib/ansi.mjs';
 import { bannerLines, tintLog } from './banner.mjs';
+import { codeMapOf } from '../lib/code-map.mjs';
 
 // --- configuration -----------------------------------------------------------
 
@@ -1409,6 +1410,41 @@ async function surveyProjectGit(path, { fetch = true } = {}) {
 }
 
 /**
+ * The shape of a repository: its files, and which of them import which — R77.
+ *
+ * <p>Read on the git survey's timer rather than per run: it is a fact about the
+ * repository, not about a session, and the Map tab wants it to exist before
+ * anybody starts anything.
+ *
+ * <p>Tracked files only, via `git ls-files` — `node_modules` and `target` are
+ * not this project's code, and a map that included them would be a map of npm.
+ * A file too big to be source is skipped rather than read: a checked-in
+ * minified bundle is a megabyte of one line and nothing in it is an import
+ * anybody wants to see.
+ */
+const BIGGEST_SOURCE_FILE = 400_000;
+
+async function surveyCodeMap(path) {
+  const listed = await git(path, ['ls-files']);
+  const paths = listed.split('\n').map((each) => each.trim()).filter(Boolean);
+
+  const files = [];
+  for (const each of paths) {
+    if (!/\.(java|mjs|js|ts|tsx|jsx)$/.test(each)) {
+      // Still on the map, just not read for imports.
+      files.push({ path: each });
+      continue;
+    }
+    const full = join(path, each);
+    const size = await stat(full).then((it) => it.size).catch(() => Infinity);
+    files.push(size > BIGGEST_SOURCE_FILE
+      ? { path: each }
+      : { path: each, text: await readFile(full, 'utf8').catch(() => '') });
+  }
+  return codeMapOf(files);
+}
+
+/**
  * Reads every served repository and tells the platform.
  *
  * One request per project, and a project that could not be read reports the
@@ -1436,6 +1472,21 @@ async function surveyGit(config) {
       method: 'POST',
       body: reading,
     }).catch((failure) => log(`  could not report git for ${slug}: ${failure.message}`));
+
+    // R77's Map. On the same timer and in the same loop, because it answers
+    // about the same checkout at the same moment — reading the files from one
+    // commit and the branches from another would put a map of two repositories
+    // on one page.
+    const map = await surveyCodeMap(path).catch((failure) => {
+      log(`  could not read the code map for ${slug}: ${failure.message.split('\n')[0]}`);
+      return null;
+    });
+    if (map) {
+      await api(config, `/api/runners/${config.runnerId}/git/${slug}/code-map`, {
+        method: 'POST',
+        body: { headSha: reading.headSha ?? null, ...map },
+      }).catch((failure) => log(`  could not report the code map: ${failure.message}`));
+    }
   }
 }
 
