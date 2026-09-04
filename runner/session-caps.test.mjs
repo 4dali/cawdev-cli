@@ -55,7 +55,7 @@ async function daemonWith(t, { workspaces, offers, name, maxSessions }) {
   }));
 
   const daemon = spawn(process.execPath, [DAEMON, '--config', config], {
-    env: { ...process.env, CAWDEV_TOKEN: 'cawd_fake' },
+    env: platform.env(),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let said = '';

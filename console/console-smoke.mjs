@@ -481,6 +481,18 @@ try {
   check('the run is waiting on a person, and says so',
     (await console_(`/api/projects/${project}/runs/${runId}`)).state === 'WAITING_ON_USER');
 
+  // R78: the prompt box stops lying. A session blocked inside `ask_user` cannot
+  // read a prompt — it queued and turned up as a stray remark after somebody
+  // had answered in the inbox — so the API refuses one and names where the
+  // words belong instead. The console hides the box; this is the rule under it.
+  const swallowed = await console_(`${runPath}/prompts`, {
+    method: 'POST',
+    body: JSON.stringify({ prompt: 'Postgres — typed into the wrong box.' }),
+    expect: 409,
+  });
+  check('a prompt is refused while the session is stopped on a question',
+    /answer it/i.test(swallowed?.message ?? ''), JSON.stringify(swallowed));
+
   await console_(
     `/api/projects/${project}/runs/${runId}/questions/${item.question.id}/answer`,
     { method: 'POST', body: JSON.stringify({ answer: 'Postgres, to match the platform.' }) },

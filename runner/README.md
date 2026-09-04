@@ -100,7 +100,7 @@ at a blank terminal — and `esc` leaves without changing anything.
 | `L` | the run list; arrows, `enter` to open, `esc` to leave |
 | `1`–`9` | jump straight to a run |
 | `a` | answer the question it stopped on — if it is yours (R58) |
-| `y` / `s` / `n` | allow once / allow for this session / refuse (R51, R60) |
+| `y` / `s` / `n` | a permission request: allow once / for the rest of this run / refuse (R51, R60) |
 | `Y` | allow always, here — writes a project rule |
 | `x`, twice | cancel the session |
 | `g` | print the daemon's own log instead of the transcript |
@@ -138,6 +138,24 @@ rather than as the question belonging to a colleague.
 If the person it is waiting on cannot be reached, a project owner can take the
 question over from the console — the run page has the button, and the takeover
 is recorded on the question rather than appearing as an unexplained answer.
+
+`i` is refused while a session is asking, and says so: a run blocked inside
+`ask_user` cannot read a prompt, and the words typed into one queue behind the
+answer they were meant to be. R78 put that refusal in the API, so this client,
+the run page and the home composer cannot disagree about it.
+
+### Three lengths of yes
+
+A permission request has R60's three answers here as well as in the console.
+`y` is this call; `s` is the rest of this run and no longer; `Y` writes a
+project rule that outlives the session, the person and the reason they said yes.
+
+`s` names what it covers — `Bash(mvn *)` when the server could render a rule for
+the command, and `every Bash` when it could not, because those are two different
+promises and a banner that said the same words for both would be lying about one
+of them. `Y` is offered only when there is a rule to write: a compound command
+like `cd backend && ./mvnw test` cannot be settled by a pattern about its first
+word, and a key that quietly became an allow-once would be worse than no key.
 
 ### Watching is free; acting means signing in
 
@@ -229,6 +247,16 @@ lying about is removed. What goes is always logged.
 **Do not list a directory you work in by hand.** That clean deletes untracked
 files. It is skipped when a run was deliberately started on top of uncommitted
 work, but the rule stands: a workspace is the machine's, not yours.
+
+**A held workspace is not cleaned and not offered** (R80). When a code run
+fails, the platform marks its checkout *held* — the uncommitted work is still
+in it — and tells this daemon so on every heartbeat (`heldWorkspaces`). The
+daemon counts it as busy: a new run does not land there, and `git clean` does
+not run there, until somebody on the run page either **carries on** (the run
+re-queues onto this machine and picks up its own session in the same
+directory) or **discards** it, which is the only thing that frees it. The
+runners page lists what each machine is holding, so a workspace nobody
+remembers cannot quietly sit taken.
 
 Provision them however you like — `git clone`, then whatever the project needs
 to build. R48 makes them cheap by cloning a golden checkout per run; until then
@@ -505,11 +533,41 @@ the whole queue.
 ## If the daemon dies mid-run
 
 The platform notices. `StaleRunSweeper` fails a run whose runner has stopped
-heartbeating for five minutes, with a reason saying so — otherwise the run would
-sit `RUNNING` forever and block the project from starting anything else.
+heartbeating for five minutes, with `failureReason: RUNNER_VANISHED` and a
+summary saying so — otherwise the run would sit `RUNNING` forever and block the
+project from starting anything else. The workspace is **kept**, not reclaimed:
+when the daemon comes back, the run page offers *Carry on*, which re-queues the
+run onto this machine and resumes its own session in the same checkout, with
+whatever it had written still there. Nothing is lost by a crash that a person
+does not choose to discard.
 
 A run **`WAITING_ON_USER` is never swept.** That is the one state where nothing
 happening is correct: it is stalled on a person, who may reasonably take a day.
+Nor is a `PAUSED` or `USAGE_LIMITED` one (below) — there is no process to lose.
+
+## When the usage limit hits (R73)
+
+Claude Code stops with a message naming the window — the five-hour one or the
+weekly one — and when it resets. The daemon reads that off the session's last
+output (`tools/lib/usage-limit.mjs`, tested) and reports the run as
+**`USAGE_LIMITED`** with the window and the reset time, rather than `FAILED`
+with a stack of text. The run page says *Usage limit — resumes after …*; the
+card stays where it was; the workspace stays taken. It also posts the reading
+to `POST /api/runners/{id}/limits`, so the runners page shows what this machine
+has used of each window.
+
+**Pause** is the same state with a person's hand on it: the run page's *Pause*
+button moves a `RUNNING` run to `PAUSED`, and the runners page's *Pause* switch
+stops a machine claiming anything new without stopping what it is driving.
+Both are yours to undo. *Carry on* re-queues the run onto its runner, which
+resumes the session it already had.
+
+**Auto-resume** is per machine, off by default, on the runners page. With it
+on, the platform re-queues a `USAGE_LIMITED` run the minute its window opens,
+onto the same machine. It never touches a `PAUSED` run: a person stopped that,
+and only a person starts it. The runner has no say in any of this beyond
+obeying its heartbeat — `paused` and `heldWorkspaces` come from the platform,
+and `runner.mjs` reads them rather than deciding them.
 
 ## Trying it without spending Claude usage
 
@@ -604,6 +662,35 @@ the one project that runs Maven does not force the long form on the rest.
 Do **not** reach for `agentArgs` to add a permission: it replaces the whole
 default list, so you would have to repeat all sixteen MCP tool names to add one
 `Bash` pattern.
+
+#### Skills need no configuration here — R76
+
+A skill is a capability a project turns on in cawdev, and the runner attaches it
+to the session as an MCP server. **There is nothing to configure on the
+machine**: turn CodeGraph on for a project in the console and the next run in
+that project has it.
+
+That is deliberate, and narrower than it sounds. A skill's command is not
+something anybody types — the `skill` table is seeded by migration and has no
+create endpoint, so enabling one runs a command cawdev itself shipped. An
+allowlist on every machine would have been guarding against a project owner
+switching on a vetted skill, which is friction rather than a boundary.
+
+**The machine's consent did not go away; it moved to where it was already
+being asked.** The skill's tools are not added to `--allowedTools`, so the
+session's first call stops and asks a person (R51), and *allow `mcp__codegraph`
+for this session* (R60) is the answer that fits. A machine that wants it
+unattended says so in its own `allowedTools` — the same place every other
+standing permission lives, rather than a second list that only skills use.
+
+**The index lives outside the checkout.** CodeGraph parses the repository into
+a graph beside it; the runner builds that once per repository, keeps it in
+`~/.cawdev/skills/<skill>/<project>`, and copies it into each workspace — so
+R47's several checkouts of one project do not each pay for a parse. The pidfile
+and socket are never copied: they name a live process, and in another workspace
+they point at a daemon serving another tree. The index directory is added to
+that checkout's `.git/info/exclude`, so it neither shows up as a dirty tree nor
+gets deleted by the reset between runs.
 
 #### `grantable`: what this machine lets a saved rule cover
 

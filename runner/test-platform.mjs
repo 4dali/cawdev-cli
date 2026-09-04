@@ -24,6 +24,9 @@ import { once } from 'node:events';
  * @param runLive whether a run reads as still going. False by default, which
  *   makes the daemon reap the child straight away; true for a test that needs
  *   the spawned session to stay up long enough to be looked at.
+ * @param skills what the claim says this project has turned on — R76. What the
+ *   PROJECT asked for: whether any of it is attached is the machine's answer,
+ *   which is the thing under test.
  */
 export async function fakePlatform({
   offers = [],
@@ -31,6 +34,7 @@ export async function fakePlatform({
   workspaceRequests = [],
   resume = null,
   runLive = false,
+  skills = [],
 } = {}) {
   const seen = [];
   const transitions = [];
@@ -40,6 +44,17 @@ export async function fakePlatform({
   const finishedRequests = [];
   /** Session ids the daemon reported off the CLI's `init` event — R69. */
   const sessionIds = [];
+  /**
+   * Transcript lines the daemon sent — R76.
+   *
+   * The run's own transcript is where a withheld capability has to be
+   * explained, so a test about which side refused a skill has to read what
+   * arrived HERE rather than only what the daemon printed. The two are the same
+   * sentence, and only one of them a person will ever see.
+   */
+  const outputs = [];
+  /** What the daemon said the session consumed — R76. */
+  const usage = [];
 
   const server = createServer((request, response) => {
     seen.push(`${request.method} ${request.url.split('?')[0]}`);
@@ -73,6 +88,7 @@ export async function fakePlatform({
           defaultBranch: 'main',
           allowDirty,
           resume,
+          skills,
         }));
       }
       if (url.endsWith('/session') && request.method === 'POST') {
@@ -80,6 +96,23 @@ export async function fakePlatform({
           runId: url.split('/runs/')[1]?.split('/')[0],
           ...JSON.parse(body),
         });
+        return response.end('{}');
+      }
+      if (url.endsWith('/tool-rules')) {
+        // A list, because the real one answers with a list. The catch-all below
+        // answers `{}`, which the daemon then reports as "could not read this
+        // project's tool rules ((rules ?? []).map is not a function)" — a red
+        // herring in the log of every test that spawns anything.
+        return response.end('[]');
+      }
+      if (url.endsWith('/output') && request.method === 'POST') {
+        for (const line of JSON.parse(body).lines ?? []) {
+          outputs.push({ runId: url.split('/runs/')[1]?.split('/')[0], ...line });
+        }
+        return response.end('[]');
+      }
+      if (url.endsWith('/usage') && request.method === 'POST') {
+        usage.push({ runId: url.split('/runs/')[1]?.split('/')[0], ...JSON.parse(body) });
         return response.end('{}');
       }
       if (url.endsWith('/actions/claim') && request.method === 'POST') {
@@ -124,12 +157,53 @@ export async function fakePlatform({
 
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
+  const url = `http://127.0.0.1:${server.address().port}`;
   return {
-    url: `http://127.0.0.1:${server.address().port}`,
+    url,
+    /**
+     * The environment to spawn the daemon with, and it is not `process.env`.
+     *
+     * **`CAWDEV_URL` and `CAWDEV_TOKEN` in the environment beat the config
+     * file** — `readConfig` says so, deliberately, so a container can be
+     * configured without a file. That makes a daemon spawned with the parent's
+     * environment talk to whatever platform the PARENT was pointed at.
+     *
+     * Which is not hypothetical: cawdev is its own first project, so these
+     * tests are usually run by a session that cawdev itself started — and that
+     * session has `CAWDEV_URL` and a real `cawd_` token in its environment. The
+     * whole suite then fails with "That token is not valid", which reads as a
+     * broken daemon and is nothing of the kind.
+     *
+     * So the two are pinned at the fake, here, once, rather than in seven test
+     * files that would each have to remember.
+     */
+    env(extra = {}) {
+      return {
+        ...process.env,
+        CAWDEV_URL: url,
+        CAWDEV_TOKEN: 'cawd_fake',
+        // A run's own scoping, which a spawned session leaves in the
+        // environment of anything it starts. Nothing under test wants it.
+        CAWDEV_PROJECT: undefined,
+        CAWDEV_GRANTABLE: undefined,
+        ...extra,
+      };
+    },
     seen,
     transitions,
     finishedRequests,
     sessionIds,
+    outputs,
+    usage,
+    /** Waits for a transcript line to arrive, or gives up — R76. */
+    async untilSaidOnTheRun(pattern, timeout = 20000) {
+      const deadline = Date.now() + timeout;
+      while (Date.now() < deadline) {
+        if (outputs.some((line) => pattern.test(line.body ?? ''))) return true;
+        await new Promise((wake) => setTimeout(wake, 150));
+      }
+      return false;
+    },
     /** Waits for a session id to be reported, or gives up — R69. */
     async untilSessionId(predicate, timeout = 20000) {
       const deadline = Date.now() + timeout;

@@ -52,7 +52,7 @@ async function daemonWith(t, { workspaces, offers, name }) {
   }));
 
   const daemon = spawn(process.execPath, [DAEMON, '--config', config], {
-    env: { ...process.env, CAWDEV_TOKEN: 'cawd_fake' },
+    env: platform.env(),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let said = '';
@@ -156,7 +156,7 @@ test('a bare path is still one workspace', async (t) => {
   }));
 
   const daemon = spawn(process.execPath, [DAEMON, '--config', config], {
-    env: { ...process.env, CAWDEV_TOKEN: 'cawd_fake' },
+    env: platform.env(),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let said = '';

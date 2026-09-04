@@ -123,7 +123,9 @@ test('a permission request offers three reaches, and each one is a word', () => 
   assert.match(said, /permission/);
   assert.match(said, /mvn -q test/);
   assert.match(said, /y allow once/);
-  assert.match(said, /s allow for this session/);
+  // R78: the middle grant NAMES what it covers, because "for this session" and
+  // "every Bash for this session" are not the same promise.
+  assert.match(said, /s allow Bash\(mvn \*\) this session/);
   assert.match(said, /n refuse/);
   assert.match(said, /Y always allow Bash\(mvn \*\)/);
 });

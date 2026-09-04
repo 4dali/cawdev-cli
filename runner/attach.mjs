@@ -124,36 +124,119 @@ export function questionBanner(asking, width, ink = painter(3)) {
 }
 
 /**
+ * What a key means for a permission request — R51, R60, R78.
+ *
+ * Pure, and returning null for a key that cannot be honoured, because `Y`
+ * cannot always be: `suggestion` is the server's rendering of a rule, and it is
+ * absent for a compound command that no pattern can settle. The caller says so
+ * rather than sending a decision with nothing to write, which the server would
+ * quietly turn into an allow-once.
+ */
+export function permissionDecision(approval, key) {
+  switch (key) {
+    case 'y':
+      return { allow: true, scope: 'ONCE' };
+    case 's':
+      // The whole tool when there is no narrower rule to name — the same two
+      // sizes the console offers, chosen for you because a terminal has one
+      // key. It dies with the run either way.
+      return { allow: true, scope: 'SESSION',
+        pattern: approval.suggestion ?? approval.toolName };
+    case 'Y':
+      return approval.suggestion
+        ? { allow: true, scope: 'PROJECT', pattern: approval.suggestion }
+        : null;
+    default:
+      return null;
+  }
+}
+
+/**
  * A pending permission request, drawn — R51 and R60's three answers.
  *
- * **All three keys have to survive any width, and `n` is the one that would
- * go.** Written at its full length this row is ninety characters; clipped to a
- * forty-column terminal it reads `y allow once   s allow for th`, which offers
- * two of the three answers and hides *refuse* — the one somebody reaches for
- * when they do not like what they are looking at. So the wording shortens
- * before anything is dropped, and the standing rule, the widest clause and the
- * least urgent, is what goes first. Found by rendering this at four widths and
+ * Two rules met here, from two sessions, and they were nearly contradictory.
+ *
+ * **Every key has to survive any width, and `n` is the one that would go.**
+ * Written at its full length this row is ninety characters; clipped to a
+ * forty-column terminal it read `y allow once   s allow for th`, which offers
+ * two answers and hides *refuse* — the one somebody reaches for when they do
+ * not like what they are looking at. Found by rendering it at four widths and
  * reading them, which is the only way this kind of thing is ever found.
+ *
+ * **And a grant is never cut short** (R78). "allow every Bash this s" describes
+ * a promise nobody made, and this is the one banner in the program where the
+ * words are a decision about what a machine may do rather than a status.
+ *
+ * So: the WORDING shortens — a whole phrasing at a time, never mid-clause —
+ * and what will not fit on one row WRAPS onto the next. Nothing is dropped and
+ * nothing is truncated while a shorter honest wording is still available. The
+ * long wording says what `s` covers, because "for this session" and "every
+ * Bash for this session" are not the same promise.
  */
 export function permissionBanner(pending, width, ink = painter(3)) {
   if (!pending) return [];
-  const approval = pending.approval;
+  // Called with a pending record by the client, and with the approval itself by
+  // the rule's own tests — the banner is about the request either way.
+  const approval = pending.approval ?? pending;
+  const covers = approval.suggestion ?? `every ${approval.toolName}`;
 
-  const long = ` ${ink.success('y')} allow once   ${ink.success('s')} allow for this session   `
-    + `${ink.danger('n')} refuse`;
-  const short = ` ${ink.success('y')} once · ${ink.success('s')} session · ${ink.danger('n')} refuse`;
-  const always = approval.suggestion
-    ? `   ${ink.warn('Y')} always allow ${approval.suggestion}`
-    : '';
+  const long = [
+    `${ink.success('y')} allow once`,
+    `${ink.success('s')} allow ${covers} this session`,
+    ...(approval.suggestion
+      ? [`${ink.warn('Y')} always allow ${approval.suggestion} here`]
+      : []),
+    `${ink.danger('n')} refuse`,
+  ];
+  const short = [
+    `${ink.success('y')} once`,
+    `${ink.success('s')} session`,
+    ...(approval.suggestion
+      ? [`${ink.warn('Y')} always allow ${approval.suggestion} here`]
+      : []),
+    `${ink.danger('n')} refuse`,
+  ];
 
-  const keys = [long + always, long, short + always, short]
-    .find((option) => visibleWidth(option) <= width) ?? short;
+  // Two rows is the most a banner may take before it is the screen rather than
+  // a note on it. What gives way, in order: first the wording shortens, and
+  // only then the STANDING RULE goes — the widest clause and the least urgent,
+  // and the only one of the four that can wait for a wider terminal. `n
+  // refuse` never moves, because it is the one somebody reaches for when they
+  // do not like what they are looking at.
+  const without = (choices) => choices.filter((each) => !/\bY\b/.test(stripAnsi(each)));
+  const rows = (choices) => wrapChoices(choices, width);
+  const keys = [long, without(long), short, without(short)]
+    .map(rows)
+    .find((lines) => lines.length <= 2)
+    ?? rows(without(short));
 
   return [
     `${ink.bold(ink.warn(' permission '))} ${clip(approval.summary, Math.max(8, width - 13))}`,
     ink.muted(` ${approval.toolName} · waiting since ${approval.askedAt?.slice(11, 19) ?? ''}`),
-    keys,
+    ...keys,
   ];
+}
+
+/**
+ * The choices across as few rows as fit, wrapping rather than truncating.
+ *
+ * Only a terminal too narrow for one choice on its own reaches the clip at the
+ * end, and there is nothing better than a cut line to give it.
+ */
+function wrapChoices(choices, width, gap = '   ') {
+  const lines = [];
+  let line = '';
+  for (const choice of choices) {
+    const next = line ? `${line}${gap}${choice}` : ` ${choice}`;
+    if (line && visibleWidth(next) > width) {
+      lines.push(line);
+      line = ` ${choice}`;
+    } else {
+      line = next;
+    }
+  }
+  if (line) lines.push(line);
+  return lines.map((each) => clip(each, width));
 }
 
 /**
@@ -868,8 +951,19 @@ class Attached {
         return this.quit();
       case '\r':
       case '\n':
-      case 'i':
+      case 'i': {
+        // R78: a session stopped on a question cannot read a prompt — it is
+        // blocked inside `ask_user`, and the API refuses one. Said here so
+        // nobody types a paragraph first and is told afterwards; `a` is where
+        // those words belong, and the note points at it.
+        const stopped = this.askingOn(this.current());
+        if (stopped) {
+          return this.note(stopped.yours
+            ? 'stopped on a question — press a to answer it, a prompt will not'
+            : `stopped on a question, waiting on ${stopped.waitingOn}`);
+        }
         return this.type('prompt', 'prompt ▸', '');
+      }
       case '/':
         return this.type('command', 'cawdev ▸', '/');
       case 'l':
@@ -892,11 +986,9 @@ class Attached {
         return this.type('answer', 'answer ▸', '');
       }
       case 'y':
-        return void this.decide({ allow: true, scope: 'ONCE' });
       case 's':
-        return void this.decide({ allow: true, scope: 'SESSION' });
       case 'Y':
-        return void this.decide({ allow: true, scope: 'PROJECT' });
+        return void this.allow(key);
       case 'n': {
         if (!this.pendingOn(this.current())) {
           return this.note('nothing is waiting for permission on this one');
@@ -951,7 +1043,7 @@ class Attached {
       }
       return was === 'answer'
         ? void this.answer(text)
-        : void this.decide({ allow: false, reason: text });
+        : void this.decide({ allow: false, reason: text }, 'refused');
     }
     if (key === '\x7f' || key === '\b') {
       this.input = this.input.slice(0, -1);
@@ -1166,13 +1258,39 @@ class Attached {
   }
 
   /**
+   * Allowing it, for how long — R60's three, from a key (R78).
+   *
+   * The scope travels with the decision rather than as a second call, the same
+   * way the console sends it: "allow this and stop asking" is one act, and
+   * splitting it gives you a client that can half-succeed.
+   */
+  async allow(key) {
+    const pending = this.pendingOn(this.current());
+    if (!pending) {
+      return this.note('nothing is waiting for permission on this one');
+    }
+    const decision = permissionDecision(pending.approval, key);
+    if (!decision) {
+      // `Y` on a compound command: the server can write no rule for it, and a
+      // decision with nothing to remember would silently be an allow-once.
+      return this.note(
+        'no project rule can be written for that one — s allows it for this session');
+    }
+    return this.decide(decision, decision.scope === 'PROJECT'
+      ? `allowed, and ${pending.approval.suggestion} is now a project rule`
+      : decision.scope === 'SESSION'
+        ? `allowed ${decision.pattern} for the rest of this run`
+        : 'allowed, once');
+  }
+
+  /**
    * R51's decision, with R60's three reaches.
    *
    * `scope` rather than `remember`: the useful answer was the missing one —
    * somebody unblocking a session at 2am wants neither "ask me again in ninety
    * seconds" nor "decide policy for every agent that ever runs here".
    */
-  async decide({ allow, scope, reason }) {
+  async decide(decision, said) {
     const run = this.current();
     const pending = this.pendingOn(run);
     if (!pending) {
@@ -1185,12 +1303,10 @@ class Attached {
       await this.session.request(
         `/api/projects/${pending.projectSlug}/runs/${pending.runId}` +
           `/approvals/${pending.approval.id}/decision`,
-        { method: 'POST', body: { allow, scope, reason } },
+        { method: 'POST', body: decision },
       );
       this.approvals.delete(run.id);
-      this.note(allow
-        ? { ONCE: 'allowed, once', SESSION: 'allowed for this session', PROJECT: 'allowed, and remembered' }[scope]
-        : 'refused');
+      this.note(said);
     } catch (failure) {
       this.note(failure.message);
     }
@@ -1358,8 +1474,12 @@ class Attached {
     if (this.askingOn(this.current())?.yours) {
       parts.push(`${ink.success('a')} ${ink.muted('answer')}`);
     }
-    if (this.pendingOn(this.current())) {
-      parts.push(`${ink.warn('y/s/n')} ${ink.muted('permission')}`);
+    const pending = this.pendingOn(this.current());
+    if (pending) {
+      // `Y` is offered only when the server has a rule to write; a key that
+      // would be refused is worse than one that is not there.
+      parts.push(`${ink.warn(pending.approval?.suggestion ? 'y/s/Y/n' : 'y/s/n')} `
+        + `${ink.muted('permission')}`);
     }
     parts.push(`${ink.text('x')} ${ink.muted('cancel')}`);
     parts.push(`${ink.text('q')} ${ink.muted(this.options.onQuit ? 'stop' : 'quit')}`);
