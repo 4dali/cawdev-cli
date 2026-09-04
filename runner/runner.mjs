@@ -12,7 +12,9 @@
 // against your working copies; it should be a file you can read first.
 
 import { spawn } from 'node:child_process';
-import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import {
+  access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describeTurn, totalsOf } from '../lib/usage.mjs';
@@ -711,56 +713,79 @@ async function prepareSkillIndex(config, skill, local, run, cwd, baseCommit) {
       + 'by the skill rather than rebuilt.';
   }
 
-  const stamp = await readJson(stampPath);
-  if (await exists(join(kept, 'codegraph.db')) || (stamp && await exists(kept))) {
-    const copied = await copyIndex(kept, inWorkspace, local.volatile);
-    if (copied.ok) {
-      const at = stamp?.commit ? `built at ${short(stamp.commit)}` : 'built earlier';
-      const now = baseCommit && stamp?.commit && stamp.commit !== baseCommit
-        ? ', and the skill will re-parse what has changed since'
-        : '';
-      return `${skill.name}: reusing this repository's index, ${at}${now}. `
-        + 'Nothing was parsed again for this run.';
-    }
-    // Fall through and build. A cache we cannot copy is a cache, not a verdict.
-    log(`  could not reuse the ${skill.key} index: ${copied.said}`);
+  const fromCache = await takeCachedIndex(kept, stampPath, inWorkspace, local, baseCommit);
+  if (fromCache) {
+    return `${skill.name}: ${fromCache}`;
   }
 
   // Nothing to reuse. Build it once, here, and leave it in the cache so the
   // next run in any workspace of this repository gets it for nothing.
   const lock = join(cache, 'building.lock');
   if (!(await claimLock(cache, lock, config.skillPrepareSeconds * 1000))) {
-    return `${skill.name}: another run on this machine is building this repository's index. `
-      + 'This session starts without it and its own tools still work.';
+    // Somebody else got here first. **Wait for them rather than giving up**,
+    // which is the difference between "not parsed twice" and the thing the
+    // entry actually asked for — two runs *sharing* one index. R47 starts
+    // several runs on one repository within milliseconds of each other, so
+    // this is the ordinary case and not the rare one: both check an empty
+    // cache, one wins the lock, and the loser is the run that would otherwise
+    // spend the whole session without the capability it was given.
+    const shared = await waitForIndex(kept, lock, stampPath, inWorkspace, local,
+        config.skillPrepareSeconds * 1000);
+    if (shared) {
+      return `${skill.name}: ${shared}`;
+    }
+    return `${skill.name}: another run on this machine is building this repository's index and `
+      + 'it did not finish in time. This session starts without it and its own tools still work.';
   }
 
+  // **Read the cache again, now that we hold the lock.** The check above and
+  // this one are not the same check: R47 starts several runs on one repository
+  // within milliseconds, so the ordinary sequence is both reading an empty
+  // cache, one building and releasing, and the other then finding the lock free
+  // and building the very thing that is now sitting there. Losing the lock is
+  // the case people think of; this is the case that actually happened, and the
+  // one the entry's last "done when" is about.
+  const nowCached = await takeCachedIndex(kept, stampPath, inWorkspace, local, baseCommit);
+  if (nowCached) {
+    await rm(lock, { force: true });
+    return `${skill.name}: ${nowCached}`;
+  }
+
+  // **The lock is held until the cache is populated, not until the build ends.**
+  // Releasing it between those two was the bug: a waiter saw the lock vanish,
+  // looked in the cache, found nothing yet, and built the very index the other
+  // run was about to deposit. `finally`, so a throw in the deposit cannot leave
+  // the lock behind for `claimLock`'s staleness rule to clear five minutes later.
   const started = Date.now();
-  const built = await runSkillCommand(skill.command, buildArgsFor(skill, local), {
-    cwd,
-    env: { ...process.env, ...(local.env ?? {}) },
-    timeoutMs: config.skillPrepareSeconds * 1000,
-  });
-  await rm(lock, { force: true });
+  try {
+    const built = await runSkillCommand(skill.command, buildArgsFor(skill, local), {
+      cwd,
+      env: { ...process.env, ...(local.env ?? {}) },
+      timeoutMs: config.skillPrepareSeconds * 1000,
+    });
 
-  if (!built.ok) {
-    return `${skill.name}: could not build this repository's index (${built.said}). The session `
-      + 'is running without it — nothing else about the run is affected.';
-  }
+    if (!built.ok) {
+      return `${skill.name}: could not build this repository's index (${built.said}). The session `
+        + 'is running without it — nothing else about the run is affected.';
+    }
 
-  const seconds = Math.round((Date.now() - started) / 1000);
-  const deposited = await copyIndex(inWorkspace, kept, local.volatile);
-  if (deposited.ok) {
-    await writeFile(stampPath, JSON.stringify({
-      commit: baseCommit ?? null,
-      version: skill.version,
-      builtAt: new Date().toISOString(),
-      builtFrom: cwd,
-    }, null, 2)).catch(() => { });
-  } else {
-    log(`  built the ${skill.key} index but could not keep it: ${deposited.said}`);
+    const seconds = Math.round((Date.now() - started) / 1000);
+    const deposited = await copyIndex(inWorkspace, kept, local.volatile);
+    if (deposited.ok) {
+      await writeFile(stampPath, JSON.stringify({
+        commit: baseCommit ?? null,
+        version: skill.version,
+        builtAt: new Date().toISOString(),
+        builtFrom: cwd,
+      }, null, 2)).catch(() => { });
+    } else {
+      log(`  built the ${skill.key} index but could not keep it: ${deposited.said}`);
+    }
+    return `${skill.name}: built this repository's index in ${seconds}s and kept it outside the `
+      + 'workspace, so the next run here does not parse it again.';
+  } finally {
+    await rm(lock, { force: true }).catch(() => { });
   }
-  return `${skill.name}: built this repository's index in ${seconds}s and kept it outside the `
-    + 'workspace, so the next run here does not parse it again.';
 }
 
 /** The row's `serve --mcp` invocation, turned into the one that builds. */
@@ -818,9 +843,24 @@ async function claimLock(directory, lock, staleAfterMs) {
     return true;
   } catch (failure) {
     if (failure.code !== 'EEXIST') return false;
+    // Somebody holds it. Steal it ONLY on proof that it is old.
+    //
+    // The first version read the timestamp out of the file and stole the lock
+    // whenever it could not parse one — and an unparseable read is exactly what
+    // the loser of a close race gets, because the winner's `wx` create is
+    // visible before its contents are. Two runs claiming one repository's index
+    // within a millisecond of each other therefore BOTH won, which is the
+    // ordinary case under R47 rather than a rare one.
+    //
+    // So: unsure means held, the same direction `tool-rules.mjs` fails in. The
+    // file's own mtime is the fallback, because a lock whose contents we cannot
+    // read still has a real age and a crashed run must not hold this forever.
     const held = await readFile(lock, 'utf8').catch(() => '');
-    const at = Date.parse(held.split(' ')[1] ?? '');
-    if (Number.isFinite(at) && Date.now() - at < staleAfterMs) {
+    const said = Date.parse(held.split(' ')[1] ?? '');
+    const at = Number.isFinite(said)
+      ? said
+      : await stat(lock).then((it) => it.mtimeMs).catch(() => Date.now());
+    if (Date.now() - at < staleAfterMs) {
       return false;
     }
     await rm(lock, { force: true });
@@ -828,6 +868,57 @@ async function claimLock(directory, lock, staleAfterMs) {
       .then(() => true)
       .catch(() => false);
   }
+}
+
+/**
+ * Copies a cached index into this workspace, or says there was nothing to take.
+ *
+ * <p>One function because it is asked three times and the answers must agree:
+ * before the build lock, again after winning it, and by `waitForIndex` after
+ * losing it. A cache we cannot copy is a cache, not a verdict — the caller
+ * falls through and builds.
+ */
+async function takeCachedIndex(kept, stampPath, inWorkspace, local, baseCommit) {
+  const stamp = await readJson(stampPath);
+  if (!(await exists(join(kept, 'codegraph.db'))) && !(stamp && await exists(kept))) {
+    return null;
+  }
+  const copied = await copyIndex(kept, inWorkspace, local.volatile);
+  if (!copied.ok) {
+    log(`  could not reuse a cached index: ${copied.said}`);
+    return null;
+  }
+  const at = stamp?.commit ? `built at ${short(stamp.commit)}` : 'built earlier';
+  const since = baseCommit && stamp?.commit && stamp.commit !== baseCommit
+    ? ', and the skill will re-parse what has changed since'
+    : '';
+  return `reusing this repository's index, ${at}${since}. Nothing was parsed again for this run.`;
+}
+
+/**
+ * Waits for whoever holds the build lock, then takes what they built.
+ *
+ * <p>Polling a lock file rather than anything cleverer, because the thing being
+ * waited on is a sibling process on this machine and the wait is bounded by the
+ * same timeout the build itself gets. A build that dies without releasing the
+ * lock is covered by `claimLock`'s staleness rule on the next run rather than
+ * by anything here.
+ *
+ * Returns the sentence for the transcript, or null if the wait ran out — the
+ * caller says the other half. Never throws: a skill that cannot be prepared is
+ * a session without a capability, not a failed run.
+ */
+async function waitForIndex(kept, lock, stampPath, inWorkspace, local, timeoutMs) {
+  const until = Date.now() + timeoutMs;
+  while (Date.now() < until) {
+    await sleep(200);
+    if (await exists(lock)) {
+      continue;
+    }
+    // The lock is gone. Either they finished or they died; the cache says which.
+    return takeCachedIndex(kept, stampPath, inWorkspace, local, null);
+  }
+  return null;
 }
 
 /** A line in this checkout's own ignore list, written once. */
@@ -865,9 +956,8 @@ async function readJson(path) {
  * out loud because "I clicked allow and nothing happened" needs an answer where
  * the person is looking. Neither is a failure.
  */
-async function resolveSkills(config, run, cwd, baseCommit) {
-  const asked = Array.isArray(run.skills) ? run.skills : [];
-  if (!asked.length) {
+async function resolveSkills(config, run, cwd, baseCommit, asked) {
+  if (!Array.isArray(asked) || !asked.length) {
     return { attached: [], notes: [] };
   }
   // A profile that writes no code is offered nothing by the platform, and this
@@ -3104,7 +3194,8 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   // `resolveSkills` also prepares whatever a skill keeps per repository, which
   // for CodeGraph is the index. It never throws and never fails a run: every
   // outcome comes back as a sentence for the transcript.
-  const { attached, notes: skillNotes } = await resolveSkills(config, run, cwd, baseCommit);
+  const { attached, notes: skillNotes } =
+      await resolveSkills(config, run, cwd, baseCommit, skills);
   for (const { skill, local } of attached) {
     mcpServers[skill.serverName] = {
       command: skill.command,

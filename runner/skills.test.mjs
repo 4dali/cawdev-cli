@@ -25,7 +25,7 @@
 
 import assert from 'node:assert/strict';
 import { spawn, execFile } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile, chmod, mkdir } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm, writeFile, chmod, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -215,16 +215,30 @@ async function daemonWith(t, { name, wants, allows, perProject, offers, workspac
   };
 }
 
-/** The MCP config the child was handed, read back out of what it printed. */
-function mcpConfigFrom(said) {
-  const line = said.split('\n').reverse().find((each) => each.includes('MCPCONFIG '));
-  assert.ok(line, `the agent never printed its config:\n${said}`);
-  return JSON.parse(line.slice(line.indexOf('MCPCONFIG ') + 'MCPCONFIG '.length));
+/**
+ * What the child printed, read back off the RUN's transcript.
+ *
+ * Not off the daemon's own log, which is the obvious place and the wrong one:
+ * the daemon routes an agent's stdout into the transcript it streams to the
+ * platform (`linesOf` keeps a non-JSON line verbatim, up to 4000 characters)
+ * and logs only its *stderr*, truncated to 400. An MCP config is longer than
+ * that, so the echo has to be read where the daemon actually puts it.
+ */
+function saidByTheAgent(platform, tag) {
+  const line = [...platform.outputs].reverse()
+    .find((each) => (each.body ?? '').includes(tag + ' '));
+  return line ? line.body.slice(line.body.indexOf(tag + ' ') + tag.length + 1) : null;
 }
 
-function argvFrom(said) {
-  const line = said.split('\n').reverse().find((each) => each.includes('ARGV '));
-  return line ? line.slice(line.indexOf('ARGV ') + 'ARGV '.length) : '';
+/** The MCP config the child was handed, read back out of what it printed. */
+function mcpConfigFrom(platform) {
+  const said = saidByTheAgent(platform, 'MCPCONFIG');
+  assert.ok(said, `the agent never printed its config:\n${JSON.stringify(platform.outputs, null, 2)}`);
+  return JSON.parse(said);
+}
+
+function argvFrom(platform) {
+  return saidByTheAgent(platform, 'ARGV') ?? '';
 }
 
 test('the project asks and the machine allows: the skill is in the session\'s MCP config',
@@ -235,8 +249,8 @@ test('the project asks and the machine allows: the skill is in the session\'s MC
       allows: ['codegraph'],
     });
 
-    assert.ok(await untilSaid(/MCPCONFIG /), said());
-    const config = mcpConfigFrom(said());
+    assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /), said());
+    const config = mcpConfigFrom(platform);
     assert.ok(config.mcpServers.codegraph, `no codegraph server:\n${said()}`);
     // cawdev's own entry survives beside it, and is not the skill's. A skill
     // that could shadow it would intercept the run's own token.
@@ -257,18 +271,18 @@ test('the project asks and the machine allows: the skill is in the session\'s MC
   });
 
 test('availability is not pre-approval: the tools are not in --allowedTools', async (t) => {
-  const { said, untilSaid } = await daemonWith(t, {
+  const { platform, said, untilSaid } = await daemonWith(t, {
     name: 'test-skill-not-granted',
     wants: {},
     allows: ['codegraph'],
   });
 
-  assert.ok(await untilSaid(/ARGV /), said());
+  assert.ok(await platform.untilSaidOnTheRun(/ARGV /), said());
   // The whole point of R51 and R60. Attaching a server makes its tools exist;
   // it must not make them allowed, or nobody is ever asked and the machine's
   // veto is the only check left. The transcript tells the session what to
   // expect instead.
-  assert.doesNotMatch(argvFrom(said()), /mcp__codegraph/);
+  assert.doesNotMatch(argvFrom(platform), /mcp__codegraph/);
 });
 
 test('the project asks and the machine does not: it runs anyway, and says which side',
@@ -279,8 +293,8 @@ test('the project asks and the machine does not: it runs anyway, and says which 
       allows: [],
     });
 
-    assert.ok(await untilSaid(/MCPCONFIG /), said());
-    assert.equal(mcpConfigFrom(said()).mcpServers.codegraph, undefined);
+    assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /), said());
+    assert.equal(mcpConfigFrom(platform).mcpServers.codegraph, undefined);
     // NOT failed. A capability withheld and a broken run are different things.
     assert.deepEqual(platform.transitions.filter((each) => each.state === 'FAILED'), []);
     assert.ok(await platform.untilSaidOnTheRun(/this machine has not allowed it/),
@@ -295,37 +309,37 @@ test('a config that never heard of R76 means no, and keeps meaning it', async (t
   // The upgrade path. Every runner config written before this entry omits the
   // key, and must not start attaching third-party servers because the daemon
   // was updated.
-  const { said, untilSaid } = await daemonWith(t, {
+  const { platform, said, untilSaid } = await daemonWith(t, {
     name: 'test-skill-absent',
     wants: {},
     allows: undefined,
   });
 
-  assert.ok(await untilSaid(/MCPCONFIG /), said());
-  assert.equal(mcpConfigFrom(said()).mcpServers.codegraph, undefined);
+  assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /), said());
+  assert.equal(mcpConfigFrom(platform).mcpServers.codegraph, undefined);
 });
 
 test('a machine that allows it can still refuse one project', async (t) => {
-  const { said, untilSaid } = await daemonWith(t, {
+  const { platform, said, untilSaid } = await daemonWith(t, {
     name: 'test-skill-project-no',
     wants: {},
     allows: ['codegraph'],
     perProject: [],
   });
 
-  assert.ok(await untilSaid(/MCPCONFIG /), said());
-  assert.equal(mcpConfigFrom(said()).mcpServers.codegraph, undefined);
+  assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /), said());
+  assert.equal(mcpConfigFrom(platform).mcpServers.codegraph, undefined);
 });
 
 test('a project that turned nothing on is spawned exactly as before', async (t) => {
-  const { said, untilSaid } = await daemonWith(t, {
+  const { platform, said, untilSaid } = await daemonWith(t, {
     name: 'test-skill-unasked',
     wants: undefined,
     allows: ['codegraph'],
   });
 
-  assert.ok(await untilSaid(/MCPCONFIG /), said());
-  assert.equal(mcpConfigFrom(said()).mcpServers.codegraph, undefined);
+  assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /), said());
+  assert.equal(mcpConfigFrom(platform).mcpServers.codegraph, undefined);
   // And nothing is said about it, because nothing was refused.
   assert.doesNotMatch(said(), /has not allowed it/);
 });
@@ -340,13 +354,13 @@ test('the pin is checked against what was sent, and a disagreement is said out l
       allows: ['codegraph'],
     });
 
-    assert.ok(await untilSaid(/MCPCONFIG /), said());
+    assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /), said());
     assert.ok(await platform.untilSaidOnTheRun(/does not name that version/),
       JSON.stringify(platform.outputs, null, 2));
     // Running what was SENT, not what was claimed: the arguments are what
     // executes, and quietly substituting a version nobody sent would be worse
     // than saying so.
-    assert.ok(mcpConfigFrom(said()).mcpServers.codegraph);
+    assert.ok(mcpConfigFrom(platform).mcpServers.codegraph);
   });
 
 // --- the index, which is the integration work --------------------------------
@@ -387,7 +401,16 @@ test('two runs on one repository parse it once, in two different workspaces', as
   assert.equal(parses.length, 1, `parsed ${parses.length} times:\n${parses.join('\n')}`);
 
   // The second workspace has its own copy of the graph...
-  const second = parses[0] === paths[0] ? paths[1] : paths[0];
+  //
+  // Matched on the REAL path, not the one mkdtemp handed back: on macOS
+  // `/var` is a symlink to `/private/var`, so the indexer's own `process.cwd()`
+  // never string-equals the temp directory this test created. Comparing them
+  // raw silently picks the wrong workspace — and then asserts the *building*
+  // one has no pidfile, which it always does, so the test fails while the
+  // behaviour it is checking is correct.
+  const parsedIn = await realpath(parses[0]);
+  const real = await Promise.all(paths.map((each) => realpath(each)));
+  const second = parsedIn === real[0] ? paths[1] : paths[0];
   await readFile(join(second, '.codegraph', 'codegraph.db'), 'utf8');
   // ...and NOT the other one's daemon pidfile, which is the whole reason this
   // is a copy rather than a symlink: a pidfile from another root points at a
@@ -397,7 +420,7 @@ test('two runs on one repository parse it once, in two different workspaces', as
 });
 
 test('the index is kept out of the checkout\'s own status', async (t) => {
-  const { untilSaid, said, paths } = await daemonWith(t, {
+  const { platform, untilSaid, said, paths } = await daemonWith(t, {
     name: 'test-skill-index-excluded',
     wants: {},
     allows: ['codegraph'],
@@ -422,7 +445,7 @@ test('an index that cannot be built is a sentence, not a failed run', async (t) 
     allows: ['codegraph'],
   });
 
-  assert.ok(await untilSaid(/MCPCONFIG /, 60000), said());
+  assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /, 60000), said());
   assert.ok(await platform.untilSaidOnTheRun(/could not build this repository's index/),
     JSON.stringify(platform.outputs.map((line) => line.body), null, 2));
   assert.deepEqual(platform.transitions.filter((each) => each.state === 'FAILED'), []);
