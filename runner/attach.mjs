@@ -123,18 +123,36 @@ export function questionBanner(asking, width, ink = painter(3)) {
   return [head, ink.muted(clip(whole.length <= width ? whole : who, width))];
 }
 
-/** A pending permission request, drawn — R51 and R60's three answers. */
+/**
+ * A pending permission request, drawn — R51 and R60's three answers.
+ *
+ * **All three keys have to survive any width, and `n` is the one that would
+ * go.** Written at its full length this row is ninety characters; clipped to a
+ * forty-column terminal it reads `y allow once   s allow for th`, which offers
+ * two of the three answers and hides *refuse* — the one somebody reaches for
+ * when they do not like what they are looking at. So the wording shortens
+ * before anything is dropped, and the standing rule, the widest clause and the
+ * least urgent, is what goes first. Found by rendering this at four widths and
+ * reading them, which is the only way this kind of thing is ever found.
+ */
 export function permissionBanner(pending, width, ink = painter(3)) {
   if (!pending) return [];
   const approval = pending.approval;
+
+  const long = ` ${ink.success('y')} allow once   ${ink.success('s')} allow for this session   `
+    + `${ink.danger('n')} refuse`;
+  const short = ` ${ink.success('y')} once · ${ink.success('s')} session · ${ink.danger('n')} refuse`;
   const always = approval.suggestion
     ? `   ${ink.warn('Y')} always allow ${approval.suggestion}`
     : '';
+
+  const keys = [long + always, long, short + always, short]
+    .find((option) => visibleWidth(option) <= width) ?? short;
+
   return [
-    `${ink.bold(ink.warn(' permission '))} ${clip(approval.summary, width - 14)}`,
+    `${ink.bold(ink.warn(' permission '))} ${clip(approval.summary, Math.max(8, width - 13))}`,
     ink.muted(` ${approval.toolName} · waiting since ${approval.askedAt?.slice(11, 19) ?? ''}`),
-    ` ${ink.success('y')} allow once   ${ink.success('s')} allow for this session   `
-      + `${ink.danger('n')} refuse${always}`,
+    keys,
   ];
 }
 
@@ -233,9 +251,16 @@ export function settingsBar(runner, runs, width, ink = painter(3)) {
 export function runLine(run, { chosen, marker, number }, width, ink = painter(3)) {
   const colour = ink[STATE_COLOUR[run.state] ?? 'text'];
   const head = `${chosen ? ink.bold('❯') : ' '}${marker ?? ' '}${ink.muted(number ?? ' ')} `;
-  const name = `${colour(run.label)}`;
-  const where = ink.muted(` ${run.projectSlug} · ${run.state}`);
+  const where = ink.muted(`  ${run.projectSlug} · ${run.state}`);
   const why = run.why ? ink.warn(` — ${run.why}`) : '';
+
+  // **The label is what gets shortened, not the reason.** R58's lesson, in a
+  // second place: whichever half survives the narrowing should be the one that
+  // answers the question, and here the question is "why is that not moving".
+  // A card's title is recognisable from a dozen characters; "no free workspace
+  // in cawdev (2 here, all busy" cut mid-parenthesis answers nothing.
+  const room = width - visibleWidth(head) - visibleWidth(where) - visibleWidth(why);
+  const name = colour(clip(run.label, Math.max(12, room)));
   return clip(`${head}${name}${where}${why}`, width);
 }
 
@@ -281,24 +306,63 @@ export function footerLines(state, width, ink = painter(3)) {
   // it is the honest one.
   const who = email ? ink.text(email) : ink.muted('watching only');
   const link = connected ? '' : `  ${ink.danger('detached')}`;
-  const here = ` ${oneLine(ink)}${ink.enabled ? '' : ' '} ${ink.muted('·')} `
-    + `${ink.bold(runner?.name ?? '…')} ${ink.muted('·')} ${who}${link}`;
-  const now = watching
-    ? `  ${ink.muted('▸')} ${clip(watching.label, Math.max(8, width / 2))} `
-      + ink.muted(`(${watching.projectSlug} · ${watching.state})`)
-    : `  ${ink.muted('▸ no session — L lists what this machine has')}`;
-  lines.push(pad(clip(`${here}${now}`, width), width));
+  const named = `${ink.bold(runner?.name ?? '…')} ${ink.muted('·')} ${who}${link}`;
+  // The mark is the only decoration in the program, so it is the first thing
+  // to go: at forty columns it was costing eight of them and cutting the email
+  // in half, and "who am I acting as" is an answer while a logo is a mood.
+  const withMark = ` ${oneLine(ink)} ${ink.muted('·')} ${named}`;
+  lines.push(pad(clip(
+    visibleWidth(withMark) <= width ? withMark : ` ${named}`,
+    width,
+  ), width));
+
+  // **A row of its own, and the state is what is reserved for.** Sharing the
+  // line above cost the run's state at a hundred columns: a fifty-character
+  // card title used every column the label was given and `(cawdev · running)`
+  // fell off the end — so the footer said which session was being watched and
+  // not whether it was still going, which is the half that changes.
+  //
+  // The height is affordable in a way it never was before R81: the footer no
+  // longer competes with a pane for the screen. Everything it pushes up is in
+  // the scrollback and is still there.
+  lines.push(pad(clip(watching
+    ? runLine(watching, { chosen: false, marker: ink.muted('▸'), number: ' ' }, width, ink)
+    : `  ${ink.muted('▸ nothing being watched — L lists what this machine has')}`,
+    width), width));
 
   // The last row is either what you are typing or what you can press. Never
   // both: a key list under a half-typed prompt is a list of keys that would
   // land in the prompt.
   if (input) {
     lines.push(pad(clip(` ${ink.accent(input.label)} ${input.text}${ink.reverse(' ')}`, width), width));
-  } else if (keys || status) {
-    const said = status ? `  ${ink.warn(status)}` : '';
-    lines.push(pad(clip(` ${keys}${said}`, width), width));
+  } else if (keys.length || status) {
+    lines.push(pad(clip(` ${keyList(keys, status, width - 1, ink)}`, width), width));
   }
   return lines;
+}
+
+/**
+ * The keys, and whatever was just said, in the room there is.
+ *
+ * **Whole keys are dropped rather than a key being cut in half.** At sixty
+ * columns this row ended `x c`, and at forty `y/`, which is not a shorter list
+ * — it is a list with a typo at the end of it. The status goes first, because
+ * it is a sentence about something that already happened; then keys from the
+ * right, where the rarer ones are.
+ */
+export function keyList(keys, status, width, ink = painter(3)) {
+  const parts = Array.isArray(keys) ? [...keys] : [String(keys)];
+  const said = status ? `  ${ink.warn(status)}` : '';
+  const join = (of, tail) => of.join(ink.muted(' · ')) + (of.length < parts.length ? ink.muted(' …') : '') + tail;
+
+  if (visibleWidth(join(parts, said)) <= width) {
+    return join(parts, said);
+  }
+  const shown = [...parts];
+  while (shown.length > 1 && visibleWidth(join(shown, '')) > width) {
+    shown.pop();
+  }
+  return join(shown, '');
 }
 
 function pad(text, width) {
@@ -1202,11 +1266,18 @@ class Attached {
     }
   }
 
-  /** What you can press right now, which is not the same list at all times. */
+  /**
+   * What you can press right now, which is not the same list at all times.
+   *
+   * Ordered by what survives a narrow terminal: {@link keyList} drops from the
+   * right, so the two that are always true come first and the ones that depend
+   * on what a session is doing come after — those already have a banner above
+   * them saying the same thing.
+   */
   keys() {
     const ink = this.ink;
     if (this.mode === 'list') {
-      return ink.muted('↑↓ move · enter open · esc leave');
+      return [ink.muted('↑↓ move'), ink.muted('enter open'), ink.muted('esc leave')];
     }
     const parts = [
       `${ink.text('enter')} ${ink.muted('prompt')}`,
@@ -1221,7 +1292,7 @@ class Attached {
     }
     parts.push(`${ink.text('x')} ${ink.muted('cancel')}`);
     parts.push(`${ink.text('q')} ${ink.muted(this.options.onQuit ? 'stop' : 'quit')}`);
-    return parts.join(ink.muted(' · '));
+    return parts;
   }
 }
 

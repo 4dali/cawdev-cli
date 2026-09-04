@@ -15,7 +15,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { painter, stripAnsi } from '../lib/ansi.mjs';
-import { farewell, footerLines, permissionBanner, questionBanner, runLine } from './attach.mjs';
+import {
+  farewell, footerLines, keyList, permissionBanner, questionBanner, runLine,
+} from './attach.mjs';
 
 const runner = {
   name: 'macbook',
@@ -56,7 +58,7 @@ test('the run being watched is on the footer, because that is what enter prompts
 
 test('with nothing to watch it says what to press rather than showing a gap', () => {
   const said = drawn({ email: 'dali@cawdev.test', watching: null }).join('\n');
-  assert.match(said, /no session/);
+  assert.match(said, /nothing being watched/);
   assert.match(said, /L lists/);
 });
 
@@ -213,4 +215,70 @@ test('a daemon too old to say its pid still gets a sentence that works', () => {
   const said = stripAnsi(farewell({ name: 'macbook' }, [], painter(3)).join('\n'));
   assert.match(said, /macbook/);
   assert.doesNotMatch(said, /kill undefined/);
+});
+
+// --- what goes when there is not enough room ---------------------------------
+
+test('the keys row drops whole keys rather than cutting one in half', () => {
+  // At sixty columns this row used to end `x c`, and at forty `y/`. That is not
+  // a shorter list, it is a list with a typo at the end of it.
+  const keys = ['enter prompt', '/ commands', 'L runs', 'y/s/n permission', 'x cancel', 'q quit'];
+  const narrow = stripAnsi(keyList(keys, '', 40, painter(3)));
+
+  assert.ok(narrow.length <= 40);
+  assert.match(narrow, /…$/, 'and it says that it was cut');
+  for (const key of keys) {
+    // Every key that IS shown is shown whole.
+    const shown = narrow.replace(/ …$/, '').split(' · ');
+    assert.ok(shown.every((each) => keys.includes(each)), narrow);
+  }
+});
+
+test('the status goes before any key does — it is about something already done', () => {
+  const keys = ['enter prompt', '/ commands'];
+  assert.match(stripAnsi(keyList(keys, 'sent', 100, painter(3))), /sent$/);
+  assert.doesNotMatch(stripAnsi(keyList(keys, 'sent', 26, painter(3))), /sent/);
+});
+
+test('at forty columns the mark goes and the email stays', () => {
+  // The mark is the only decoration in the program, so it is the first thing to
+  // go: it was costing eight columns and cutting the email in half, and "who am
+  // I acting as" is an answer while a logo is a mood.
+  const long = { ...runner, name: 'macbook-laptop' };
+  const at = (width) => footerLines(
+    { runner: long, runs, email: 'dali@cawdev.test', watching: runs[0] }, width, painter(3),
+  ).map(stripAnsi).join('\n');
+
+  assert.match(at(100), /●▸/, 'there is room, so the mark is there');
+  assert.doesNotMatch(at(40), /●▸/);
+  assert.match(at(40), /macbook-laptop · dali@cawdev\.test/, 'and both answers fit without it');
+});
+
+test('a queued run keeps its whole reason, and the title is what shortens', () => {
+  const long = {
+    id: 'c', projectSlug: 'cawdev', state: 'queued',
+    label: 'R80 — a card with a title long enough to use every column it is given',
+    why: 'no free workspace in cawdev (2 here, all busy)',
+  };
+  const line = stripAnsi(runLine(long, { chosen: false, number: '2' }, 100, painter(3)));
+  assert.match(line, /no free workspace in cawdev \(2 here, all busy\)$/);
+  assert.ok(line.length <= 100);
+});
+
+test('the three permission keys survive a forty-column terminal', () => {
+  const said = permissionBanner({
+    approval: {
+      id: '1', summary: 'mvn test', toolName: 'Bash',
+      suggestion: 'Bash(mvn *)', askedAt: '2026-09-04T10:11:12Z',
+    },
+  }, 40, painter(3)).map(stripAnsi);
+
+  const keys = said[2];
+  assert.ok(keys.length <= 40, keys);
+  assert.match(keys, /y once/);
+  assert.match(keys, /s session/);
+  // The one that would have gone, and the one somebody reaches for when they do
+  // not like what they are looking at.
+  assert.match(keys, /n refuse/);
+  assert.doesNotMatch(keys, /always allow/, 'the standing rule is what is dropped first');
 });
