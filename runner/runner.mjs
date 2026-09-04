@@ -1679,7 +1679,16 @@ Start by calling the cawdev MCP tool \`task_current\`. It gives you the entry, i
 branch, and everything already said on this run — including, if you are resuming,
 what you said before.
 
-The working method here:
+${run.rejection ? `THIS CARD WAS REVIEWED AND SENT BACK. The work is already on branch
+${run.branch}; a previous session finished on it. ${run.rejection.decidedByEmail ?? 'The reviewer'}
+read it and said:
+
+    ${String(run.rejection.note).split('\n').join('\n    ')}
+
+Fix what is listed. Do not rebuild the card — its text below is the original
+task, for context only. \`task_current\` carries the same note.
+
+` : ''}The working method here:
 
 1. You are already on branch ${run.branch}. Move the entry to CODING naming that
    branch (\`roadmap_set_status\`) before your first commit, if it is not there

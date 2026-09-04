@@ -340,6 +340,7 @@ const TOOLS = [
             'IN_PROGRESS',
             'CODING',
             'REVIEW',
+            'DONE',
             'MERGED',
             'SHIPPED',
             'DECLINED',
@@ -489,6 +490,7 @@ const TOOLS = [
             'IN_PROGRESS',
             'CODING',
             'REVIEW',
+            'DONE',
             'MERGED',
             'SHIPPED',
             'DECLINED',
@@ -561,6 +563,7 @@ const TOOLS = [
             'IN_PROGRESS',
             'CODING',
             'REVIEW',
+            'DONE',
             'MERGED',
             'SHIPPED',
             'DECLINED',
@@ -728,14 +731,33 @@ const TOOLS = [
         `/api/projects/${project}/roadmap/${run.entryNumber}/runs`,
       ).catch(() => []);
 
-      const lines = [
+      const lines = [];
+
+      // R74. A card that was sent back leads with WHY, before the card's own
+      // text — because the card's text is the original specification, and the
+      // only honest reading of it alone is "build this". The instruction is:
+      // fix what is listed; the branch already holds the work.
+      if (entry.rejection) {
+        lines.push(
+          '=== THIS CARD WAS REVIEWED AND SENT BACK. FIX WHAT IS LISTED — DO NOT REBUILD IT ===',
+          `The work is already on branch ${run.branch}. A previous session finished on it, ` +
+            `and ${entry.rejection.decidedByEmail ?? 'the reviewer'} read it and said:`,
+          '',
+          entry.rejection.note,
+          '',
+          'Address that. The card below is the original task, for context only.',
+          '',
+        );
+      }
+
+      lines.push(
         `project: ${project}`,
         `branch:  ${run.branch}`,
         `run:     ${run.state}${run.runnerName ? ` on ${run.runnerName}` : ''}`,
         `started by ${run.startedByEmail}`,
         '',
         formatEntry(entry, { comments }),
-      ];
+      );
 
       // What happened the other times. A session is told the entry and the
       // branch but not that two previous runs on this card failed, which is
