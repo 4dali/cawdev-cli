@@ -1430,24 +1430,92 @@ async function surveyProjectGit(path, { fetch = true } = {}) {
  */
 const BIGGEST_SOURCE_FILE = 400_000;
 
-async function surveyCodeMap(path) {
-  const listed = await git(path, ['ls-files']);
+/**
+ * Every file at a ref, and the text of the ones worth reading — R77.
+ *
+ * <p><strong>Read from the ref, never from the working tree.</strong> The first
+ * version used `git ls-files`, which reads whatever branch the checkout happens
+ * to be sitting on — and R47's survey deliberately picks a *free* workspace,
+ * which is exactly the one left on somebody's abandoned branch. On this machine
+ * that was the difference between a map of 481 files and a map of 474, chosen
+ * at random by which checkout was idle. A map of the wrong branch is worse than
+ * no map: it is confidently wrong about what exists.
+ *
+ * <p>`cat-file --batch` rather than a `git show` per file: four hundred
+ * processes to read four hundred files is a minute of forks for a second of
+ * work.
+ */
+async function readAtRef(path, ref) {
+  const listed = await git(path, ['ls-tree', '-r', '--name-only', ref]);
   const paths = listed.split('\n').map((each) => each.trim()).filter(Boolean);
 
-  const files = [];
-  for (const each of paths) {
-    if (!/\.(java|mjs|js|ts|tsx|jsx)$/.test(each)) {
-      // Still on the map, just not read for imports.
-      files.push({ path: each });
-      continue;
+  const wanted = paths.filter((each) => /\.(java|mjs|js|ts|tsx|jsx)$/.test(each));
+  const texts = await catFileBatch(path, ref, wanted);
+
+  return paths.map((each) => (texts.has(each) ? { path: each, text: texts.get(each) }
+    : { path: each }));
+}
+
+/**
+ * The contents of many blobs, in one process.
+ *
+ * <p>`--batch` answers each request with a header line — `<sha> blob <size>` —
+ * then exactly that many bytes and a newline. Counting BYTES rather than
+ * splitting on newlines is the whole trick: source files contain blank lines,
+ * and a parser that looked for them would tear every file in half.
+ */
+function catFileBatch(cwd, ref, paths) {
+  return new Promise((done) => {
+    const found = new Map();
+    if (!paths.length) {
+      done(found);
+      return;
     }
-    const full = join(path, each);
-    const size = await stat(full).then((it) => it.size).catch(() => Infinity);
-    files.push(size > BIGGEST_SOURCE_FILE
-      ? { path: each }
-      : { path: each, text: await readFile(full, 'utf8').catch(() => '') });
-  }
-  return codeMapOf(files);
+    const child = spawn('git', ['cat-file', '--batch'], { cwd });
+    const chunks = [];
+    child.stdout.on('data', (chunk) => chunks.push(chunk));
+    child.on('error', () => done(found));
+    child.on('close', () => {
+      const all = Buffer.concat(chunks);
+      let at = 0;
+      for (const each of paths) {
+        const newline = all.indexOf(10, at);
+        if (newline === -1) break;
+        const header = all.subarray(at, newline).toString('utf8');
+        at = newline + 1;
+        const parts = header.split(' ');
+        // "<path> missing" for anything the ref does not have. Skipped rather
+        // than guessed: a file that is not at this commit is not on this map.
+        if (parts.length < 3) {
+          continue;
+        }
+        const size = Number(parts[2]);
+        if (!Number.isFinite(size)) break;
+        if (size <= BIGGEST_SOURCE_FILE) {
+          found.set(each, all.subarray(at, at + size).toString('utf8'));
+        }
+        at += size + 1;
+      }
+      done(found);
+    });
+    for (const each of paths) {
+      child.stdin.write(`${ref}:${each}\n`);
+    }
+    child.stdin.end();
+  });
+}
+
+/**
+ * The shape of a repository at its default branch — R77.
+ *
+ * <p>The default branch and not the checkout's own HEAD, because the map is a
+ * fact about the project rather than about somebody's session. That is also
+ * what makes merging need no handling of its own: work becomes part of the map
+ * when it lands on the default branch, which is the moment it becomes part of
+ * the project.
+ */
+async function surveyCodeMap(path, ref) {
+  return codeMapOf(await readAtRef(path, ref));
 }
 
 /**
@@ -1479,21 +1547,73 @@ async function surveyGit(config) {
       body: reading,
     }).catch((failure) => log(`  could not report git for ${slug}: ${failure.message}`));
 
-    // R77's Map. On the same timer and in the same loop, because it answers
-    // about the same checkout at the same moment — reading the files from one
-    // commit and the branches from another would put a map of two repositories
-    // on one page.
-    const map = await surveyCodeMap(path).catch((failure) => {
-      log(`  could not read the code map for ${slug}: ${failure.message.split('\n')[0]}`);
-      return null;
-    });
-    if (map) {
-      await api(config, `/api/runners/${config.runnerId}/git/${slug}/code-map`, {
-        method: 'POST',
-        body: { headSha: reading.headSha ?? null, ...map },
-      }).catch((failure) => log(`  could not report the code map: ${failure.message}`));
+    // R77's Map, of the DEFAULT BRANCH — and only when it has moved.
+    //
+    // The head sha is the whole trigger, and it answers the merge question by
+    // itself: a run's branch changes nothing here, and the moment that work
+    // lands on the default branch the sha moves and the map is read again. No
+    // hook on merging, because "the default branch moved" is the same event
+    // said more honestly.
+    //
+    // Skipping an unchanged sha is not only thrift: re-reading four hundred
+    // files every five minutes to produce identical bytes is how a background
+    // task becomes the thing somebody turns off.
+    await reportCodeMap(config, slug, path, reading.headSha ?? null,
+        reading.defaultBranch ?? 'main');
+  }
+}
+
+/**
+ * Reads and reports the code map, unless it would say the same thing again.
+ *
+ * <p>Remembered per project in this process rather than asked of the platform:
+ * one extra request every five minutes to discover there is nothing to send is
+ * the cost this exists to avoid. A restarted daemon reports once and then
+ * settles, which is the right side to be wrong on.
+ */
+const lastMapped = new Map();
+
+async function reportCodeMap(config, slug, path, headSha, defaultBranch, { force = false } = {}) {
+  if (!force && headSha && lastMapped.get(slug) === headSha) {
+    return;
+  }
+  // `origin/<default>` for preference: it is what everybody else has, and it is
+  // what the checkout may not be on. A repository with no remote falls back to
+  // the local branch, and then to HEAD, so a local experiment still gets a map.
+  const ref = await firstRef(path, [`origin/${defaultBranch}`, defaultBranch, 'HEAD']);
+  if (!ref) {
+    log(`  no ref to map ${slug} from`);
+    return;
+  }
+
+  const map = await surveyCodeMap(path, ref).catch((failure) => {
+    log(`  could not read the code map for ${slug}: ${failure.message.split('\n')[0]}`);
+    return null;
+  });
+  if (!map) {
+    return;
+  }
+  // The sha OF THE REF WE READ, not of whatever the checkout is on — the map
+  // and the commit it claims to be of have to be the same thing.
+  const at = await git(path, ['rev-parse', ref]).catch(() => headSha);
+  await api(config, `/api/runners/${config.runnerId}/git/${slug}/code-map`, {
+    method: 'POST',
+    body: { headSha: at, ...map },
+  }).then(() => {
+    lastMapped.set(slug, at);
+    log(`  mapped ${slug} at ${short(at)}: ${map.files.length} files, ${map.edges.length} imports`);
+  }).catch((failure) => log(`  could not report the code map: ${failure.message}`));
+}
+
+/** The first of these refs this repository actually has. */
+async function firstRef(path, candidates) {
+  for (const ref of candidates) {
+    const found = await git(path, ['rev-parse', '--verify', '--quiet', ref]).catch(() => null);
+    if (found) {
+      return ref;
     }
   }
+  return null;
 }
 
 // --- the prompt --------------------------------------------------------------
@@ -2002,10 +2122,22 @@ async function performWorkspaceRequest(config, request) {
     // The skill's row travels on the request, so this daemon does not have to
     // know what CodeGraph is: the platform says what to run and this runs it,
     // exactly as `resolveSkills` does at spawn.
+    // R77. The map cawdev shows is refreshed FIRST and unconditionally, because
+    // that is what the button in front of the person says it does. The skill's
+    // own index is a separate thing that a session uses, and a project with no
+    // skill turned on must still be able to redraw its map on demand — which is
+    // the answer to "can I update it when I want".
+    const branch = await git(cwd, ['symbolic-ref', '--short', 'HEAD']).catch(() => 'main');
+    await reportCodeMap(config, request.projectSlug, cwd, null, branch, { force: true })
+      .catch((failure) => log(`  could not refresh the map: ${failure.message}`));
+
     const skill = request.skill;
     if (!skill?.key || !skill?.command || !Array.isArray(skill.args)) {
-      await reportWorkspaceRequest(config, request, false,
-        'This request carried no skill this daemon can read, so there was nothing to build.');
+      // Not a failure any more: the map is what was asked for and the map was
+      // built. A project with no skill on has nothing else to do here.
+      await reportWorkspaceRequest(config, request, true,
+        'The map has been refreshed. No skill is turned on for this project, so there was no '
+          + 'index to build beside it.');
       return;
     }
     log(`  building the ${skill.key} index for ${cwd}, as asked`);
