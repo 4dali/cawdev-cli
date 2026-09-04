@@ -84,7 +84,7 @@ test('the daemon registers, offers a socket, and says what it is', async (t) => 
   await rm(socketPathFor(RUNNER), { force: true });
 
   const daemon = spawn(process.execPath, [DAEMON, '--config', config], {
-    env: { ...process.env, CAWDEV_TOKEN: 'cawd_fake' },
+    env: platform.env(),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let said = '';
@@ -129,7 +129,7 @@ test('--attach starts the machine and shows it, in one terminal', async (t) => {
   }));
 
   const both = spawn(process.execPath, [DAEMON, '--config', config, '--attach', '--watch-only'], {
-    env: { ...process.env, CAWDEV_TOKEN: 'cawd_fake' },
+    env: platform.env(),
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let drawn = '';
@@ -182,7 +182,7 @@ test('a claimed run actually spawns', async (t) => {
   }));
 
   const daemon = spawn(process.execPath, [DAEMON, '--config', config], {
-    env: { ...process.env, CAWDEV_TOKEN: 'cawd_fake' },
+    env: platform.env(),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let said = '';
@@ -248,7 +248,7 @@ test('a daemon that stops takes its socket with it', async (t) => {
   }));
 
   const daemon = spawn(process.execPath, [DAEMON, '--config', config], {
-    env: { ...process.env, CAWDEV_TOKEN: 'cawd_fake' },
+    env: platform.env(),
     stdio: 'ignore',
   });
   t.after(async () => {

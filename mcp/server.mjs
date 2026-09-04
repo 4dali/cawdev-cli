@@ -953,7 +953,7 @@ async function decide(config, args) {
         toolName,
         toolInput: JSON.stringify(input),
         summary: summaryOf(toolName, input),
-        suggestion: suggestionFor(toolName, input),
+        suggestion: suggestionFor(toolName, input, { skillServers: skillServers() }),
         toolUseId: args.tool_use_id,
       },
     });
@@ -1040,6 +1040,28 @@ function grantable() {
   try {
     const parsed = JSON.parse(process.env.CAWDEV_GRANTABLE ?? '[]');
     return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Which of this session's MCP servers are skills — R76.
+ *
+ * Put in the environment by the runner, which is the only thing that knows: it
+ * composed the config. Absent means none, which is the safe reading — every
+ * suggestion is then the single tool, which is narrower than a server.
+ *
+ * It changes ONE thing: the pattern offered to the person a stopped session is
+ * waiting on. A project turned CodeGraph on as one capability, so the offer is
+ * `mcp__codegraph` rather than the tool that happened to be called first. It
+ * grants nothing by itself — a person still says yes, and R60's session rule is
+ * what carries it.
+ */
+function skillServers() {
+  try {
+    const parsed = JSON.parse(process.env.CAWDEV_SKILL_SERVERS ?? '[]');
+    return Array.isArray(parsed) ? parsed.filter((each) => typeof each === 'string') : [];
   } catch {
     return [];
   }

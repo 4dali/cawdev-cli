@@ -15,7 +15,7 @@ import { spawn } from 'node:child_process';
 import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { describeTurn } from '../lib/usage.mjs';
+import { describeTurn, totalsOf } from '../lib/usage.mjs';
 import { withinCeiling } from '../lib/tool-rules.mjs';
 import { serveControl } from './control.mjs';
 import { painter } from '../lib/ansi.mjs';
@@ -167,6 +167,52 @@ const DEFAULTS = {
    */
   browser: false,
   /**
+   * Which SKILLS this machine will let a project attach — R76.
+   *
+   * **Empty, and it has to be.** A skill is a third-party MCP server spawned on
+   * this machine, with read access to the checkout it is pointed at. That is the
+   * same class of permission as `browser` above — the operator's own computer —
+   * and it must not be reachable by writing a roadmap card in a project this
+   * machine happens to serve.
+   *
+   * The platform decides what a skill IS and whether a project wants it; this
+   * decides whether it happens here. A run asking for a skill that is not named
+   * here is **not failed** — it runs without it and says which side refused, on
+   * its own transcript, because a capability withheld and a broken run are
+   * different things.
+   *
+   *   "skills": ["codegraph"]
+   *
+   * Overridable per project, like `browser`: a machine that will let one
+   * repository be indexed has not said the same about the other three.
+   *
+   * **This is availability, not permission.** The session's first call to a
+   * skill's tools still stops and asks a person (R51), and the answer that fits
+   * is R60's *allow every `mcp__codegraph` this session*. A machine that wants
+   * it unattended says so in its own `grantable`, where that decision already
+   * lives.
+   */
+  skills: [],
+  /**
+   * Where a skill's shared, per-repository state lives — R76.
+   *
+   * Outside every workspace, and that is the whole point. R47 gives each run a
+   * checkout of its own and R48 will make those copy-on-write clones, so an
+   * index that lived beside the checkout would be re-parsed by every run —
+   * exactly the cost the skill exists to remove, paid once per run instead of
+   * once per repository.
+   */
+  skillCache: null,
+  /**
+   * How long to spend building a skill's index before giving up — R76.
+   *
+   * Bounded because it happens between claiming a run and spawning it, and an
+   * indexer that hangs would otherwise hold a run for ever with nothing said.
+   * Giving up is not a failure: the session starts without the index, which is
+   * what every session did before this existed.
+   */
+  skillPrepareSeconds: 300,
+  /**
    * How often to take what a person has asked of a served checkout — R57.
    *
    * Faster than the heartbeat on purpose: these sit behind a button somebody is
@@ -222,6 +268,17 @@ async function readConfig() {
     grantable: file.grantable ?? DEFAULTS.grantable,
     /** Whether a run here may reach the operator's browser. Per project too. */
     browser: file.browser ?? DEFAULTS.browser,
+    /**
+     * Which skills may be attached here — R76. Per project too.
+     *
+     * A list rather than a boolean, because skills are an open set: `browser`
+     * is one capability and this is "which of them", so the machine's answer
+     * has to name them. Anything not named is refused, which is what makes an
+     * absent key mean no.
+     */
+    skills: normaliseSkills(file.skills ?? DEFAULTS.skills),
+    skillCache: file.skillCache ?? DEFAULTS.skillCache,
+    skillPrepareSeconds: file.skillPrepareSeconds ?? DEFAULTS.skillPrepareSeconds,
   };
 
   if (!config.token) {
@@ -294,10 +351,94 @@ function normaliseProjects(projects) {
       // falls through to the machine's answer; `false` here refuses it for one
       // project on a machine that otherwise allows it.
       browser: settings.browser,
+      // And which skills may be attached for it — R76, in the same shape and
+      // for the same reason. Undefined falls through to the machine's list;
+      // `[]` here refuses every skill for one project on a machine that allows
+      // some. NOT merged with the machine's list: a per-project list is an
+      // answer about this project, and adding to it would mean a project could
+      // only ever widen what the machine said.
+      skills: settings.skills === undefined ? undefined : normaliseSkills(settings.skills),
     };
   }
   return normalised;
 }
+
+/**
+ * A machine's answer to "which skills may be attached here" — R76.
+ *
+ * A list of keys, and anything that is not a list of non-blank strings is a
+ * config nobody can read as an allowlist. It throws rather than being ignored:
+ * a mistyped `"skills": "codegraph"` silently meaning *no skills* is the kind
+ * of failure somebody spends an afternoon on, and a daemon that will not start
+ * says so in one line.
+ */
+function normaliseSkills(skills) {
+  if (!Array.isArray(skills)) {
+    throw new Error(
+      '"skills" is a list of skill keys the machine allows, or absent for none:\n\n' +
+        '  { "skills": ["codegraph"] }',
+    );
+  }
+  return skills
+    .map((key) => (typeof key === 'string' ? key.trim() : ''))
+    .filter(Boolean);
+}
+
+/**
+ * What THIS daemon knows about a skill, beyond what the platform sent — R76.
+ *
+ * Data, not branches. The platform's row says what to spawn; this says the two
+ * things only the machine can know — what environment the command needs here,
+ * and what per-repository state it keeps that ought to be shared between
+ * workspaces. Adding a skill that needs neither is not an entry here at all;
+ * adding one that does is a key, which is the entry's promise: a row and a
+ * config entry rather than a column and an `if`.
+ *
+ * A key that is absent is not an error. It means "spawn it as sent", which is
+ * what most skills will want.
+ */
+const SKILLS_HERE = {
+  codegraph: {
+    /**
+     * The npm package is a thin shim: the real artifact is a per-platform
+     * binary shipped as an `optionalDependency` at the same exact version, and
+     * when npm fails to deliver one the shim DOWNLOADS IT FROM GITHUB RELEASES
+     * at run time. A pinned version whose contents can still arrive over an
+     * unpinned path is not pinned, so that path is off. If the bundle really is
+     * missing, the skill fails to start and the session says so — which is the
+     * honest outcome of a supply-chain decision somebody made on purpose.
+     */
+    env: { CODEGRAPH_NO_DOWNLOAD: '1' },
+    /**
+     * The index it keeps beside the checkout, which is the part that is
+     * genuinely cawdev's problem — R47. `CODEGRAPH_DIR` cannot be pointed
+     * outside the project: the package's own docs say an override that is
+     * absolute or contains a separator is ignored. So the index cannot simply
+     * live in the cache and be read from there.
+     */
+    indexDir: '.codegraph',
+    /**
+     * How to turn the row's "serve" invocation into a "build" one. The row
+     * carries `serve --mcp`, because that is what the CLI spawns; building the
+     * graph is a different subcommand of the same pinned command.
+     */
+    serveArgs: ['serve', '--mcp'],
+    buildArgs: ['init', '--yes'],
+    /**
+     * Files inside the index directory that are about a RUNNING daemon rather
+     * than about the graph — and copying them is the one thing that would make
+     * a shared index dangerous instead of merely useful.
+     *
+     * `daemon.pid` names a live process and the socket it is listening on. A
+     * second workspace whose index directory contained another workspace's
+     * pidfile would connect to THAT daemon, and every answer it gave would be
+     * about a different checkout — a silent wrong answer, which is the one
+     * failure this tool must never have. So the copy leaves them behind and
+     * each run gets its own daemon over its own copy.
+     */
+    volatile: ['daemon.pid', 'daemon.sock', 'daemon.log'],
+  },
+};
 
 // --- talking to cawdev -------------------------------------------------------
 
@@ -439,6 +580,340 @@ async function projectRules(config, slug) {
     log(`  could not read ${slug}'s tool rules (${failure.message}); the session will ask`);
     return [];
   }
+}
+
+// --- skills (R76) ------------------------------------------------------------
+
+/**
+ * Which skills may be attached for this project, on this machine.
+ *
+ * The project's own list wins outright when it has one, rather than adding to
+ * the machine's: a per-project list is an answer about this project, and merging
+ * would mean a project entry could only ever widen what the machine said.
+ */
+function skillsAllowedHere(config, slug) {
+  return config.projects[slug]?.skills ?? config.skills ?? [];
+}
+
+/**
+ * Runs one of a skill's own commands, and never lets it take the daemon down.
+ *
+ * Its own helper rather than `git`'s: this spawns a third-party binary that may
+ * take minutes, so it is bounded, and a failure comes back as a string rather
+ * than a rejection because nothing it can do is worth failing a run over. The
+ * session runs without the skill, which is what every session did before R76.
+ */
+function runSkillCommand(command, args, { cwd, env, timeoutMs }) {
+  return new Promise((done) => {
+    let child;
+    try {
+      child = spawn(command, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (failure) {
+      return done({ ok: false, said: failure.message });
+    }
+    let out = '';
+    let err = '';
+    let timer = setTimeout(() => {
+      // The whole tree: an indexer spawns workers, and killing the parent alone
+      // leaves them chewing through somebody's laptop after we stopped waiting.
+      child.kill('SIGKILL');
+      timer = null;
+      done({ ok: false, said: `gave up after ${Math.round(timeoutMs / 1000)}s` });
+    }, timeoutMs);
+    timer.unref?.();
+
+    child.stdout.on('data', (chunk) => (out += chunk));
+    child.stderr.on('data', (chunk) => (err += chunk));
+    child.on('error', (failure) => {
+      if (!timer) return;
+      clearTimeout(timer);
+      timer = null;
+      done({ ok: false, said: failure.message });
+    });
+    child.on('close', (code) => {
+      if (!timer) return;
+      clearTimeout(timer);
+      timer = null;
+      done(code === 0
+        ? { ok: true, said: out.trim() }
+        : { ok: false, said: err.trim() || out.trim() || `exit ${code}` });
+    });
+  });
+}
+
+/** Whether a path exists, as a boolean rather than an exception. */
+async function exists(path) {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Where a skill's shared per-repository state lives on this machine.
+ *
+ * Keyed by project rather than by workspace, which is the point: R47 gives each
+ * run a checkout of its own and R48 will make those clones, so anything keyed
+ * by checkout is rebuilt per run.
+ */
+function skillCacheFor(config, skill, slug) {
+  const root = config.skillCache
+    ?? join(process.env.HOME ?? tmpdir(), '.cawdev', 'skills');
+  return join(root, skill.key, slug);
+}
+
+/**
+ * Gives a workspace a skill's index without parsing the repository again — R76.
+ *
+ * The shape of this is forced by two facts about CodeGraph, both read out of the
+ * package rather than assumed:
+ *
+ *   - the index directory **cannot** be pointed outside the checkout —
+ *     `CODEGRAPH_DIR` is a single path segment and an absolute one is ignored;
+ *   - the daemon's pidfile and socket live INSIDE that directory, one per
+ *     project root.
+ *
+ * So the obvious move — every workspace symlinking `.codegraph` at one shared
+ * directory — is not untidy, it is wrong: the second workspace's server finds
+ * the first's live daemon in the pidfile and answers questions about the FIRST
+ * workspace's tree. A silent wrong answer, which is the one failure a pre-built
+ * index must never have.
+ *
+ * What is shared is therefore the *build*, not the live index. The cache holds
+ * one index per repository, stamped with the commit it was built at; a run
+ * copies it in, minus anything about a running daemon, and the skill's own
+ * incremental sync brings it forward from that commit. Two runs on one
+ * repository parse it once, and each still has its own daemon over its own copy.
+ *
+ * Nothing here can fail a run. Every path returns a sentence for the transcript
+ * instead.
+ */
+async function prepareSkillIndex(config, skill, local, run, cwd, baseCommit) {
+  const inWorkspace = join(cwd, local.indexDir);
+  const cache = skillCacheFor(config, skill, run.projectSlug);
+  const kept = join(cache, 'index');
+  const stampPath = join(cache, 'index.json');
+
+  // The index is untracked work in somebody's checkout, and two things would
+  // otherwise trip over it: `git status --porcelain`, which is how R46 decides a
+  // tree is dirty and would refuse the NEXT run in this workspace, and R47's
+  // `git clean -fd` between runs, which would delete it. `.git/info/exclude` is
+  // the right place for both — it is per-checkout and local to this machine, so
+  // it does not ask the project to carry a machine's `.gitignore` line.
+  await excludeLocally(cwd, local.indexDir);
+
+  if (await exists(inWorkspace)) {
+    // This workspace already has one. Left alone: it is newer than anything in
+    // the cache by construction, and the skill syncs it itself.
+    return `${skill.name}: this checkout already has an index; it will be brought up to date `
+      + 'by the skill rather than rebuilt.';
+  }
+
+  const stamp = await readJson(stampPath);
+  if (await exists(join(kept, 'codegraph.db')) || (stamp && await exists(kept))) {
+    const copied = await copyIndex(kept, inWorkspace, local.volatile);
+    if (copied.ok) {
+      const at = stamp?.commit ? `built at ${short(stamp.commit)}` : 'built earlier';
+      const now = baseCommit && stamp?.commit && stamp.commit !== baseCommit
+        ? ', and the skill will re-parse what has changed since'
+        : '';
+      return `${skill.name}: reusing this repository's index, ${at}${now}. `
+        + 'Nothing was parsed again for this run.';
+    }
+    // Fall through and build. A cache we cannot copy is a cache, not a verdict.
+    log(`  could not reuse the ${skill.key} index: ${copied.said}`);
+  }
+
+  // Nothing to reuse. Build it once, here, and leave it in the cache so the
+  // next run in any workspace of this repository gets it for nothing.
+  const lock = join(cache, 'building.lock');
+  if (!(await claimLock(cache, lock, config.skillPrepareSeconds * 1000))) {
+    return `${skill.name}: another run on this machine is building this repository's index. `
+      + 'This session starts without it and its own tools still work.';
+  }
+
+  const started = Date.now();
+  const built = await runSkillCommand(skill.command, buildArgsFor(skill, local), {
+    cwd,
+    env: { ...process.env, ...(local.env ?? {}) },
+    timeoutMs: config.skillPrepareSeconds * 1000,
+  });
+  await rm(lock, { force: true });
+
+  if (!built.ok) {
+    return `${skill.name}: could not build this repository's index (${built.said}). The session `
+      + 'is running without it — nothing else about the run is affected.';
+  }
+
+  const seconds = Math.round((Date.now() - started) / 1000);
+  const deposited = await copyIndex(inWorkspace, kept, local.volatile);
+  if (deposited.ok) {
+    await writeFile(stampPath, JSON.stringify({
+      commit: baseCommit ?? null,
+      version: skill.version,
+      builtAt: new Date().toISOString(),
+      builtFrom: cwd,
+    }, null, 2)).catch(() => { });
+  } else {
+    log(`  built the ${skill.key} index but could not keep it: ${deposited.said}`);
+  }
+  return `${skill.name}: built this repository's index in ${seconds}s and kept it outside the `
+    + 'workspace, so the next run here does not parse it again.';
+}
+
+/** The row's `serve --mcp` invocation, turned into the one that builds. */
+function buildArgsFor(skill, local) {
+  const serve = new Set(local.serveArgs ?? []);
+  return [...(skill.args ?? []).filter((arg) => !serve.has(arg)), ...(local.buildArgs ?? [])];
+}
+
+/**
+ * Copies an index directory, leaving behind anything about a running daemon.
+ *
+ * The exclusion is the whole reason this is not `cp -R`. See
+ * `SKILLS_HERE.codegraph.volatile`: a copied pidfile points at another
+ * workspace's daemon, and everything that daemon says is about another
+ * workspace's files.
+ */
+async function copyIndex(from, to, volatile = []) {
+  try {
+    await mkdir(to, { recursive: true });
+    for (const entry of await readdir(from, { withFileTypes: true })) {
+      if (volatile.includes(entry.name)) continue;
+      const source = join(from, entry.name);
+      const target = join(to, entry.name);
+      if (entry.isDirectory()) {
+        const nested = await copyIndex(source, target, volatile);
+        if (!nested.ok) return nested;
+      } else if (entry.isFile()) {
+        await copyFile(source, target);
+      }
+      // Symlinks and sockets are skipped: neither is part of a graph, and
+      // following one out of the cache is how a copy reaches somewhere nobody
+      // meant it to.
+    }
+    return { ok: true };
+  } catch (failure) {
+    return { ok: false, said: failure.message };
+  }
+}
+
+/**
+ * One builder at a time per repository, without a queue.
+ *
+ * Two runs claimed in the same second would otherwise both parse the whole
+ * project — the exact cost this exists to remove, paid twice. The loser does not
+ * wait: waiting would hold a session for minutes on something it can work
+ * without, so it starts without the index and says so.
+ *
+ * A stale lock is taken over rather than respected for ever, because the honest
+ * reading of one older than the whole timeout is "a daemon died mid-build".
+ */
+async function claimLock(directory, lock, staleAfterMs) {
+  await mkdir(directory, { recursive: true }).catch(() => { });
+  try {
+    await writeFile(lock, `${process.pid} ${new Date().toISOString()}\n`, { flag: 'wx' });
+    return true;
+  } catch (failure) {
+    if (failure.code !== 'EEXIST') return false;
+    const held = await readFile(lock, 'utf8').catch(() => '');
+    const at = Date.parse(held.split(' ')[1] ?? '');
+    if (Number.isFinite(at) && Date.now() - at < staleAfterMs) {
+      return false;
+    }
+    await rm(lock, { force: true });
+    return writeFile(lock, `${process.pid} ${new Date().toISOString()}\n`, { flag: 'wx' })
+      .then(() => true)
+      .catch(() => false);
+  }
+}
+
+/** A line in this checkout's own ignore list, written once. */
+async function excludeLocally(cwd, entry) {
+  const path = join(cwd, '.git', 'info', 'exclude');
+  try {
+    const current = await readFile(path, 'utf8').catch(() => '');
+    if (current.split('\n').some((line) => line.trim() === `/${entry}/`)) {
+      return;
+    }
+    await mkdir(join(cwd, '.git', 'info'), { recursive: true });
+    await writeFile(path, `${current}${current.endsWith('\n') || !current ? '' : '\n'}`
+      + `# cawdev R76: a skill's index, kept out of this checkout's status\n/${entry}/\n`);
+  } catch (failure) {
+    // A worktree, a bare repository, a read-only .git — none of it is worth
+    // failing over. The consequence is a dirty-looking checkout, which the
+    // person starting the next run is shown and can decide about.
+    log(`  could not add ${entry} to this checkout's local excludes: ${failure.message}`);
+  }
+}
+
+async function readJson(path) {
+  try {
+    return JSON.parse(await readFile(path, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Which skills this session actually gets, and what to say about the rest.
+ *
+ * Both halves always, which is R61's rule: what was attached is said out loud
+ * because the first call will still stop and ask, and what was refused is said
+ * out loud because "I clicked allow and nothing happened" needs an answer where
+ * the person is looking. Neither is a failure.
+ */
+async function resolveSkills(config, run, cwd, baseCommit) {
+  const asked = Array.isArray(run.skills) ? run.skills : [];
+  if (!asked.length) {
+    return { attached: [], notes: [] };
+  }
+  // A profile that writes no code is offered nothing by the platform, and this
+  // says the same thing again on the machine — for the reason the ceiling is
+  // enforced in two places: a claim from an older platform has never been
+  // through the check at all.
+  if (!writesCodeProfile(run)) {
+    return { attached: [], notes: [] };
+  }
+
+  const allowed = skillsAllowedHere(config, run.projectSlug);
+  const attached = [];
+  const notes = [];
+
+  for (const skill of asked) {
+    if (!skill?.key || !skill?.command || !Array.isArray(skill.args)) {
+      notes.push(`A skill arrived that this daemon cannot read (${JSON.stringify(skill)}). `
+        + 'It has not been attached.');
+      continue;
+    }
+    if (!allowed.includes(skill.key)) {
+      notes.push(`${skill.name ?? skill.key} is on for this project and this machine has not `
+        + `allowed it, so the session is running without it. Add "${skill.key}" to "skills" in `
+        + "the runner's config to permit it. Nothing else about the run is affected.");
+      continue;
+    }
+    // What the platform claims to be running, against what it actually sends.
+    // Two facts, and a disagreement between them is worth saying out loud
+    // rather than resolving quietly in favour of whichever was read second.
+    if (skill.version && !skill.args.some((arg) => String(arg).includes(skill.version))) {
+      notes.push(`${skill.name ?? skill.key} says it is pinned to ${skill.version}, and the `
+        + 'command it sent does not name that version. Running what was sent, and somebody '
+        + 'should look at the skill row.');
+    }
+
+    const local = SKILLS_HERE[skill.key] ?? {};
+    if (local.indexDir) {
+      notes.push(await prepareSkillIndex(config, skill, local, run, cwd, baseCommit));
+    }
+    attached.push({ skill, local });
+    notes.push(`${skill.name ?? skill.key} is available to this session as `
+      + `${skill.toolPrefix ?? `mcp__${skill.serverName}`}. The first call still asks a person — `
+      + `allow ${skill.toolPrefix ?? `mcp__${skill.serverName}`} for the session to cover the `
+      + 'rest.');
+  }
+  return { attached, notes };
 }
 
 // --- git ---------------------------------------------------------------------
@@ -2473,6 +2948,9 @@ async function startRun(config, offered, workspace) {
   let baseCommit;
   // The conversation this run is continuing, when it is continuing one — R69.
   let resume = null;
+  // What this project has turned on — R76. Asked for, never granted: the
+  // machine's own `skills` list decides which of these are attached.
+  let skills = [];
 
   try {
     log(`claiming ${run.projectSlug} ${run.label} on ${run.branch}`);
@@ -2499,6 +2977,14 @@ async function startRun(config, offered, workspace) {
     resume = claimed.resume ?? null;
     if (resume?.agentSessionId) {
       log(`  resuming session ${short(resume.agentSessionId)}`);
+    }
+    // R76. What the project asked for, which is not what it gets: the machine's
+    // answer is given at spawn, and the run's transcript says which side
+    // refused. Said here too, because a log that names what a project wanted is
+    // how its operator finds out a skill is on at all.
+    skills = Array.isArray(claimed.skills) ? claimed.skills : [];
+    if (skills.length) {
+      log(`  the project asks for: ${skills.map((skill) => skill.key).join(', ')}`);
     }
   } catch (failure) {
     // Losing the race is normal when two runners serve one project, and is not
@@ -2539,7 +3025,8 @@ async function startRun(config, offered, workspace) {
       body: { state: 'RUNNING', workspace: workspace ?? null },
     });
 
-    await spawnAgent(config, run, runToken, resolve(path), baseCommit, workspace, resume);
+    await spawnAgent(config, run, runToken, resolve(path), baseCommit, workspace, resume,
+        skills);
   } catch (failure) {
     // Anything that goes wrong before or during the spawn is the run's failure,
     // and the reason belongs on the run where someone will see it.
@@ -2570,7 +3057,7 @@ function writesCodeProfile(run) {
  * `cawdr_` token bound to one run, which expires with it — so the worst a
  * confused or misbehaving session can do is act on the run it was started for.
  */
-async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, resume) {
+async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, resume, skills) {
   // R51: what this machine will let a STORED rule cover. The project's rules
   // are filtered through it before they go anywhere near a spawn, so the
   // platform can narrow what runs here and never widen it.
@@ -2608,6 +3095,29 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   // cawdev's entry is written last, so a project cannot shadow it with a server
   // of the same name and intercept the run's own token.
   const mcpServers = { ...(await projectMcpServers(cwd)) };
+
+  // R76. The skills the project turned on and this machine allows, each as an
+  // MCP server. AFTER the repository's own, so a checkout cannot shadow a skill
+  // with a server of the same name and be spawned in its place — the same
+  // ordering argument that puts cawdev's own entry last, one level down.
+  //
+  // `resolveSkills` also prepares whatever a skill keeps per repository, which
+  // for CodeGraph is the index. It never throws and never fails a run: every
+  // outcome comes back as a sentence for the transcript.
+  const { attached, notes: skillNotes } = await resolveSkills(config, run, cwd, baseCommit);
+  for (const { skill, local } of attached) {
+    mcpServers[skill.serverName] = {
+      command: skill.command,
+      args: skill.args,
+      // The machine's environment for it, plus nothing from the platform. A
+      // skill's stored settings are deliberately NOT spread in here: the row
+      // says what to run and the machine says under what conditions, and a
+      // settings blob that could add environment variables would be a channel
+      // from a database row into a spawned process.
+      env: { ...process.env, ...(local.env ?? {}) },
+    };
+  }
+
   mcpServers.cawdev = {
     command: process.execPath,
     args: [serverPath],
@@ -2618,6 +3128,18 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       // The ceiling travels with the server, so the half that answers
       // permission questions mid-run enforces the same limit the spawn did.
       CAWDEV_GRANTABLE: JSON.stringify(ceiling),
+      // R76. Which of the servers in this config are skills — so that when the
+      // first call to one stops and asks, the pattern offered is the WHOLE
+      // server rather than the one tool.
+      //
+      // A skill is one decision: the project turned CodeGraph on, not
+      // `codegraph_explore`. Being asked twenty-six times about a capability
+      // somebody has already expressed as one thing is how a good permission
+      // model becomes a thing people click through. A server this list does not
+      // name keeps the per-tool suggestion, because nobody declared it as a
+      // capability — see `suggestionFor`.
+      CAWDEV_SKILL_SERVERS: JSON.stringify(
+        attached.map(({ skill }) => skill.toolPrefix ?? `mcp__${skill.serverName}`)),
     },
   };
   await writeFile(mcpConfigPath, JSON.stringify({ mcpServers }, null, 2));
@@ -2782,6 +3304,17 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       transcript.push({ kind: 'SYSTEM', body: line });
     }
 
+    // R76. What was attached, what was refused, and what happened to a skill's
+    // index — on the RUN, for the reason the browser's line is: the session is
+    // about to either use a capability or explain that it could not, and the
+    // reason belongs beside that rather than in a log on somebody's laptop.
+    // Which side refused is in the sentence, because "the project asked and
+    // this machine has not allowed it" and "nobody asked" are different facts.
+    for (const line of skillNotes) {
+      log(`  ${line}`);
+      transcript.push({ kind: 'SYSTEM', body: line });
+    }
+
     // A rule the project granted that this machine will not apply unattended.
     // Said on the RUN, not only in the daemon's log: "I clicked allow and
     // nothing happened" needs an answer where the person is looking, and the
@@ -2792,6 +3325,14 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       log(`  ${line}`);
       transcript.push({ kind: 'SYSTEM', body: line });
     }
+
+    // R76. What this run had already used before this child started. Zero on an
+    // ordinary run; on a resume it is what the earlier session spent, which the
+    // claim carries on the run itself.
+    const usageBase = {
+      tokensIn: Number(run.tokensIn) || 0,
+      tokensOut: Number(run.tokensOut) || 0,
+    };
 
     // stream-json arrives in chunks that split mid-line, so buffer until a
     // newline rather than assuming one chunk is one event.
@@ -2814,6 +3355,24 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
         // the most recent one, not the first.
         if (event?.type === 'system' && event.subtype === 'init' && event.session_id) {
           reportSessionId(config, run, event.session_id);
+        }
+        // R76. What the session has consumed, recorded rather than only
+        // printed. Caught here for the reason the session id is: the CLI says
+        // it on a `result` event and nowhere else.
+        //
+        // The base is what the RUN had already been credited with before this
+        // child existed, because these counters are cumulative per session and
+        // a resumed run (R69) starts a second process counting from zero.
+        // Adding this child's total to that base is the only reading that is
+        // right for both a first run and a resumed one.
+        if (event?.type === 'result') {
+          const totals = totalsOf(event);
+          if (totals) {
+            reportUsage(config, run, {
+              tokensIn: usageBase.tokensIn + totals.input,
+              tokensOut: usageBase.tokensOut + totals.output,
+            });
+          }
         }
         for (const recorded of linesOf(event, line)) {
           transcript.push(recorded);
@@ -2898,6 +3457,21 @@ function reportSessionId(config, run, sessionId) {
   }).catch((failure) => log(`  could not record the session id: ${failure.message}`));
 }
 
+/**
+ * What the session has consumed, sent as an absolute total for the run — R76.
+ *
+ * Fire and forget, like the session id, and for a stronger reason: this is
+ * bookkeeping for a comparison somebody may make later, and a run must never
+ * fail because a number could not be filed. It arrives once per turn, and the
+ * platform keeps the largest reading.
+ */
+function reportUsage(config, run, totals) {
+  api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/usage`, {
+    method: 'POST',
+    body: totals,
+  }).catch((failure) => log(`  could not record what the session used: ${failure.message}`));
+}
+
 async function finish(config, run, state, summary) {
   await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/transition`, {
     method: 'POST',
@@ -2971,6 +3545,12 @@ function capabilities(config) {
     workspaces: Object.fromEntries(
       Object.entries(config.projects).map(([slug, project]) => [slug, project.workspaces.length]),
     ),
+    // Which skills this machine will let a project attach — R76. Said out loud
+    // for the reason the two numbers above are: a project can turn CodeGraph on
+    // and see nothing happen, and the answer is on the machine. A console that
+    // can read this can say which side refused without waiting for a run to
+    // say it in a transcript.
+    skills: config.skills ?? [],
     agent: config.agentCommand,
   });
 }
