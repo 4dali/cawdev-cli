@@ -93,10 +93,13 @@ leaving queued, with the reason each waiting one waits. Arrows move, `enter`
 opens that run — laying its history into the scrollback so you are not staring
 at a blank terminal — and `esc` leaves without changing anything.
 
+A **status line** sits with the footer while something is running: which run, how
+long it has been going, and the key that stops it. It is absent when nothing is.
+
 | Key | |
 |---|---|
 | `enter`, `i` | prompt the session you are watching |
-| `/` | a command — `/help` lists them |
+| `/` | a command — the list filters as you type |
 | `L` | the run list; arrows, `enter` to open, `esc` to leave |
 | `1`–`9` | jump straight to a run |
 | `a` | answer the question it stopped on — if it is yours (R58) |
@@ -105,6 +108,12 @@ at a blank terminal — and `esc` leaves without changing anything.
 | `x`, twice | cancel the session |
 | `g` | print the daemon's own log instead of the transcript |
 | `q` | leave; the runner keeps going |
+| `esc` | close whatever is open, without ending the session |
+| `ctrl+c`, twice | the same, and then leave |
+
+In any list: arrows move, `1`–`9` pick straight away, `enter` chooses, `esc`
+leaves. While typing: `↑`/`↓` walk your history, `tab` completes, and the arrows
+move through the command list while one is open.
 
 | Command | |
 |---|---|
@@ -116,11 +125,54 @@ at a blank terminal — and `esc` leaves without changing anything.
 | `/log` | the daemon's own log, on or off |
 | `/quit` | leave |
 
-Under `NO_COLOR`, through a pipe, or on a dumb terminal it degrades to plain
-text and every state carries a word as well as a colour. Through a pipe there is
-nothing to pin to, so the fixed answers are printed when they change and the
-escape codes are stripped — a log file full of `ESC[32m` is not legible, whatever
-else it is.
+**Typing `/` filters that list as you go**, each row with its description; arrows
+and `enter` pick one and `tab` completes as far as the matches agree. Guessing a
+command name and being told `no such command` is a step, and it is the step this
+removes.
+
+**`↑` recalls what you last sent**, kept in `~/.cawdev/history.json` at mode
+`0600` and keyed by URL like the session beside it — so it survives quitting.
+`/logout` forgets it along with the session.
+
+**A paste stays one line.** Paste four hundred lines and the input shows
+`[pasted, 342 lines]`; all of it is sent. A paste that scrolled the transcript
+away would bury the thing this program exists to keep.
+
+Under `NO_COLOR` it is the same terminal without the colour: the picker still
+moves, and the `❯`, the numbers and the words carry what the colour did — colour
+and cursor are two different questions. Through a pipe or on a dumb terminal
+there is no cursor at all, so a picker becomes a **numbered list read from
+stdin** — type the number, or for a question type the answer itself. The fixed
+answers are printed when they change and the escape codes are stripped; a log
+file full of `ESC[32m` is not legible, whatever else it is.
+
+### Answering is picking, not retyping
+
+The agent has usually already worked out the two or three answers it can act on
+— `ask_user` has carried `options` since R10 — and until R83 this was the one
+surface that threw them away and asked you to retype one of them, spelled
+correctly.
+
+Now a question with options arrives as a list: the question prints into the
+transcript, the options become a live selection, arrows or a digit choose one,
+and that is the answer. A question with no options goes straight to the line, as
+it always did.
+
+**The last row is always "write my own answer"**, and it opens a real line to
+type on with the question still on screen. The options are the agent's *guess* at
+the shape of the decision, and the whole value of asking a person is that they
+can say the thing that was not on the list — so getting there costs one key, and
+`esc` from it comes back to the list rather than abandoning the answer. A chosen
+option and a typed sentence resolve the same question the same way, through the
+same endpoint the inbox and the run page post to: one record, the same
+`answeredBy`, and the badge clears at once.
+
+A permission request is the same widget — R60's lengths of yes as rows, with the
+tool and its arguments printed above them so you are deciding about something you
+can read. The single keys keep working for anybody who has learned them.
+
+R58 is unchanged by any of this: a question that is not yours is shown with the
+name of the person it is waiting on, and no picker is offered.
 
 ### A question on this machine is not necessarily yours
 
@@ -146,9 +198,10 @@ the run page and the home composer cannot disagree about it.
 
 ### Three lengths of yes
 
-A permission request has R60's three answers here as well as in the console.
-`y` is this call; `s` is the rest of this run and no longer; `Y` writes a
-project rule that outlives the session, the person and the reason they said yes.
+A permission request has R60's three answers here as well as in the console, as
+three rows of a list and as three keys. `y` is this call; `s` is the rest of this
+run and no longer; `Y` writes a project rule that outlives the session, the
+person and the reason they said yes. Refusing asks why.
 
 `s` names what it covers — `Bash(mvn *)` when the server could render a rule for
 the command, and `every Bash` when it could not, because those are two different

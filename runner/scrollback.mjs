@@ -40,14 +40,21 @@ export class Scrollback {
    *   with `write` in a test, which is how the arithmetic below is checked
    *   without a terminal.
    */
-  constructor(out = process.stdout, { colour = colourDepth(process.env, out) > 0 } = {}) {
+  constructor(out = process.stdout, {
+    colour = colourDepth(process.env, out) > 0,
+    // A dumb terminal is a TTY that cannot be repainted, and R83 needs to say
+    // so: everything drawn here assumes `ESC[0J` and `ESC[nA` mean something.
+    // Passed in rather than read here so the caller keeps one flag for "can this
+    // be drawn on at all", which is also what decides whether it reads keys.
+    tty = Boolean(out.isTTY) && process.env.TERM !== 'dumb',
+  } = {}) {
     this.out = out;
     this.drawn = 0;
     this.pinned = [];
     // A pipe, a `less`, a CI log. There is no cursor to move and no region to
     // pin, so the live region simply stops existing and the transcript is the
     // whole output — which is the honest degradation, not a lesser one.
-    this.tty = Boolean(out.isTTY);
+    this.tty = tty;
     // **Two flags, because they are two questions.** `tty` is about a cursor;
     // this is about escape codes, and `FORCE_COLOR` is somebody piping into
     // something that does understand them. Where it is off, a committed line is

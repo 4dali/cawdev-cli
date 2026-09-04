@@ -32,20 +32,37 @@
 //   - R62's five settings are in the footer, where they never scroll away,
 //     rather than in a top bar that did.
 //
+// **R83 made answering a thing you pick rather than a thing you retype.** The
+// agent has usually already worked out the two or three answers it can act on —
+// `ask_user` has carried `options` since R10 — and this was the one surface that
+// threw them away. Now a question with options arrives as a list you move
+// through, a permission request is the same list with R60's three lengths of yes
+// in it, and the last row of a question opens a line editor because the options
+// are the agent's guess and the value of asking a person is that they can say
+// the thing that was not on it. See select.mjs for the widget and input.mjs for
+// the line — both pure, both readable without a terminal.
+//
 // Zero dependencies, so this is ANSI escapes and `setRawMode` rather than a
 // curses library.
 
 import { connect } from 'node:net';
 import { listSockets, socketPathFor } from './control.mjs';
-import { clip, painter, stripAnsi, visibleWidth, wrap } from '../lib/ansi.mjs';
+import { clip, keyList, padVisible, painter, stripAnsi, visibleWidth, wrap } from '../lib/ansi.mjs';
 import { oneLine } from './brand.mjs';
 import { Scrollback } from './scrollback.mjs';
 import { Session, signInThroughBrowser, storedSession } from './sign-in.mjs';
 import { clearSession } from './session-store.mjs';
+import { clearHistory, loadHistory, pushHistory } from './history.mjs';
+import {
+  History, KeyStream, Line, Pastes, commonPrefix, completionLines, completions, keysIn,
+} from './input.mjs';
+import { Select, WRITE_MY_OWN, pickFromLine, plainLines } from './select.mjs';
 
 // Re-exported because they were this file's before R81 moved them into the
-// shared ANSI helpers, and the tests that pin the arithmetic import them here.
-export { clip, stripAnsi, visibleWidth, wrap };
+// shared ANSI helpers — and `keysIn` and `keyList` before R83 moved them beside
+// the rest of the input and the rest of the layout. The tests that pin the
+// arithmetic import them here.
+export { clip, keyList, keysIn, stripAnsi, visibleWidth, wrap };
 
 const ESC = '\x1b';
 
@@ -321,7 +338,7 @@ export function settingsBar(runner, runs, width, ink = painter(3)) {
   // No blanket dim over the row: everything in it already carries its own
   // colour, and dimming the lot flattens "full" back into "idle", which is the
   // one distinction this footer exists to make.
-  return pad(clip(line, width), width);
+  return padVisible(clip(line, width), width);
 }
 
 /**
@@ -348,36 +365,36 @@ export function runLine(run, { chosen, marker, number }, width, ink = painter(3)
 }
 
 /**
- * One chunk of stdin, split into the keystrokes it actually contains — R81.
+ * The run being driven right now, as one row — R83.
  *
- * **A `data` event is not a keypress.** It is however many bytes arrived
- * together, and the client used to treat the whole chunk as one key: it
- * compared it against `'\r'`, found `"help\r"`, and appended the lot to the
- * prompt as text. Typing `/help` and pressing enter left `/help` sitting on the
- * line with nothing happening, and the next key landed in it.
+ * **Which run, for how long, and the key that stops it.** A session that has
+ * been going for four minutes and one that has been going for two hours look
+ * identical in a transcript, and "is this thing still working" is the question
+ * somebody is actually asking when they glance at the bottom of the screen.
  *
- * That was survivable while the client was key-driven and a prompt was a rare
- * mode. R81 makes typing the primary way in, so it is not. It shows up whenever
- * bytes coalesce: a paste, a fast typist, a session over ssh, or anything
- * driving the terminal rather than sitting at it — which is how it was found.
- *
- * An escape sequence is ONE key. `ESC[B` is Down, not three characters, and a
- * bare `ESC` is Escape — so a sequence is taken whole when one is there and the
- * escape stands alone when it is not.
+ * Absent when nothing is running, which is why this returns null rather than a
+ * blank row: an empty line that is always there is a line that says nothing, and
+ * the footer is short on rows to spend.
  */
-export function keysIn(chunk) {
-  const keys = [];
-  for (let at = 0; at < chunk.length;) {
-    if (chunk[at] === ESC) {
-      const sequence = /^\x1b(\[[0-9;?]*[a-zA-Z~]|O[A-Z]|.)?/.exec(chunk.slice(at));
-      keys.push(sequence[0]);
-      at += sequence[0].length;
-      continue;
-    }
-    keys.push(chunk[at]);
-    at += 1;
+export function statusLine(run, now, width, ink = painter(3)) {
+  if (!run || (run.state !== 'running' && run.state !== 'claiming')) {
+    return null;
   }
-  return keys;
+  const going = run.startedAt ? elapsed(now - Date.parse(run.startedAt)) : null;
+  const tail = ink.muted(`${going ? ` · ${going}` : ''} · x stops it`);
+  const head = `${ink.success('●')} ${run.state === 'claiming' ? ink.muted('claiming ') : ''}`;
+  const room = Math.max(8, width - visibleWidth(head) - visibleWidth(tail) - 1);
+  return clip(` ${head}${ink.text(clip(run.label ?? 'a session', room))}${tail}`, width);
+}
+
+/** How long, in the shortest form that is still a duration. */
+export function elapsed(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${String(seconds % 60).padStart(2, '0')}s`;
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m`;
 }
 
 /**
@@ -396,6 +413,7 @@ export function footerLines(state, width, ink = painter(3)) {
   const {
     runner, runs = [], email, watching, connected = true,
     banner = [], overlay = [], input = null, keys = '', status = '',
+    running = null, now = Date.now(), matches = [],
   } = state;
 
   const rule = ink.muted('─'.repeat(Math.max(0, width)));
@@ -427,7 +445,7 @@ export function footerLines(state, width, ink = painter(3)) {
   // to go: at forty columns it was costing eight of them and cutting the email
   // in half, and "who am I acting as" is an answer while a logo is a mood.
   const withMark = ` ${oneLine(ink)} ${ink.muted('·')} ${named}`;
-  lines.push(pad(clip(
+  lines.push(padVisible(clip(
     visibleWidth(withMark) <= width ? withMark : ` ${named}`,
     width,
   ), width));
@@ -441,49 +459,36 @@ export function footerLines(state, width, ink = painter(3)) {
   // The height is affordable in a way it never was before R81: the footer no
   // longer competes with a pane for the screen. Everything it pushes up is in
   // the scrollback and is still there.
-  lines.push(pad(clip(watching
+  lines.push(padVisible(clip(watching
     ? runLine(watching, { chosen: false, marker: ink.muted('▸'), number: ' ' }, width, ink)
     : `  ${ink.muted('▸ nothing being watched — L lists what this machine has')}`,
     width), width));
+
+  // R83's status line: what is actually running, and how long it has been. It
+  // is absent rather than blank when nothing is — the row above already says
+  // which run is printing, and this one is only worth its height while there is
+  // a clock ticking behind it.
+  const going = statusLine(running, now, width, ink);
+  if (going) {
+    lines.push(padVisible(going, width));
+  }
+
+  // The commands that still match what is being typed, directly above the line
+  // being typed — R83. Next to it rather than in the overlay at the top,
+  // because a list of what you are halfway through writing belongs beside it.
+  for (const line of completionLines(matches.rows ?? matches, matches.at ?? 0, width, ink)) {
+    lines.push(padVisible(line, width));
+  }
 
   // The last row is either what you are typing or what you can press. Never
   // both: a key list under a half-typed prompt is a list of keys that would
   // land in the prompt.
   if (input) {
-    lines.push(pad(clip(` ${ink.accent(input.label)} ${input.text}${ink.reverse(' ')}`, width), width));
+    lines.push(padVisible(clip(` ${ink.accent(input.label)} ${input.text}`, width), width));
   } else if (keys.length || status) {
-    lines.push(pad(clip(` ${keyList(keys, status, width - 1, ink)}`, width), width));
+    lines.push(padVisible(clip(` ${keyList(keys, status, width - 1, ink)}`, width), width));
   }
   return lines;
-}
-
-/**
- * The keys, and whatever was just said, in the room there is.
- *
- * **Whole keys are dropped rather than a key being cut in half.** At sixty
- * columns this row ended `x c`, and at forty `y/`, which is not a shorter list
- * — it is a list with a typo at the end of it. The status goes first, because
- * it is a sentence about something that already happened; then keys from the
- * right, where the rarer ones are.
- */
-export function keyList(keys, status, width, ink = painter(3)) {
-  const parts = Array.isArray(keys) ? [...keys] : [String(keys)];
-  const said = status ? `  ${ink.warn(status)}` : '';
-  const join = (of, tail) => of.join(ink.muted(' · ')) + (of.length < parts.length ? ink.muted(' …') : '') + tail;
-
-  if (visibleWidth(join(parts, said)) <= width) {
-    return join(parts, said);
-  }
-  const shown = [...parts];
-  while (shown.length > 1 && visibleWidth(join(shown, '')) > width) {
-    shown.pop();
-  }
-  return join(shown, '');
-}
-
-function pad(text, width) {
-  const short = width - visibleWidth(text);
-  return short > 0 ? text + ' '.repeat(short) : text;
 }
 
 // --- the client ---------------------------------------------------------------
@@ -601,13 +606,28 @@ const COMMANDS = [
   ['/quit', 'leave; the runner keeps going'],
 ];
 
-class Attached {
+/**
+ * The client.
+ *
+ * Exported since R83 so the things it DECIDES can be checked without a
+ * terminal: that choosing an option posts the same answer to the same record as
+ * typing one, that a watcher who does not own a question is offered no picker,
+ * that Esc from free text comes back to the list. Those are rules, and R62's
+ * lesson about rules in a renderer is that they can only be tested by looking at
+ * them.
+ */
+export class Attached {
+  /**
+   * @param options `out` is where to draw — `process.stdout` in the real thing,
+   *   anything with `write` in a test, which is the same seam Scrollback takes
+   *   and for the same reason.
+   */
   constructor(socketPath, session, options = {}) {
     this.socketPath = socketPath;
     this.session = session;
     this.options = options;
     this.ink = painter();
-    this.screen = new Scrollback(process.stdout);
+    this.screen = new Scrollback(options.out ?? process.stdout);
 
     this.runner = null;
     this.runs = [];
@@ -624,33 +644,86 @@ class Attached {
     /** runId -> what it is asking, and whose question that is — R58. */
     this.questions = new Map();
 
+    /** 'keys', 'select' or 'typing' — and only ever one of them. */
     this.mode = 'keys';
-    this.input = '';
-    this.inputKind = null;
+    /** The open picker, whatever it is a picker OF. See select.mjs. */
+    this.select = null;
+    /** The line being typed, its label, and where Esc goes back to. */
+    this.input = null;
     this.status = '';
     this.showLog = false;
-    this.listAt = 0;
     this.asked = new Set();
     this.connected = false;
     this.stopped = false;
     this.dirty = false;
     /** Lines waiting to be committed on the next tick. See {@link say}. */
     this.pending = [];
+
+    // R83's input line. The history is loaded from disk in `start`, because a
+    // constructor that awaits is a constructor nobody can call.
+    this.history = new History();
+    this.pastes = new Pastes();
+    this.stdinKeys = new KeyStream();
+    /** Questions and requests already printed, so they are announced once. */
+    this.announced = new Set();
+    /** Ctrl+C, armed. See {@link onInterrupt}. */
+    this.interrupting = false;
+  }
+
+  /**
+   * Whether this terminal can be drawn on at all.
+   *
+   * One flag for two things that are the same question: a stream with no cursor
+   * cannot hold a live region, and it cannot hold a picker either. Where this is
+   * true a picker is a numbered list read from stdin — a plain prompt, not a
+   * broken repaint.
+   *
+   * **Colour is a different question and is deliberately not this one.** R62's
+   * rule and R81's are that `NO_COLOR` is about escape codes, not about the
+   * cursor: somebody who has turned colour off in their shell profile forever
+   * still has arrow keys, and taking the picker away from them would be a worse
+   * terminal for no reason. Under `NO_COLOR` the widget draws in plain text and
+   * the `❯`, the numbers and the words carry what the colour did.
+   */
+  get plain() {
+    return !this.screen.tty;
   }
 
   async start() {
     this.screen.open();
+    this.history = new History(await loadHistory(this.session.url).catch(() => []));
     // Raw mode only where there is a terminal to put in it. Through a pipe
     // there are no keys, the transcript is the whole output, and that is the
     // honest degradation rather than a broken one.
-    if (process.stdin.isTTY) {
+    if (!this.plain && process.stdin.isTTY) {
       process.stdin.setRawMode?.(true);
       process.stdin.resume();
-      // One chunk is however many bytes arrived together, not one keypress.
-      // See {@link keysIn} — this line used to be the bug.
+      // Bracketed paste, which is the only way to tell a pasted newline from
+      // somebody pressing enter. Without it, pasting a paragraph sends the first
+      // line and types the rest into whatever opens next.
+      process.stdout.write(`${ESC}[?2004h`);
+      // One chunk is however many bytes arrived together, not one keypress —
+      // and a paste is not even one chunk. See input.mjs; this line used to be
+      // the bug.
       process.stdin.on('data', (chunk) => {
-        for (const key of keysIn(chunk.toString('utf8'))) {
+        for (const key of this.stdinKeys.push(chunk.toString('utf8'))) {
           this.onKey(key);
+        }
+      });
+    } else if (process.stdin.readable) {
+      // The plain path: no cursor to move, so whole LINES are read. A number
+      // picks from whatever list was printed, and anything else is a prompt, an
+      // answer, or a command — which is what a plain prompt has always meant.
+      process.stdin.setEncoding('utf8');
+      process.stdin.resume();
+      let buffered = '';
+      process.stdin.on('data', (chunk) => {
+        buffered += chunk;
+        let newline;
+        while ((newline = buffered.indexOf('\n')) !== -1) {
+          const line = buffered.slice(0, newline);
+          buffered = buffered.slice(newline + 1);
+          this.onLine(line);
         }
       });
     }
@@ -882,6 +955,7 @@ class Attached {
         this.approvals = new Map(
           (inbox.approvals ?? []).map((item) => [item.runId, item]),
         );
+        this.announce();
         this.dirty = true;
       } catch {
         await new Promise((done) => setTimeout(done, 5000));
@@ -916,6 +990,9 @@ class Attached {
           } else {
             this.questions.delete(run.id);
           }
+          // A run entering WAITING_ON_USER is the moment the question becomes
+          // something to look at, and this poll is where that is noticed.
+          this.announce();
           this.dirty = true;
         } catch {
           // A run this operator cannot read is not an error worth a banner.
@@ -933,11 +1010,23 @@ class Attached {
   // --- keys ------------------------------------------------------------------
 
   onKey(key) {
+    // A paste is one key and never a command: `\r` inside it is a newline
+    // somebody copied, not enter. See input.mjs.
+    if (typeof key === 'object' && key.paste !== undefined) {
+      return this.onPaste(key.paste);
+    }
+    // Ctrl+C is the same key everywhere, and it is answered before anything
+    // else has a chance to interpret it.
+    if (key === '\x03') {
+      return this.onInterrupt();
+    }
+    this.interrupting = false;
+
     if (this.mode === 'typing') {
       return this.onTyping(key);
     }
-    if (this.mode === 'list') {
-      return this.onListKey(key);
+    if (this.mode === 'select') {
+      return this.onSelectKey(key);
     }
     // Any other key means "no". A confirmation that outlives the moment is one
     // somebody answers by accident three keystrokes later.
@@ -947,7 +1036,6 @@ class Attached {
 
     switch (key) {
       case 'q':
-      case '\x03': // Ctrl-C
         return this.quit();
       case '\r':
       case '\n':
@@ -983,7 +1071,7 @@ class Attached {
           return this.note(`waiting on ${asking.waitingOn} — not yours to answer`);
         }
         if (!this.requireSignIn('answer a question')) return undefined;
-        return this.type('answer', 'answer ▸', '');
+        return this.askTheQuestion(asking);
       }
       case 'y':
       case 's':
@@ -1010,128 +1098,520 @@ class Attached {
     }
   }
 
-  type(kind, label, start) {
+  /**
+   * Ctrl+C — once says press again, twice leaves.
+   *
+   * **The first press also closes whatever is open**, which is the difference
+   * between this and Esc: Esc steps back one level, so a free-text answer
+   * returns to the list it came from; Ctrl+C is "stop all of this", and having
+   * pressed it once nobody wants to press it three more times to get out of a
+   * picker they opened by accident.
+   *
+   * R81's rule holds on the way out: the daemon survives, and the goodbye names
+   * it and says how to stop it.
+   */
+  onInterrupt() {
+    const closed = this.closeEverything();
+    if (this.interrupting) {
+      return this.quit();
+    }
+    this.interrupting = true;
+    return this.note(closed
+      ? 'cancelled — ctrl+c again to quit'
+      : 'press ctrl+c again to quit, or q');
+  }
+
+  /** Everything open, closed. Returns whether there was anything. */
+  closeEverything() {
+    const open = this.mode !== 'keys';
+    this.mode = 'keys';
+    this.select = null;
+    this.input = null;
+    this.history.reset();
+    this.dirty = true;
+    return open;
+  }
+
+  /**
+   * A pasted blob, which is one thing however many lines it has — R83.
+   *
+   * It goes into the line being typed, and if it has more than one line it goes
+   * in as a placeholder that SAYS what it is. Four hundred lines of somebody's
+   * stack trace scrolling past would bury the transcript this program exists to
+   * keep, and it is sent in full either way.
+   *
+   * A paste with nothing open opens a prompt, because that is plainly what
+   * somebody pasting into this window meant.
+   */
+  onPaste(text) {
+    if (!text) {
+      return undefined;
+    }
+    if (this.mode !== 'typing') {
+      if (this.mode === 'select') {
+        // A paste is not a choice. Leaving the picker open and dropping it
+        // would look like the terminal ignoring a paste.
+        return this.note('a paste is not a choice — esc first, or pick a row');
+      }
+      this.type('prompt', 'prompt ▸', '');
+      if (this.mode !== 'typing') {
+        return undefined; // Not signed in; `type` has already said so.
+      }
+    }
+    this.input.line.insert(text.includes('\n') ? this.pastes.hold(text) : text);
+    this.dirty = true;
+    return undefined;
+  }
+
+  /**
+   * Open the line editor.
+   *
+   * @param back the picker to return to on Esc. R83's rule: Esc from "write my
+   *   own answer" goes back to the list rather than abandoning the answer, so
+   *   changing your mind about writing prose costs one key and not the question.
+   */
+  type(kind, label, start, back = null) {
     if (kind === 'prompt' && !this.requireSignIn('prompt a session')) {
       return undefined;
     }
     this.mode = 'typing';
-    this.inputKind = kind;
-    this.inputLabel = label;
-    this.input = start;
+    this.select = null;
+    this.input = { kind, label, line: new Line(start), back };
+    this.history.reset();
     return this.note('');
   }
 
-  onTyping(key) {
-    if (key === '\x03' || key === ESC) {
-      this.mode = 'keys';
-      this.input = '';
-      return this.note('cancelled');
+  /** The commands still matching what is typed, and which one is highlighted. */
+  matching() {
+    if (this.mode !== 'typing' || this.input.kind !== 'command') {
+      return { rows: [], at: 0 };
     }
-    if (key === '\r' || key === '\n') {
-      const text = this.input.trim();
-      const was = this.inputKind;
-      this.mode = 'keys';
-      this.input = '';
-      if (!text || text === '/') {
+    const rows = completions(this.input.line.text, COMMANDS);
+    return { rows, at: Math.min(this.input.at ?? 0, Math.max(0, rows.length - 1)) };
+  }
+
+  onTyping(key) {
+    const { line } = this.input;
+    const { rows, at } = this.matching();
+
+    if (key === ESC) {
+      // One level at a time. The completion list first, because it is the
+      // thing most recently in the way; then the line, back to whatever opened
+      // it — which for a free-text answer is the list of options.
+      if (rows.length && this.input.kind === 'command' && this.input.showing !== false) {
+        this.input.showing = false;
         return this.note('');
       }
-      if (was === 'command' || text.startsWith('/')) {
-        return void this.runCommand(text);
+      const back = this.input.back;
+      this.input = null;
+      this.history.reset();
+      if (back) {
+        return this.reopen(back);
       }
-      if (was === 'prompt') {
-        return void this.send(text);
-      }
-      return was === 'answer'
-        ? void this.answer(text)
-        : void this.decide({ allow: false, reason: text }, 'refused');
+      this.mode = 'keys';
+      return this.note('cancelled');
     }
+
+    if (key === '\r' || key === '\n') {
+      // With a completion list open, enter takes the highlighted command —
+      // which is what makes guessing a name stop being a step. With none, it
+      // sends what was typed.
+      if (rows.length && this.input.showing !== false && this.input.kind === 'command') {
+        line.set(rows[at][0]);
+      }
+      return this.submit();
+    }
+
+    if (key === '\t') {
+      if (rows.length) {
+        // As far as they agree, which is what every shell does and nobody has
+        // to be taught. One match completes it whole.
+        line.set(commonPrefix(rows.map(([name]) => name)));
+        this.input.showing = true;
+        this.dirty = true;
+      }
+      return undefined;
+    }
+
+    if (key === `${ESC}[A` || key === `${ESC}OA` || key === '\x10') {
+      if (rows.length && this.input.showing !== false) {
+        this.input.at = (at - 1 + rows.length) % rows.length;
+        this.dirty = true;
+        return undefined;
+      }
+      const older = this.history.back(line.text);
+      if (older !== null) {
+        line.set(older);
+        this.dirty = true;
+      }
+      return undefined;
+    }
+    if (key === `${ESC}[B` || key === `${ESC}OB` || key === '\x0e') {
+      if (rows.length && this.input.showing !== false) {
+        this.input.at = (at + 1) % rows.length;
+        this.dirty = true;
+        return undefined;
+      }
+      const newer = this.history.forward();
+      if (newer !== null) {
+        line.set(newer);
+        this.dirty = true;
+      }
+      return undefined;
+    }
+
     if (key === '\x7f' || key === '\b') {
-      this.input = this.input.slice(0, -1);
+      line.backspace();
+    } else if (key === `${ESC}[3~`) {
+      line.forwardDelete();
+    } else if (key === `${ESC}[D` || key === `${ESC}OD` || key === '\x02') {
+      line.left();
+    } else if (key === `${ESC}[C` || key === `${ESC}OC` || key === '\x06') {
+      line.right();
+    } else if (key === `${ESC}[H` || key === `${ESC}OH` || key === '\x01') {
+      line.home();
+    } else if (key === `${ESC}[F` || key === `${ESC}OF` || key === '\x05') {
+      line.end();
+    } else if (key === '\x15') {
+      line.killToStart();
+    } else if (key === '\x17') {
+      line.killWord();
+    } else if (!key.startsWith(ESC)) {
+      // Printable only: an arrow key inside a prompt should not become "[A".
+      line.insert(key);
+      // Typing again re-opens a completion list Esc closed, because the list is
+      // about what is on the line RIGHT NOW.
+      this.input.showing = true;
+      this.input.at = 0;
+    } else {
+      return undefined;
+    }
+    this.dirty = true;
+    return undefined;
+  }
+
+  /** Enter, on whatever was being typed. */
+  submit() {
+    const typed = this.input.line.text.trim();
+    const kind = this.input.kind;
+    const back = this.input.back;
+    this.input = null;
+    this.mode = 'keys';
+    this.history.reset();
+
+    if (!typed || typed === '/') {
+      // Nothing typed is not an answer, and a question that was open is still
+      // open — so an empty line goes back to it rather than dropping it.
+      return back ? this.reopen(back) : this.note('');
+    }
+    // What was typed, remembered as typed: a placeholder rather than the four
+    // hundred lines behind it.
+    const remembered = this.remember(typed);
+    const text = this.pastes.expand(typed);
+
+    if (kind === 'command' || (kind === 'prompt' && typed.startsWith('/'))) {
+      // After the write, not beside it: `/logout` forgets the history, and a
+      // write still in flight would put the command that cleared it back.
+      return void remembered.then(() => this.runCommand(typed));
+    }
+    if (kind === 'prompt') {
+      return void this.send(text);
+    }
+    return kind === 'answer'
+      ? void this.answer(text)
+      : void this.decide({ allow: false, reason: text }, 'refused');
+  }
+
+  /** Up-arrow's memory, here and next launch — see history.mjs. */
+  async remember(typed) {
+    this.history.add(typed);
+    await pushHistory(this.session.url, typed).catch(() => undefined);
+  }
+
+  // --- the one select widget -------------------------------------------------
+
+  /**
+   * Open a picker, or — where there is no cursor to move — print it and wait
+   * for a line.
+   *
+   * The two paths take the same {@link Select}, which is the point: a numbered
+   * list read from stdin is the same rows in the same order, so there is one
+   * place where "what can be chosen here" is decided.
+   */
+  openPicker(select) {
+    if (this.plain) {
+      this.select = select;
+      for (const line of plainLines(select)) {
+        this.say(line);
+      }
+      return undefined;
+    }
+    this.mode = 'select';
+    this.select = select;
+    this.input = null;
+    return this.note('');
+  }
+
+  /** Back to a picker that was left for the line editor. */
+  reopen(select) {
+    return this.openPicker(select);
+  }
+
+  onSelectKey(key) {
+    const select = this.select;
+    // `q` closes the run list, which is what it did before R83. It is not
+    // offered on a question or a permission request: there `q` could be the
+    // first letter of an answer somebody is about to write.
+    if (key === 'q' && select.kind === 'runs') {
+      this.mode = 'keys';
+      this.select = null;
+      return this.note('');
+    }
+
+    const outcome = select.key(key);
+    if (!outcome) {
+      return undefined;
+    }
+    if (outcome.done === null) {
       this.dirty = true;
       return undefined;
     }
-    // Printable only: an arrow key inside a prompt should not become "[A".
-    if (!key.startsWith(ESC)) {
-      this.input += key;
-      this.dirty = true;
+    if (outcome.done === 'cancelled') {
+      this.mode = 'keys';
+      this.select = null;
+      // Escape leaves without changing anything, which is the promise the key
+      // makes everywhere else.
+      return this.note('');
+    }
+    return this.chose(select, outcome.row);
+  }
+
+  /**
+   * A row was chosen, whichever way it was chosen.
+   *
+   * One place for it, so that a digit, an arrow-and-enter and a number typed at
+   * a plain prompt cannot mean three different things.
+   */
+  chose(select, row, typed = null) {
+    if (!row) {
+      return this.note('');
+    }
+    this.mode = 'keys';
+    this.select = null;
+
+    if (select.kind === 'runs') {
+      this.watch(row.id);
+      return undefined;
+    }
+    if (select.kind === 'question') {
+      if (row.id === WRITE_MY_OWN) {
+        // Free text, with the question still on screen and Esc back to the
+        // list: the options are the agent's guess, and the value of asking a
+        // person is that they can say the thing that was not on it.
+        return typed
+          ? void this.answer(typed)
+          : this.type('answer', 'answer ▸', '', select);
+      }
+      return void this.answer(row.label);
+    }
+    if (select.kind === 'permission') {
+      if (row.id === 'refuse') {
+        return this.type('reason', 'refuse, because ▸', '', select);
+      }
+      return void this.allow(row.id);
     }
     return undefined;
   }
 
-  // --- the run list, as an overlay ------------------------------------------
+  /**
+   * A line typed where there is no cursor — the plain path's whole input.
+   *
+   * A number picks from whatever was printed; anything else is the free text a
+   * question allows, a command, or a prompt. Same rows, same rules, no repaint.
+   */
+  onLine(text) {
+    const typed = String(text).trim();
+    if (this.select) {
+      const picked = pickFromLine(this.select, typed);
+      if (picked) {
+        return this.chose(this.select, picked.row, picked.text ?? null);
+      }
+      if (!this.select.freeText) {
+        for (const line of plainLines(this.select)) {
+          this.say(line);
+        }
+        return undefined;
+      }
+    }
+    if (!typed) {
+      return undefined;
+    }
+    if (typed.startsWith('/')) {
+      return void this.remember(typed).then(() => this.runCommand(typed));
+    }
+    void this.remember(typed);
+    const asking = this.askingOn(this.current());
+    if (asking?.yours) {
+      // A session stopped on a question cannot read a prompt (R78), and the
+      // words somebody typed here are plainly meant for it.
+      return void this.answer(typed);
+    }
+    return void this.send(typed);
+  }
+
+  // --- the three things there are to pick from -------------------------------
 
   /**
    * `L` — every run this machine is driving, claiming or leaving queued.
    *
    * An overlay rather than a rail, because that is the trade R81 reversed: the
    * rail cost thirty columns on every line of every transcript to answer a
-   * question asked a few times an hour.
+   * question asked a few times an hour. Since R83 it is the same widget as the
+   * other two, which is how it stopped being its own key handler.
    */
   openList() {
-    this.mode = 'list';
-    this.listAt = Math.max(0, this.runs.findIndex((run) => run.id === this.watching));
-    return this.note('');
-  }
-
-  onListKey(key) {
-    if (key === ESC || key === 'q' || key === '\x03') {
-      this.mode = 'keys';
-      // Escape leaves without changing anything, which is the promise the key
-      // makes everywhere else.
-      return this.note('');
-    }
-    if (key === '\r' || key === '\n') {
-      const run = this.runs[this.listAt];
-      this.mode = 'keys';
-      if (run) {
-        this.watch(run.id);
-      }
-      return undefined;
-    }
-    if (key === `${ESC}[B` || key === 'j' || key === '\t') {
-      this.listAt = this.runs.length ? (this.listAt + 1) % this.runs.length : 0;
-      this.dirty = true;
-      return undefined;
-    }
-    if (key === `${ESC}[A` || key === 'k') {
-      this.listAt = this.runs.length
-        ? (this.listAt - 1 + this.runs.length) % this.runs.length
-        : 0;
-      this.dirty = true;
-      return undefined;
-    }
-    return undefined;
-  }
-
-  overlayLines(width) {
-    if (this.mode !== 'list') return [];
     const ink = this.ink;
-    const lines = [`${ink.muted(' sessions on this machine')}`];
-    if (!this.runs.length) {
-      lines.push(ink.muted('  nothing running, claiming or queued here'));
-    }
-    // The window walks with the cursor rather than the list scrolling under it:
-    // a machine with twenty runs should still show the one you are on.
-    const room = Math.max(3, Math.min(this.runs.length, Math.floor(this.screen.height / 3)));
-    const from = Math.max(0, Math.min(this.listAt - Math.floor(room / 2), this.runs.length - room));
-    this.runs.slice(from, from + room).forEach((run, offset) => {
-      const at = from + offset;
-      lines.push(runLine(run, {
-        chosen: at === this.listAt,
+    return this.openPicker(new Select({
+      kind: 'runs',
+      title: 'sessions on this machine',
+      empty: 'nothing running, claiming or queued here',
+      at: Math.max(0, this.runs.findIndex((run) => run.id === this.watching)),
+      rows: this.runs.map((run) => ({
+        id: run.id,
+        label: run.label,
         // `!` is a decision waiting; `?` is a question. Different marks because
         // they are answered with different keys, and since R58 the second may
         // not even be yours.
         marker: this.approvals.has(run.id)
           ? ink.warn('!')
           : this.questions.has(run.id) ? ink.accent('?') : ' ',
-        number: at < 9 ? String(at + 1) : ' ',
-      }, width, ink));
-    });
-    if (this.runs.length > room) {
-      lines.push(ink.muted(`  … ${this.runs.length - room} more`));
+        // A run brings its own renderer: `runLine` narrows the LABEL and keeps
+        // the reason a queued run is queued, which is not a rule a generic row
+        // could guess.
+        render: (opts, width, painted) => runLine(run, opts, width, painted),
+      })),
+    }));
+  }
+
+  /**
+   * The question this session stopped on, as something to pick from — R83.
+   *
+   * With no options there is nothing to pick, so it goes straight to the line
+   * editor, which is what it has always done.
+   */
+  askTheQuestion(asking) {
+    const options = asking.question.options ?? [];
+    if (!options.length) {
+      return this.type('answer', 'answer ▸', '');
     }
-    lines.push(ink.muted('  ↑↓ move · enter open · esc leave'));
-    return lines;
+    return this.openPicker(new Select({
+      kind: 'question',
+      title: clip(asking.question.question, Math.max(20, this.screen.width - 2)),
+      rows: [
+        ...options.map((option) => ({ id: option, label: option })),
+        // Always last, and always there.
+        { id: WRITE_MY_OWN, label: 'Write my own answer', hint: 'opens a line to type on' },
+      ],
+    }));
+  }
+
+  /**
+   * A permission request, as R60's lengths of yes — R83.
+   *
+   * The tool and its arguments are PRINTED above the rows, not clipped into
+   * them: you are deciding about something you can read, which is the whole
+   * reason R51 records the call rather than the tool's name.
+   */
+  askPermission(pending) {
+    const approval = pending.approval;
+    const covers = approval.suggestion ?? `every ${approval.toolName}`;
+    return this.openPicker(new Select({
+      kind: 'permission',
+      // The call, on the title, as well as printed in full above: the picker
+      // may still be on screen when the transcript under it has moved on.
+      title: `${approval.toolName} · ${approval.summary}`,
+      rows: [
+        { id: 'y', label: 'Allow once', hint: 'this call and no more' },
+        // R78: the middle grant NAMES what it covers, and it says so in the
+        // short wording too — "for this run" and "every Bash for this run" are
+        // not the same promise, and a row that shortened to the first would be
+        // describing one nobody made.
+        {
+          id: 's',
+          label: `Allow ${covers} for the rest of this run`,
+          short: `Allow ${covers} this run`,
+          hint: 'dies with the session',
+        },
+        ...(approval.suggestion
+          ? [{
+            id: 'Y',
+            label: `Always allow ${approval.suggestion} here`,
+            short: `Always ${approval.suggestion}`,
+            hint: 'a project rule',
+          }]
+          : []),
+        { id: 'refuse', label: 'Refuse', hint: 'and say why' },
+      ],
+    }));
+  }
+
+  /**
+   * What a session is stopped on, said once, when it starts being stopped on it.
+   *
+   * **Printed into the transcript and then offered as a list.** The text goes
+   * into the scrollback because it is what happened and it should still be there
+   * when you scroll back to it; the choice goes into the live region because it
+   * is what is happening now. A question that scrolls away leaves a picker
+   * asking about nothing.
+   *
+   * Nothing opens over something somebody is already doing: with a picker or a
+   * half-written prompt on screen the banner and its key are enough, and taking
+   * the keyboard away mid-sentence is how a client loses somebody's paragraph.
+   */
+  announce() {
+    const run = this.current();
+    if (!run) return;
+
+    const pending = this.pendingOn(run);
+    if (pending && !this.announced.has(pending.approval.id)) {
+      this.announced.add(pending.approval.id);
+      const ink = this.ink;
+      this.say('');
+      this.say(`${ink.bold(ink.warn(' permission '))} ${ink.text(pending.approval.toolName)}`);
+      // Not clipped: this is the thing being decided about, and a command cut
+      // at the width is a command you have not read.
+      this.say(`  ${ink.text(pending.approval.summary)}`);
+      if (this.mode === 'keys') {
+        this.askPermission(pending);
+      }
+      return;
+    }
+
+    const asking = this.askingOn(run);
+    if (!asking || this.announced.has(asking.question.id)) {
+      return;
+    }
+    this.announced.add(asking.question.id);
+    const ink = this.ink;
+    this.say('');
+    this.say(`${ink.bold(ink.accent(' question '))} ${ink.text(asking.question.question)}`);
+    // R58: a watcher who does not own the question is told whose it is and is
+    // offered nothing. A picker here would take an answer the platform then
+    // refuses, which reads as cawdev being broken.
+    if (!asking.yours) {
+      this.say(`  ${ink.muted(`waiting on ${asking.waitingOn ?? 'somebody else'}`)}`);
+      return;
+    }
+    if (this.mode === 'keys' && this.session.signedIn && asking.question.options?.length) {
+      this.askTheQuestion(asking);
+    }
+  }
+
+  overlayLines(width) {
+    if (this.mode !== 'select' || !this.select) return [];
+    // A third of the window, so a long list never becomes the screen. The
+    // transcript underneath is what this program is for.
+    return this.select.lines(width, this.ink, Math.max(3, Math.floor(this.screen.height / 3)));
   }
 
   requireSignIn(what) {
@@ -1161,6 +1641,8 @@ class Attached {
         this.say(this.ink.bold(' keys'));
         this.say(this.ink.muted('   enter prompt · / command · L runs · 1-9 pick a run'));
         this.say(this.ink.muted('   a answer · y/s/Y/n permission · x cancel · g log · q quit'));
+        this.say(this.ink.muted('   in a list: ↑↓ move · 1-9 pick · enter choose · esc leave'));
+        this.say(this.ink.muted('   while typing: ↑↓ history · tab complete · esc back · ctrl+c twice quits'));
         this.say('');
         return this.note('');
       case 'login':
@@ -1168,6 +1650,11 @@ class Attached {
       case 'logout':
         await this.session.signOut();
         await clearSession(this.session.url);
+        // The history goes with it. It is what this person typed, and "forget
+        // the stored session on this machine" would be a strange promise to
+        // keep half of.
+        await clearHistory(this.session.url).catch(() => undefined);
+        this.history = new History();
         return this.note('signed out — /login to sign in again');
       case 'runs':
         return this.openList();
@@ -1372,6 +1859,11 @@ class Attached {
       this.pending = [];
     }
     this.screen.close();
+    if (!this.plain && process.stdin.isTTY) {
+      // Bracketed paste is the terminal's mode, not ours, and leaving it on
+      // would put `ESC[200~` into the shell somebody pastes into next.
+      process.stdout.write(`${ESC}[?2004l`);
+    }
     process.stdin.setRawMode?.(false);
 
     if (!this.options.onQuit) {
@@ -1422,10 +1914,23 @@ class Attached {
       email: this.session.email,
       watching: run,
       connected: this.connected,
+      // R83's status line is about what this machine is DRIVING, which is not
+      // always what you are watching: a queued run prints nothing and has no
+      // clock, and the answer to "is anything still going" should not depend on
+      // which row you last opened.
+      running: run?.state === 'running' || run?.state === 'claiming'
+        ? run
+        : this.runs.find((each) => each.state === 'running') ?? null,
       // A permission request wins when there is one: it is the narrower thing
       // and the one with three keys behind it. Otherwise a question — and
       // since R58 that banner has two shapes.
-      banner: pending
+      //
+      // **Unless its own picker is open**, in which case the banner is the same
+      // choice written twice, one row above itself: three keys under a list of
+      // the same three. At forty columns that was six rows of footer over a
+      // transcript this program exists to show. The picker's title carries the
+      // call, and the whole of it was printed above.
+      banner: this.select && this.select.kind !== 'runs' ? [] : pending
         ? permissionBanner(pending, width, this.ink)
         : questionBanner(this.askingOn(run), width, this.ink),
     };
@@ -1434,7 +1939,15 @@ class Attached {
       return footerLines({
         ...state,
         overlay: this.overlayLines(width),
-        input: this.mode === 'typing' ? { label: this.inputLabel, text: this.input } : null,
+        matches: this.input?.showing === false ? { rows: [], at: 0 } : this.matching(),
+        input: this.mode === 'typing' ? {
+          label: this.input.label,
+          // The width the line has left, so the caret stays on screen when the
+          // text is longer than the terminal — see Line.window.
+          text: this.input.line.render(
+            Math.max(8, width - visibleWidth(this.input.label) - 3), this.ink,
+          ),
+        } : null,
         keys: this.keys(),
         status: this.status,
       }, width, this.ink);
@@ -1463,8 +1976,10 @@ class Attached {
    */
   keys() {
     const ink = this.ink;
-    if (this.mode === 'list') {
-      return [ink.muted('↑↓ move'), ink.muted('enter open'), ink.muted('esc leave')];
+    if (this.mode === 'select') {
+      // The widget draws its own key row, so this one would be a second copy of
+      // it under the first.
+      return [];
     }
     const parts = [
       `${ink.text('enter')} ${ink.muted('prompt')}`,
