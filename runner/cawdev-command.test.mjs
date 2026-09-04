@@ -15,12 +15,12 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
-import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fakePlatform } from './test-platform.mjs';
-import { findConfig } from './cawdev.mjs';
+import { findConfig, isTheCommand } from './cawdev.mjs';
 
 const CAWDEV = new URL('./cawdev.mjs', import.meta.url).pathname;
 
@@ -228,4 +228,40 @@ test('no config anywhere is not an error here — the daemon decides that', asyn
   t.after(() => rm(empty, { recursive: true, force: true }));
 
   assert.equal(await findConfig([], { HOME: empty }, empty), null);
+});
+
+// --- installed, it has to actually run -----------------------------------------
+
+test('the command runs when it is reached through the symlink npm installs', async (t) => {
+  // The defect this pins: `npm i -g` installs a bin as a LINK, so argv[1] is
+  // `…/bin/cawdev` and import.meta.url is its target. Comparing the two
+  // lexically is never equal — `main()` never ran, and the installed command
+  // exited 0 having printed nothing at all. Every test and every hand check
+  // had typed the path, which is the one way it worked.
+  const home = await mkdtemp(join(tmpdir(), 'cawdev-bin-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const link = join(home, 'cawdev');
+  await symlink(CAWDEV, link);
+
+  const said = await new Promise((done) => {
+    const child = spawn(process.execPath, [link, '--help'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    child.stdout.on('data', (chunk) => { out += chunk; });
+    child.on('exit', () => done(out));
+  });
+
+  assert.match(said, /cawdev --url/, 'the link ran the command, not nothing at all');
+});
+
+test('the rule itself: a link and its target are the same file', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'cawdev-link-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const link = join(home, 'cawdev');
+  await symlink(CAWDEV, link);
+
+  const url = new URL('./cawdev.mjs', import.meta.url).href;
+  assert.equal(isTheCommand(link, url), true, 'through the link');
+  assert.equal(isTheCommand(CAWDEV, url), true, 'named directly');
+  assert.equal(isTheCommand(join(home, 'something-else'), url), false);
+  assert.equal(isTheCommand(undefined, url), false, 'imported, not run');
 });

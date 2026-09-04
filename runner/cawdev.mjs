@@ -18,9 +18,11 @@
 // Zero dependencies, like everything in tools/.
 
 import { spawn } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { access, mkdir, open, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { attach, urlFrom, valueOf } from './attach.mjs';
 import { liveSockets, probeSocket, socketPathFor } from './control.mjs';
 import { painter } from '../lib/ansi.mjs';
@@ -199,9 +201,42 @@ async function main() {
   await attach(argv, { socketPath });
 }
 
+/**
+ * Is this file the command being run, rather than a module somebody imported?
+ *
+ * **Through the SYMLINK, and that is the whole point.** `npm i -g` installs a
+ * bin as a link — `…/bin/cawdev` → `…/lib/node_modules/cawdev/runner/cawdev.mjs`
+ * — so `process.argv[1]` is the link and `import.meta.url` is its target. A
+ * lexical comparison of the two is never equal, `main()` never ran, and the
+ * installed command exited 0 having printed nothing. It worked only when the
+ * file was named directly, which is how it passed every test and every hand
+ * check: those all typed the path.
+ *
+ * So both sides are resolved through the filesystem, which is what makes a
+ * link and its target the same file. `fileURLToPath` rather than
+ * `URL.pathname`, because a path containing a space arrives percent-encoded
+ * and would miss for a second reason.
+ *
+ * Pure enough to test: give it the two strings and it answers.
+ */
+export function isTheCommand(argv1, moduleUrl) {
+  if (!argv1) return false;
+  const real = (path) => {
+    try {
+      return realpathSync(path);
+    } catch {
+      // A path that is not there cannot be this file; the lexical form is
+      // still worth comparing, since that is the case where both are absent
+      // from disk (a bundler, a test harness) and equality still means yes.
+      return resolve(path);
+    }
+  };
+  return real(argv1) === real(fileURLToPath(moduleUrl));
+}
+
 // Only when this file IS the command. Its helpers are imported by the tests,
 // and a module that starts a daemon on import is one nothing can test.
-if (process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname)) {
+if (isTheCommand(process.argv[1], import.meta.url)) {
   main().catch((failure) => {
     console.error(`\n  ${failure.message}\n`);
     process.exit(1);
