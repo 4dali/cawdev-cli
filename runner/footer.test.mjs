@@ -16,7 +16,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { painter, stripAnsi } from '../lib/ansi.mjs';
 import {
-  farewell, footerLines, keyList, permissionBanner, questionBanner, runLine,
+  farewell, footerLines, keyList, keysIn, permissionBanner, questionBanner, runLine,
 } from './attach.mjs';
 
 const runner = {
@@ -281,4 +281,31 @@ test('the three permission keys survive a forty-column terminal', () => {
   // not like what they are looking at.
   assert.match(keys, /n refuse/);
   assert.doesNotMatch(keys, /always allow/, 'the standing rule is what is dropped first');
+});
+
+// --- one chunk is not one keypress -------------------------------------------
+
+test('a chunk of stdin is split into the keystrokes it actually contains', () => {
+  // The bug a real terminal found: `help\r` arrives as ONE data event, the
+  // whole string was compared against '\r', and `/help` sat on the prompt line
+  // with nothing happening while the next key landed in it.
+  assert.deepEqual(keysIn('help\r'), ['h', 'e', 'l', 'p', '\r']);
+  assert.deepEqual(keysIn('q'), ['q']);
+  assert.deepEqual(keysIn(''), []);
+});
+
+test('an escape sequence is one key, and a bare escape is Escape', () => {
+  // `ESC[B` is Down, not three characters. Splitting it would move the cursor
+  // and then type `[B` into whatever was open.
+  assert.deepEqual(keysIn('\x1b[B'), ['\x1b[B']);
+  assert.deepEqual(keysIn('\x1b[5~'), ['\x1b[5~']);
+  assert.deepEqual(keysIn('\x1bOA'), ['\x1bOA']);
+  assert.deepEqual(keysIn('\x1b'), ['\x1b']);
+  assert.deepEqual(keysIn('\x1b[Bx'), ['\x1b[B', 'x']);
+});
+
+test('a paste is characters, not one enormous key', () => {
+  const pasted = 'fix the thing\nand the other';
+  assert.equal(keysIn(pasted).length, pasted.length);
+  assert.equal(keysIn(pasted).join(''), pasted);
 });

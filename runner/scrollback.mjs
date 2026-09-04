@@ -73,20 +73,32 @@ export class Scrollback {
   }
 
   /**
-   * Commit lines to the scrollback, above the live region.
+   * Commit lines to the scrollback and replace what is pinned, in one write.
    *
-   * Not clipped and not wrapped: a long line is the terminal's to fold, and
-   * folding it here would freeze today's width into the copy somebody takes
-   * tomorrow.
+   * **One call rather than two, and that is not tidiness.** Printing a line and
+   * then setting the footer is two erase-and-redraw cycles per line: on a
+   * session emitting a few hundred lines a second the terminal spends its time
+   * on escape codes, and — worse — the footer drawn by the first of the two is
+   * the *previous* one, so a stale prompt line flashes under everything that is
+   * printed. Both were visible in a real terminal.
+   *
+   * Committed lines are not clipped and not wrapped: a long line is the
+   * terminal's to fold, and folding it here would freeze today's width into the
+   * copy somebody takes tomorrow.
    */
-  print(lines) {
+  update(lines = [], live = this.pinned) {
+    this.pinned = live ?? [];
     this.#write(Array.isArray(lines) ? lines : [lines], this.pinned);
+  }
+
+  /** Commit lines under whatever is already pinned. */
+  print(lines) {
+    this.update(lines, this.pinned);
   }
 
   /** Replace what is pinned at the bottom. */
   live(lines) {
-    this.pinned = lines ?? [];
-    this.#write([], this.pinned);
+    this.update([], lines ?? []);
   }
 
   /**

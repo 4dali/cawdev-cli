@@ -265,6 +265,39 @@ export function runLine(run, { chosen, marker, number }, width, ink = painter(3)
 }
 
 /**
+ * One chunk of stdin, split into the keystrokes it actually contains — R81.
+ *
+ * **A `data` event is not a keypress.** It is however many bytes arrived
+ * together, and the client used to treat the whole chunk as one key: it
+ * compared it against `'\r'`, found `"help\r"`, and appended the lot to the
+ * prompt as text. Typing `/help` and pressing enter left `/help` sitting on the
+ * line with nothing happening, and the next key landed in it.
+ *
+ * That was survivable while the client was key-driven and a prompt was a rare
+ * mode. R81 makes typing the primary way in, so it is not. It shows up whenever
+ * bytes coalesce: a paste, a fast typist, a session over ssh, or anything
+ * driving the terminal rather than sitting at it — which is how it was found.
+ *
+ * An escape sequence is ONE key. `ESC[B` is Down, not three characters, and a
+ * bare `ESC` is Escape — so a sequence is taken whole when one is there and the
+ * escape stands alone when it is not.
+ */
+export function keysIn(chunk) {
+  const keys = [];
+  for (let at = 0; at < chunk.length;) {
+    if (chunk[at] === ESC) {
+      const sequence = /^\x1b(\[[0-9;?]*[a-zA-Z~]|O[A-Z]|.)?/.exec(chunk.slice(at));
+      keys.push(sequence[0]);
+      at += sequence[0].length;
+      continue;
+    }
+    keys.push(chunk[at]);
+    at += 1;
+  }
+  return keys;
+}
+
+/**
  * The footer: everything that never changes, and the few things that do.
  *
  * **Pure, and rendered from a plain object.** R62 learned this the hard way —
@@ -518,6 +551,8 @@ class Attached {
     this.connected = false;
     this.stopped = false;
     this.dirty = false;
+    /** Lines waiting to be committed on the next tick. See {@link say}. */
+    this.pending = [];
   }
 
   async start() {
@@ -528,7 +563,13 @@ class Attached {
     if (process.stdin.isTTY) {
       process.stdin.setRawMode?.(true);
       process.stdin.resume();
-      process.stdin.on('data', (chunk) => this.onKey(chunk.toString('utf8')));
+      // One chunk is however many bytes arrived together, not one keypress.
+      // See {@link keysIn} — this line used to be the bug.
+      process.stdin.on('data', (chunk) => {
+        for (const key of keysIn(chunk.toString('utf8'))) {
+          this.onKey(key);
+        }
+      });
     }
     process.stdout.on('resize', () => {
       this.screen.resize();
@@ -541,18 +582,17 @@ class Attached {
       void this.watchQuestions();
     }
 
-    // One footer repaint per tick at most. A busy session emits hundreds of
-    // lines a second; the transcript is printed as it arrives, but redrawing
-    // the footer per line would spend the terminal on escape codes.
+    // One write per tick at most, carrying everything that happened in it. A
+    // busy session emits hundreds of lines a second, and a write per line means
+    // an erase-and-redraw of the whole footer per line.
     const tick = setInterval(() => {
-      if (this.dirty) {
-        this.dirty = false;
-        this.drawFooter();
+      if (this.dirty || this.pending.length) {
+        this.flush();
       }
     }, 60);
     tick.unref?.();
 
-    this.drawFooter();
+    this.flush();
     await new Promise((done) => {
       this.finish = done;
     });
@@ -629,7 +669,13 @@ class Attached {
   }
 
   /**
-   * Print into the scrollback.
+   * Queue lines for the scrollback.
+   *
+   * **Queued rather than written, and flushed with the footer on one tick.** A
+   * busy session emits hundreds of lines a second; writing each one on its own
+   * means an erase-and-redraw of the whole footer per line, and the footer that
+   * gets drawn is the one from before whatever just happened — which showed up
+   * in a real terminal as a stale prompt line flashing under `/help`'s output.
    *
    * Wrapped here rather than left to the terminal for one reason: a transcript
    * line carries the agent's own colour and can be a paragraph with newlines in
@@ -637,7 +683,18 @@ class Attached {
    * character and an escape sequence.
    */
   say(text) {
-    this.screen.print(wrap(text, this.screen.width));
+    for (const line of wrap(text, this.screen.width)) {
+      this.pending.push(line);
+    }
+    this.dirty = true;
+  }
+
+  /** Everything queued, plus the footer as it is right now, in one write. */
+  flush() {
+    const lines = this.pending;
+    this.pending = [];
+    this.dirty = false;
+    this.screen.update(lines, this.footer());
   }
 
   /**
@@ -1044,8 +1101,12 @@ class Attached {
    * the moment it is decided.
    */
   async signIn() {
-    this.screen.live([]);
+    // Everything queued goes out first and the footer comes down, so what
+    // `runSignIn` prints with `console.log` lands under the transcript rather
+    // than through the middle of a live region nothing is going to erase.
     this.say('');
+    this.screen.update(this.pending, []);
+    this.pending = [];
     const outcome = await runSignIn(this.session, this.ink)
       .catch((failure) => ({ signedIn: false, message: failure.message }));
     if (outcome.message) {
@@ -1188,6 +1249,12 @@ class Attached {
     } catch {
       // Going anyway.
     }
+    // Anything queued is still somebody's transcript. It goes out before the
+    // footer comes down, not after it.
+    if (this.pending.length) {
+      this.screen.update(this.pending, []);
+      this.pending = [];
+    }
     this.screen.close();
     process.stdin.setRawMode?.(false);
 
@@ -1229,7 +1296,7 @@ class Attached {
    * which platform it is talking to. The keys and the status line are left out
    * there on purpose: neither means anything without a keyboard.
    */
-  drawFooter() {
+  footer() {
     const width = this.screen.width;
     const run = this.current();
     const pending = this.pendingOn(run);
@@ -1248,22 +1315,26 @@ class Attached {
     };
 
     if (this.screen.tty) {
-      this.screen.live(footerLines({
+      return footerLines({
         ...state,
         overlay: this.overlayLines(width),
         input: this.mode === 'typing' ? { label: this.inputLabel, text: this.input } : null,
         keys: this.keys(),
         status: this.status,
-      }, width, this.ink));
-      return;
+      }, width, this.ink);
     }
 
+    // A pipe: nothing is pinned, so the fixed answers are COMMITTED instead —
+    // once, and again only when they change.
     const lines = footerLines(state, width, this.ink);
     const said = stripAnsi(lines.join('\n'));
     if (said !== this.lastSaid) {
       this.lastSaid = said;
-      this.screen.print(lines);
+      for (const line of lines) {
+        this.pending.push(line);
+      }
     }
+    return [];
   }
 
   /**
