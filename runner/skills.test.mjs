@@ -129,12 +129,10 @@ setTimeout(() => {}, 60000);
 
 /**
  * @param wants what the PROJECT turned on, as the claim carries it.
- * @param allows the MACHINE's list. `undefined` leaves the key out entirely,
- *   which is what every config written before R76 looks like.
  * @param workspaces how many checkouts the project has here — R47. Two runs in
  *   two workspaces is how "share one index" is proved.
  */
-async function daemonWith(t, { name, wants, allows, perProject, offers, workspaces = 1 }) {
+async function daemonWith(t, { name, wants, offers, workspaces = 1 }) {
   const home = await mkdtemp(join(tmpdir(), 'cawdev-skillcfg-'));
   const indexer = await aFakeIndexer(home);
   const agent = await anEchoingAgent(home);
@@ -179,12 +177,8 @@ async function daemonWith(t, { name, wants, allows, perProject, offers, workspac
     pollSeconds: 1,
     skillCache: join(home, 'cache'),
     skillPrepareSeconds: 60,
-    ...(allows === undefined ? {} : { skills: allows }),
     projects: {
-      board: {
-        workspaces: paths,
-        ...(perProject === undefined ? {} : { skills: perProject }),
-      },
+      board: { workspaces: paths },
     },
   }));
 
@@ -241,12 +235,11 @@ function argvFrom(platform) {
   return saidByTheAgent(platform, 'ARGV') ?? '';
 }
 
-test('the project asks and the machine allows: the skill is in the session\'s MCP config',
+test('a skill the project turned on is in the session\'s MCP config',
   async (t) => {
     const { said, untilSaid, platform } = await daemonWith(t, {
       name: 'test-skill-yes',
       wants: {},
-      allows: ['codegraph'],
     });
 
     assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /), said());
@@ -274,7 +267,6 @@ test('availability is not pre-approval: the tools are not in --allowedTools', as
   const { platform, said, untilSaid } = await daemonWith(t, {
     name: 'test-skill-not-granted',
     wants: {},
-    allows: ['codegraph'],
   });
 
   assert.ok(await platform.untilSaidOnTheRun(/ARGV /), said());
@@ -285,57 +277,45 @@ test('availability is not pre-approval: the tools are not in --allowedTools', as
   assert.doesNotMatch(argvFrom(platform), /mcp__codegraph/);
 });
 
-test('the project asks and the machine does not: it runs anyway, and says which side',
-  async (t) => {
-    const { platform, said, untilSaid } = await daemonWith(t, {
-      name: 'test-skill-no',
-      wants: {},
-      allows: [],
-    });
-
-    assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /), said());
-    assert.equal(mcpConfigFrom(platform).mcpServers.codegraph, undefined);
-    // NOT failed. A capability withheld and a broken run are different things.
-    assert.deepEqual(platform.transitions.filter((each) => each.state === 'FAILED'), []);
-    assert.ok(await platform.untilSaidOnTheRun(/this machine has not allowed it/),
-      JSON.stringify(platform.outputs, null, 2));
-    // And the sentence says what to do about it, on the machine where the
-    // decision lives.
-    assert.ok(await platform.untilSaidOnTheRun(/"skills" in the runner's config/),
-      JSON.stringify(platform.outputs, null, 2));
-  });
-
-test('a config that never heard of R76 means no, and keeps meaning it', async (t) => {
-  // The upgrade path. Every runner config written before this entry omits the
-  // key, and must not start attaching third-party servers because the daemon
-  // was updated.
+test('the platform decides: a skill a project turned on is attached here', async (t) => {
+  // The machine's veto is gone, deliberately. A skill's `command` is not
+  // something anybody types: the `skill` table is seeded by migration and has
+  // no create endpoint, so turning one on runs a command cawdev itself shipped.
+  // A second allowlist on every machine was therefore guarding against a
+  // project owner enabling a vetted skill — friction, not a boundary.
   const { platform, said, untilSaid } = await daemonWith(t, {
-    name: 'test-skill-absent',
+    name: 'test-skill-platform-decides',
     wants: {},
-    allows: undefined,
+    // No `skills` key at all. Once, this meant "none"; now the config has no
+    // opinion to have.
   });
 
   assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /), said());
-  assert.equal(mcpConfigFrom(platform).mcpServers.codegraph, undefined);
+  assert.ok(mcpConfigFrom(platform).mcpServers.codegraph,
+    `the platform turned it on and it was not attached:\n${said()}`);
 });
 
-test('a machine that allows it can still refuse one project', async (t) => {
-  const { platform, said, untilSaid } = await daemonWith(t, {
-    name: 'test-skill-project-no',
+test('a config written before R76 needs no edit to get a skill', async (t) => {
+  // The upgrade path, and the point of removing the allowlist: an operator who
+  // turns CodeGraph on in the console does not then have to go and edit a JSON
+  // file on the machine before anything happens.
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-skill-old-config',
     wants: {},
-    allows: ['codegraph'],
-    perProject: [],
   });
 
   assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /), said());
-  assert.equal(mcpConfigFrom(platform).mcpServers.codegraph, undefined);
+  assert.ok(mcpConfigFrom(platform).mcpServers.codegraph, said());
+  // Still not pre-approved: the first call stops and asks (R51). Removing the
+  // machine's allowlist did not remove the machine's consent — it moved it to
+  // the moment the tool is actually used, which is where R51 already put it.
+  assert.doesNotMatch(argvFrom(platform), /mcp__codegraph/);
 });
 
 test('a project that turned nothing on is spawned exactly as before', async (t) => {
   const { platform, said, untilSaid } = await daemonWith(t, {
     name: 'test-skill-unasked',
     wants: undefined,
-    allows: ['codegraph'],
   });
 
   assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /), said());
@@ -351,7 +331,6 @@ test('the pin is checked against what was sent, and a disagreement is said out l
       // The row claims one version and the command names none — which is what a
       // migration that edited one and forgot the other looks like.
       wants: { version: '9.9.9' },
-      allows: ['codegraph'],
     });
 
     assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /), said());
@@ -369,7 +348,6 @@ test('two runs on one repository parse it once, in two different workspaces', as
   const { platform, indexer, untilSaid, said, paths } = await daemonWith(t, {
     name: 'test-skill-index-shared',
     wants: {},
-    allows: ['codegraph'],
     workspaces: 2,
     offers: [
       {
@@ -423,7 +401,6 @@ test('the index is kept out of the checkout\'s own status', async (t) => {
   const { platform, untilSaid, said, paths } = await daemonWith(t, {
     name: 'test-skill-index-excluded',
     wants: {},
-    allows: ['codegraph'],
   });
 
   assert.ok(await untilSaid(/built this repository's index/, 60000), said());
@@ -442,7 +419,6 @@ test('an index that cannot be built is a sentence, not a failed run', async (t) 
     // A command that is not there at all, which is what a missing binary or a
     // registry that would not serve one looks like.
     wants: { command: join(tmpdir(), 'cawdev-no-such-indexer') },
-    allows: ['codegraph'],
   });
 
   assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /, 60000), said());

@@ -169,33 +169,6 @@ const DEFAULTS = {
    */
   browser: false,
   /**
-   * Which SKILLS this machine will let a project attach — R76.
-   *
-   * **Empty, and it has to be.** A skill is a third-party MCP server spawned on
-   * this machine, with read access to the checkout it is pointed at. That is the
-   * same class of permission as `browser` above — the operator's own computer —
-   * and it must not be reachable by writing a roadmap card in a project this
-   * machine happens to serve.
-   *
-   * The platform decides what a skill IS and whether a project wants it; this
-   * decides whether it happens here. A run asking for a skill that is not named
-   * here is **not failed** — it runs without it and says which side refused, on
-   * its own transcript, because a capability withheld and a broken run are
-   * different things.
-   *
-   *   "skills": ["codegraph"]
-   *
-   * Overridable per project, like `browser`: a machine that will let one
-   * repository be indexed has not said the same about the other three.
-   *
-   * **This is availability, not permission.** The session's first call to a
-   * skill's tools still stops and asks a person (R51), and the answer that fits
-   * is R60's *allow every `mcp__codegraph` this session*. A machine that wants
-   * it unattended says so in its own `grantable`, where that decision already
-   * lives.
-   */
-  skills: [],
-  /**
    * Where a skill's shared, per-repository state lives — R76.
    *
    * Outside every workspace, and that is the whole point. R47 gives each run a
@@ -270,15 +243,6 @@ async function readConfig() {
     grantable: file.grantable ?? DEFAULTS.grantable,
     /** Whether a run here may reach the operator's browser. Per project too. */
     browser: file.browser ?? DEFAULTS.browser,
-    /**
-     * Which skills may be attached here — R76. Per project too.
-     *
-     * A list rather than a boolean, because skills are an open set: `browser`
-     * is one capability and this is "which of them", so the machine's answer
-     * has to name them. Anything not named is refused, which is what makes an
-     * absent key mean no.
-     */
-    skills: normaliseSkills(file.skills ?? DEFAULTS.skills),
     skillCache: file.skillCache ?? DEFAULTS.skillCache,
     skillPrepareSeconds: file.skillPrepareSeconds ?? DEFAULTS.skillPrepareSeconds,
   };
@@ -353,38 +317,11 @@ function normaliseProjects(projects) {
       // falls through to the machine's answer; `false` here refuses it for one
       // project on a machine that otherwise allows it.
       browser: settings.browser,
-      // And which skills may be attached for it — R76, in the same shape and
-      // for the same reason. Undefined falls through to the machine's list;
-      // `[]` here refuses every skill for one project on a machine that allows
-      // some. NOT merged with the machine's list: a per-project list is an
-      // answer about this project, and adding to it would mean a project could
-      // only ever widen what the machine said.
-      skills: settings.skills === undefined ? undefined : normaliseSkills(settings.skills),
     };
   }
   return normalised;
 }
 
-/**
- * A machine's answer to "which skills may be attached here" — R76.
- *
- * A list of keys, and anything that is not a list of non-blank strings is a
- * config nobody can read as an allowlist. It throws rather than being ignored:
- * a mistyped `"skills": "codegraph"` silently meaning *no skills* is the kind
- * of failure somebody spends an afternoon on, and a daemon that will not start
- * says so in one line.
- */
-function normaliseSkills(skills) {
-  if (!Array.isArray(skills)) {
-    throw new Error(
-      '"skills" is a list of skill keys the machine allows, or absent for none:\n\n' +
-        '  { "skills": ["codegraph"] }',
-    );
-  }
-  return skills
-    .map((key) => (typeof key === 'string' ? key.trim() : ''))
-    .filter(Boolean);
-}
 
 /**
  * What THIS daemon knows about a skill, beyond what the platform sent — R76.
@@ -586,15 +523,42 @@ async function projectRules(config, slug) {
 
 // --- skills (R76) ------------------------------------------------------------
 
+
 /**
- * Which skills may be attached for this project, on this machine.
+ * Which repositories this machine has a skill index for — R77.
  *
- * The project's own list wins outright when it has one, rather than adding to
- * the machine's: a per-project list is an answer about this project, and merging
- * would mean a project entry could only ever widen what the machine said.
+ * <p>The console cannot see these machines, so "is there a map of this project
+ * yet" is only answerable by the daemon saying so. It rides on the heartbeat
+ * beside `workingCopies`, for the reason that one does: it is the same
+ * statement — here is this machine as it stands — and a second timer would only
+ * let the two halves disagree.
+ *
+ * <p>Read off the cache rather than remembered in memory: a restarted daemon
+ * must not report "no map" for a repository it indexed an hour ago, and the
+ * stamp on disk is the only thing that outlives the process.
  */
-function skillsAllowedHere(config, slug) {
-  return config.projects[slug]?.skills ?? config.skills ?? [];
+async function surveySkillIndexes(config) {
+  const found = [];
+  for (const [slug, project] of Object.entries(config.projects)) {
+    for (const key of Object.keys(SKILLS_HERE)) {
+      const cache = skillCacheFor(config, { key }, slug);
+      const stamp = await readJson(join(cache, 'index.json'));
+      if (!stamp) {
+        continue;
+      }
+      found.push({
+        project: slug,
+        skill: key,
+        // What it was built from, so the console can say "indexed at abc1234"
+        // rather than a bare tick — a map of a commit from last week is a map,
+        // but not of what is there now.
+        commit: stamp.commit ?? null,
+        builtAt: stamp.builtAt ?? null,
+        workspaces: project.workspaces.length,
+      });
+    }
+  }
+  return found;
 }
 
 /**
@@ -692,9 +656,13 @@ function skillCacheFor(config, skill, slug) {
  * Nothing here can fail a run. Every path returns a sentence for the transcript
  * instead.
  */
-async function prepareSkillIndex(config, skill, local, run, cwd, baseCommit) {
+async function prepareSkillIndex(config, skill, local, forProject, cwd, baseCommit) {
   const inWorkspace = join(cwd, local.indexDir);
-  const cache = skillCacheFor(config, skill, run.projectSlug);
+  // `forProject` is anything carrying a projectSlug — a claimed run on the way
+  // in, or R77's INDEX request asked on its own. The index is keyed to the
+  // repository, so which of them wanted it makes no difference to what is
+  // built, and the parameter says so rather than being called `run`.
+  const cache = skillCacheFor(config, skill, forProject.projectSlug);
   const kept = join(cache, 'index');
   const stampPath = join(cache, 'index.json');
 
@@ -968,7 +936,6 @@ async function resolveSkills(config, run, cwd, baseCommit, asked) {
     return { attached: [], notes: [] };
   }
 
-  const allowed = skillsAllowedHere(config, run.projectSlug);
   const attached = [];
   const notes = [];
 
@@ -976,12 +943,6 @@ async function resolveSkills(config, run, cwd, baseCommit, asked) {
     if (!skill?.key || !skill?.command || !Array.isArray(skill.args)) {
       notes.push(`A skill arrived that this daemon cannot read (${JSON.stringify(skill)}). `
         + 'It has not been attached.');
-      continue;
-    }
-    if (!allowed.includes(skill.key)) {
-      notes.push(`${skill.name ?? skill.key} is on for this project and this machine has not `
-        + `allowed it, so the session is running without it. Add "${skill.key}" to "skills" in `
-        + "the runner's config to permit it. Nothing else about the run is affected.");
       continue;
     }
     // What the platform claims to be running, against what it actually sends.
@@ -1970,6 +1931,31 @@ async function performWorkspaceRequest(config, request) {
       result = parts.length ? parts.join('\n\n') : 'Nothing uncommitted.';
       ok = true;
     } catch (failure) {
+      result = failure.message;
+    }
+  } else if (request.kind === 'INDEX') {
+    // R77's map button. The same preparation a skill-enabled run does on its
+    // way in, asked for on its own — because looking at a map should not cost
+    // an agent session, a model, or a branch.
+    //
+    // The skill's row travels on the request, so this daemon does not have to
+    // know what CodeGraph is: the platform says what to run and this runs it,
+    // exactly as `resolveSkills` does at spawn.
+    const skill = request.skill;
+    if (!skill?.key || !skill?.command || !Array.isArray(skill.args)) {
+      await reportWorkspaceRequest(config, request, false,
+        'This request carried no skill this daemon can read, so there was nothing to build.');
+      return;
+    }
+    log(`  building the ${skill.key} index for ${cwd}, as asked`);
+    try {
+      const local = SKILLS_HERE[skill.key] ?? {};
+      const baseCommit = await git(cwd, ['rev-parse', 'HEAD']).catch(() => null);
+      result = await prepareSkillIndex(config, skill, local, request, cwd, baseCommit);
+      ok = true;
+    } catch (failure) {
+      // Never a throw out of here: the whole point of this channel is that a
+      // machine answers, and a daemon that died mid-request answers nothing.
       result = failure.message;
     }
   } else if (request.kind === 'STASH') {
@@ -3039,7 +3025,7 @@ async function startRun(config, offered, workspace) {
   // The conversation this run is continuing, when it is continuing one — R69.
   let resume = null;
   // What this project has turned on — R76. Asked for, never granted: the
-  // machine's own `skills` list decides which of these are attached.
+  // The platform decides: a skill a project turned on is attached here.
   let skills = [];
 
   try {
@@ -3068,10 +3054,9 @@ async function startRun(config, offered, workspace) {
     if (resume?.agentSessionId) {
       log(`  resuming session ${short(resume.agentSessionId)}`);
     }
-    // R76. What the project asked for, which is not what it gets: the machine's
-    // answer is given at spawn, and the run's transcript says which side
-    // refused. Said here too, because a log that names what a project wanted is
-    // how its operator finds out a skill is on at all.
+    // R76. What the project turned on. Logged because a machine's operator
+    // should be able to see, from the daemon's own output, that a session was
+    // given a capability — the platform decides it, and this is where it lands.
     skills = Array.isArray(claimed.skills) ? claimed.skills : [];
     if (skills.length) {
       log(`  the project asks for: ${skills.map((skill) => skill.key).join(', ')}`);
@@ -3186,8 +3171,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   // of the same name and intercept the run's own token.
   const mcpServers = { ...(await projectMcpServers(cwd)) };
 
-  // R76. The skills the project turned on and this machine allows, each as an
-  // MCP server. AFTER the repository's own, so a checkout cannot shadow a skill
+  // R76. The skills the project turned on, each as an MCP server. AFTER the repository's own, so a checkout cannot shadow a skill
   // with a server of the same name and be spawned in its place — the same
   // ordering argument that puts cawdev's own entry last, one level down.
   //
@@ -3824,6 +3808,12 @@ async function main() {
       log(`could not survey the working copies: ${failure.message}`);
       return null;
     });
+    // R77. Which projects have a map already, so the tab can offer to build one
+    // rather than making somebody start a session to find out.
+    const skillIndexes = await surveySkillIndexes(config).catch((failure) => {
+      log(`could not survey the skill indexes: ${failure.message}`);
+      return null;
+    });
     api(config, `/api/runners/${config.runnerId}/heartbeat`, {
       method: 'POST',
       body: {
@@ -3833,6 +3823,7 @@ async function main() {
         // Stringified, as `capabilities` and R24's detail are: the platform
         // stores what this machine said, not its own reading of it.
         workingCopies: workingCopies ? JSON.stringify(workingCopies) : null,
+        skillIndexes: skillIndexes ? JSON.stringify(skillIndexes) : null,
       },
     }).catch((failure) => log(`heartbeat failed: ${failure.message}`));
   };
