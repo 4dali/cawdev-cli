@@ -64,6 +64,23 @@ export async function fakePlatform({
       const url = request.url ?? '';
       response.writeHead(200, { 'content-type': 'application/json' });
 
+      // R93. A machine with no config signs in before it does anything else,
+      // so the fake has to be able to refuse a stored session and hand out a
+      // code. Refusing is the interesting half: the catch-all below answers
+      // `{}` to everything, and an `/api/auth/me` that answers 200 with no
+      // email reads as somebody who is already signed in.
+      if (url.endsWith('/api/auth/me')) {
+        response.writeHead(401, { 'content-type': 'application/json' });
+        return response.end(JSON.stringify({ message: 'not signed in' }));
+      }
+      if (url.endsWith('/api/auth/cli/start') && request.method === 'POST') {
+        return response.end(JSON.stringify({
+          code: 'ABCD-1234',
+          secret: 'a-secret',
+          verifyPath: '/login?cli=ABCD-1234',
+          expiresAt: new Date(Date.now() + 600_000).toISOString(),
+        }));
+      }
       if (url.endsWith('/api/runners') && request.method === 'POST') {
         return response.end(JSON.stringify({ id: 'runner-1', name: JSON.parse(body).name }));
       }

@@ -235,17 +235,27 @@ function rowLine(row, opts, width, ink) {
  * The free-text row does not need a number here. Anything that is not a number
  * IS the free text, which is what a plain prompt has always meant.
  */
-export function plainLines(select) {
+export function plainLines(select, { many = false } = {}) {
   const lines = ['', select.title ? ` ${select.title}` : ' choose:'];
   if (!select.rows.length) {
     lines.push(`  ${select.empty ?? 'nothing to choose from'}`);
   }
   select.rows.forEach((row, at) => {
-    lines.push(`  ${at + 1}) ${row.label}${row.hint ? `  — ${row.hint}` : ''}`);
+    // A hint that repeats the label is noise — "1) cawdev — cawdev" — and it
+    // happens whenever a thing's name and its identifier agree, which for a
+    // slug is most of the time.
+    const hint = row.hint && row.hint !== row.label ? `  — ${row.hint}` : '';
+    lines.push(`  ${at + 1}) ${row.label}${hint}`);
   });
-  lines.push(select.freeText
-    ? '  a number, or just type your answer:'
-    : '  a number:');
+  // The LAST line is the instruction, and there is exactly one of it. R93 added
+  // a question with several answers and printed its own instruction under this
+  // one, so the screen said "a number:" and then "several numbers:" — the
+  // widget knowing both forms is what stops that.
+  lines.push(many
+    ? '  several numbers, or enter for all:'
+    : select.freeText
+      ? '  a number, or just type your answer:'
+      : '  a number:');
   return lines;
 }
 
@@ -267,4 +277,40 @@ export function pickFromLine(select, typed) {
   }
   const free = select.rows.find((row) => row.id === WRITE_MY_OWN);
   return free ? { done: 'chosen', row: free, text } : null;
+}
+
+/**
+ * Several rows from one typed line — R93.
+ *
+ * Here rather than in the setup walk because R83's rule is that choosing is
+ * this file's job, and a second parser for "1, 3" living next to the first
+ * would be the drift that rule exists to prevent. No free text: a question with
+ * more than one answer has no "write my own" row, since the rows are the
+ * choices and not a guess at them.
+ *
+ * Returns an empty array for a line that settles nothing, so the caller asks
+ * again. A number naming no row makes the whole line nothing rather than
+ * silently choosing the rest: somebody who typed `1 2 9` meant three, and
+ * giving them two of them is a wrong answer wearing a right one's clothes.
+ */
+export function pickManyFromLine(select, typed) {
+  const text = String(typed ?? '').trim();
+  if (!text) {
+    return [];
+  }
+  const wanted = text.split(/[\s,]+/).filter(Boolean);
+  const picked = [];
+  for (const part of wanted) {
+    if (!/^[0-9]+$/.test(part)) {
+      return [];
+    }
+    const row = select.rows[Number(part) - 1];
+    if (!row) {
+      return [];
+    }
+    if (!picked.includes(row)) {
+      picked.push(row);
+    }
+  }
+  return picked;
 }

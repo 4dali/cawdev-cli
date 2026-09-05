@@ -80,8 +80,12 @@ export class Session {
   async resume() {
     try {
       const me = await this.request('/api/auth/me');
-      this.email = me.email;
-      return true;
+      // `?? null`, because `signedIn` is `email !== null` and an answer with no
+      // email would set it to `undefined` — which passes that test. Nothing on
+      // the real API answers 200 without one; a proxy in front of it might, and
+      // R93's walk now takes its FIRST decision off this flag.
+      this.email = me?.email ?? null;
+      return this.email !== null;
     } catch {
       this.email = null;
       return false;

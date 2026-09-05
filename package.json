@@ -6,6 +6,13 @@
   "bin": {
     "cawdev": "./runner/cawdev.mjs"
   },
+  "files": [
+    "runner",
+    "lib",
+    "mcp",
+    "!**/*.test.mjs",
+    "!runner/test-platform.mjs"
+  ],
   "engines": {
     "node": ">=20"
   },

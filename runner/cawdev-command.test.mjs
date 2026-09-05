@@ -146,6 +146,46 @@ test('with no daemon anywhere, `cawdev` starts one and attaches to it', async (t
   assert.ok(platform.seen.includes('POST /api/runners'), platform.seen.join(', '));
 });
 
+test('a machine with no config is set up rather than told to write one', async (t) => {
+  const platform = await fakePlatform();
+  const machine = await aCleanMachine();
+
+  // No config anywhere, and no token in the environment: R93's trigger, and the
+  // only case that runs the walk by itself.
+  const cawdev = spawn(process.execPath, [CAWDEV, '--url', platform.url], {
+    env: {
+      ...process.env,
+      HOME: machine.home,
+      CAWDEV_RUN_DIR: machine.runDir,
+      CAWDEV_TOKEN: undefined,
+      CAWDEV_URL: undefined,
+      CAWDEV_RUNNER_CONFIG: undefined,
+      // The walk opens a browser, and a test machine should not sprout tabs.
+      BROWSER: '/usr/bin/true',
+    },
+    cwd: machine.home,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  t.after(async () => {
+    cawdev.kill('SIGKILL');
+    platform.close();
+    await machine.clean();
+  });
+
+  const said = await waitFor('ABCD-1234', cawdev.stdout, 15_000);
+
+  // The old behaviour was to start a daemon that could not boot and then print
+  // `readConfig`'s complaint out of a log file. This is the sentence that
+  // replaced it.
+  assert.match(said, /Setting up this machine/);
+  assert.match(said, /Approve this sign-in at/);
+  assert.doesNotMatch(said, /did not start/, 'it still tried to boot an unconfigured daemon');
+
+  const sockets = await readdir(machine.runDir).catch(() => []);
+  assert.deepEqual(sockets, [], 'a daemon was started before the machine was configured');
+});
+
 test('--no-start refuses rather than launching something nobody asked for', async (t) => {
   const machine = await aCleanMachine();
   t.after(() => machine.clean());

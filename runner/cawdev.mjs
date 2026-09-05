@@ -24,6 +24,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { attach, urlFrom, valueOf } from './attach.mjs';
+import { asker, setUpThisMachine } from './bootstrap.mjs';
 import { liveSockets, probeSocket, socketPathFor } from './control.mjs';
 import { painter } from '../lib/ansi.mjs';
 import { mark } from './brand.mjs';
@@ -38,9 +39,14 @@ const USAGE = `
   cawdev --runner <name>    when this machine runs more than one
   cawdev --url <url>        which cawdev to sign in to (or CAWDEV_URL)
   cawdev --config <path>    the runner config to start a daemon from
+  cawdev --setup            set this machine up again: projects, checkouts, token
   cawdev --no-start         attach only; never launch a daemon
   cawdev --watch-only       do not sign in; watch without being able to act
   cawdev --help
+
+  On a machine with no config, cawdev sets one up: it signs you in through the
+  browser, asks which projects this machine should run agents for, clones them,
+  and mints its own runner token. No token is ever typed.
 
   Inside: enter prompts the session you are watching, / takes a command
   (/help lists them), L lists the runs, q leaves — and the runner keeps going.
@@ -175,10 +181,45 @@ export async function socketToAttach(argv, ink = painter()) {
     throw new Error('No runner is answering on this machine, and --no-start was given.');
   }
 
-  const configPath = await findConfig(argv);
+  let configPath = await findConfig(argv);
+
+  // R93. No config and no token in the environment is a machine nobody has set
+  // up, and it is the ONLY case that runs the walk by itself: a config that is
+  // there, or a token that is exported, is somebody having said how this
+  // machine is configured, and asking them again would be ignoring it.
+  //
+  // The old behaviour here was to start a daemon that could not boot and then
+  // print `readConfig`'s complaint out of a log file — accurate, and useless on
+  // a laptop where the answer was "you have not set this up yet".
+  if (!configPath && !process.env.CAWDEV_TOKEN) {
+    configPath = await runSetup(argv, ink);
+  }
+
   console.log(`  ${ink.muted('No runner here yet — starting one')}`
     + `${configPath ? ` ${ink.muted('from')} ${ink.accent(configPath)}` : ''}${ink.muted('…')}`);
   return startDaemon(configPath, ink);
+}
+
+/**
+ * The setup walk, with the terminal handed to it and taken back.
+ *
+ * `readline` owns stdin while it is open and the client's raw mode wants it
+ * afterwards, so the interface is closed on every path out — including the one
+ * where somebody answered "no, Claude Code is not signed in", which throws.
+ */
+async function runSetup(argv, ink) {
+  const ask = asker();
+  try {
+    const { configPath } = await setUpThisMachine({
+      url: urlFrom(argv),
+      ask,
+      say: (line) => console.log(line),
+      ink,
+    });
+    return configPath;
+  } finally {
+    ask.close();
+  }
 }
 
 async function main() {
@@ -195,6 +236,20 @@ async function main() {
   // a browser about to open, or a daemon about to boot.
   for (const line of mark(ink, { tagline: urlFrom(argv) })) {
     console.log(`\n${line}\n`);
+  }
+
+  // Asked for by name, the walk runs even where one has been done before —
+  // that is what "again" means, and adding a project to this machine is the
+  // ordinary reason. A daemon already running keeps the config it booted with,
+  // so it is told to restart rather than left to look like it took the change.
+  if (argv.includes('--setup')) {
+    await runSetup(argv, ink);
+    const alive = await liveSockets();
+    if (alive.length) {
+      console.log(`  ${ink.warn('!')} ${ink.muted('A runner is already running here, on the config it booted with.')}`);
+      console.log(`  ${ink.muted('Stop it to pick this up — quitting the client does not, and')}`);
+      console.log(`  ${ink.muted('the goodbye it prints names the command that does.')}`);
+    }
   }
 
   const socketPath = await socketToAttach(argv, ink);
