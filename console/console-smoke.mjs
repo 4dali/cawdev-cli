@@ -1036,6 +1036,59 @@ try {
   // The record is the point: it must survive the run ending.
   check('what it committed outlives the run',
     (await console_(`${sessionPath}/commits`)).length === 3);
+
+  // --- the three boards, and the dashboard over them (R84, R85, R88) --------
+
+  const board = await console_(`/api/projects/${project}/work-items`);
+  check('the development board answers, and a branch is a card on it',
+    Array.isArray(board), JSON.stringify(board).slice(0, 200));
+
+  const filed = await console_(`/api/projects/${project}/issues`, {
+    method: 'POST',
+    body: JSON.stringify({
+      title: 'A smoke-test issue',
+      severity: 'MINOR',
+      body: 'Filed by the console smoke, and declined by it.',
+    }),
+  });
+  check('an issue is filed at NEW with its severity, on the roadmap numbering',
+    filed.kind === 'ISSUE' && filed.severity === 'MINOR' && filed.status === 'NEW',
+    JSON.stringify(filed).slice(0, 200));
+
+  const issues = await console_(`/api/projects/${project}/issues`);
+  check('it is on the issues board and not on the roadmap',
+    issues.some((each) => each.number === filed.number)
+      && (await console_(`/api/projects/${project}/roadmap`))
+        .every((each) => each.number !== filed.number));
+
+  const reRanked = await console_(
+    `/api/projects/${project}/issues/${filed.number}/severity`,
+    { method: 'POST', body: JSON.stringify({ severity: 'MEDIUM' }) },
+  );
+  check('triage re-ranks it, because an audit\'s severity is its own guess',
+    reRanked.severity === 'MEDIUM');
+
+  const overview = await console_(`/api/projects/${project}/overview`);
+  check('the dashboard counts all three boards at once',
+    Array.isArray(overview.roadmap?.byStatus)
+      && Array.isArray(overview.issues?.openBySeverity)
+      && Array.isArray(overview.development?.byStatus),
+    JSON.stringify(overview).slice(0, 200));
+  check('and its issue count matches the issues board',
+    overview.issues.openBySeverity.reduce((total, row) => total + row.count, 0)
+      === issues.filter((each) =>
+        ['NEW', 'CONFIRMED', 'IN_DEVELOPMENT'].includes(each.status)).length);
+
+  const home = await console_('/api/overview');
+  check('the home page lists every project you can see',
+    home.projects.some((each) => each.slug === project));
+
+  // Declined rather than left: entries cannot be deleted, and a smoke-test
+  // issue sitting open on a real board is noise somebody has to triage.
+  await console_(`/api/projects/${project}/roadmap/${filed.number}/decline`, {
+    method: 'POST',
+    body: JSON.stringify({ reason: 'A smoke-test issue, declined by the test that made it.' }),
+  }).catch(() => undefined);
 } finally {
   if (runId) {
     await console_(`/api/projects/${project}/runs/${runId}/transition`, {
