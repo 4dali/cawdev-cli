@@ -2,6 +2,11 @@
 // Writes a project's ROADMAP.md from cawdev.
 //
 //   CAWDEV_URL=… CAWDEV_TOKEN=… node tools/roadmap/export.mjs [project] [--out FILE]
+//   CAWDEV_URL=… CAWDEV_TOKEN=… node tools/roadmap/export.mjs [project] --issues
+//
+// R85: two files, because there are two questions. --issues writes ISSUES.md
+// from the cards whose kind is ISSUE, filed by status rather than by phase — a
+// defect does not belong to "Phase 3", it belongs to open or fixed.
 //
 // The output is deliberately byte-stable: same data in, same bytes out, so a
 // regenerated export shows a diff only when the roadmap actually changed. CI
@@ -11,7 +16,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { call, readConfig, resolveProject } from '../lib/cawdev.mjs';
-import { renderRoadmap, unlistedSections } from '../lib/roadmap-format.mjs';
+import { renderIssues, renderRoadmap, unlistedSections } from '../lib/roadmap-format.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -43,9 +48,28 @@ async function main() {
   const outIndex = args.indexOf('--out');
   const out = outIndex === -1 ? 'ROADMAP.md' : args[outIndex + 1];
   const slugArgument = args.find((arg) => !arg.startsWith('--') && arg !== out);
+  const issues = args.includes('--issues');
 
   const config = await readConfig();
   const slug = resolveProject(config, slugArgument);
+
+  if (issues) {
+    const filed = await call(config, `/api/projects/${slug}/issues`);
+    const preamble = await readFile(join(here, 'issues-preamble.md'), 'utf8');
+    await writeFile(resolve(out === 'ROADMAP.md' ? 'ISSUES.md' : out),
+      renderIssues(filed, { preamble }), 'utf8');
+    const bySeverity = {};
+    for (const entry of filed) {
+      bySeverity[entry.severity] = (bySeverity[entry.severity] ?? 0) + 1;
+    }
+    console.error(
+      `Wrote ISSUES.md: ${filed.length} issue(s) from ${slug} at ${config.url}` +
+        (filed.length
+          ? ` (${Object.entries(bySeverity).map(([k, v]) => `${v} ${k}`).join(', ')})`
+          : ''),
+    );
+    return;
+  }
 
   const entries = await call(config, `/api/projects/${slug}/roadmap`);
   const preamble = await readFile(join(here, 'preamble.md'), 'utf8');

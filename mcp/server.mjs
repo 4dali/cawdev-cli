@@ -337,6 +337,8 @@ const TOOLS = [
           enum: [
             'CONSIDERING',
             'PLANNED',
+            'NEW',
+            'CONFIRMED',
             'IN_DEVELOPMENT',
             'MERGED',
             'SHIPPED',
@@ -484,6 +486,8 @@ const TOOLS = [
           enum: [
             'CONSIDERING',
             'PLANNED',
+            'NEW',
+            'CONFIRMED',
             'IN_DEVELOPMENT',
             'MERGED',
             'SHIPPED',
@@ -506,6 +510,66 @@ const TOOLS = [
         body: pick(args, ['title', 'body', 'status', 'branch', 'merge', 'version', 'reason', 'section', 'related']),
       });
       return `Created R${entry.number} in ${slug}.\n\n${formatEntry(entry, {})}`;
+    },
+  },
+
+  {
+    name: 'issue_list',
+    description:
+      'What is broken in a project, and how badly — R85. The same numbering as the roadmap: ' +
+      'R91 may be an issue. Statuses are NEW, CONFIRMED, IN_DEVELOPMENT, MERGED (drawn as ' +
+      'Resolved) and DECLINED (Won\'t fix).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_ARGUMENT,
+        status: {
+          type: 'string',
+          enum: ['NEW', 'CONFIRMED', 'IN_DEVELOPMENT', 'MERGED', 'SHIPPED', 'DECLINED'],
+        },
+        brief: { type: 'boolean', description: 'Drop the bodies.' },
+      },
+    },
+    handler: async (config, args) => {
+      const slug = await resolveProject(config, args.project);
+      const query = new URLSearchParams();
+      if (args.status) query.set('status', args.status);
+      if (args.brief) query.set('brief', 'true');
+      const suffix = query.toString() ? `?${query}` : '';
+      const issues = await api(config, `/api/projects/${slug}/issues${suffix}`);
+      if (!issues.length) {
+        return `${slug} has no issues${args.status ? ` in ${args.status}` : ''}.`;
+      }
+      return issues.map((issue) => formatEntry(issue, {})).join('\n\n---\n\n');
+    },
+  },
+
+  {
+    name: 'issue_file',
+    description:
+      'File an issue: something that is broken, with how badly. Lands at NEW — filed and not ' +
+      'yet triaged — unless you say CONFIRMED, which claims you have already checked it. The ' +
+      'severity is required: it is how the board is ordered. Use `related` to name the card it ' +
+      'was found on.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_ARGUMENT,
+        title: { type: 'string' },
+        body: { type: 'string', description: 'Markdown. What happens, and what should instead.' },
+        severity: { type: 'string', enum: ['CRITICAL', 'MEDIUM', 'MINOR'] },
+        status: { type: 'string', enum: ['NEW', 'CONFIRMED'] },
+        related: { type: 'array', items: { type: 'integer' } },
+      },
+      required: ['title', 'severity'],
+    },
+    handler: async (config, args) => {
+      const slug = await resolveProject(config, args.project);
+      const issue = await api(config, `/api/projects/${slug}/issues`, {
+        method: 'POST',
+        body: pick(args, ['title', 'body', 'severity', 'status', 'related']),
+      });
+      return `Filed R${issue.number} in ${slug}.\n\n${formatEntry(issue, {})}`;
     },
   },
 
@@ -554,6 +618,8 @@ const TOOLS = [
           enum: [
             'CONSIDERING',
             'PLANNED',
+            'NEW',
+            'CONFIRMED',
             'IN_DEVELOPMENT',
             'MERGED',
             'SHIPPED',
