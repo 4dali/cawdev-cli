@@ -1233,6 +1233,72 @@ async function surveyWorkingCopies(config) {
   return survey;
 }
 
+/**
+ * What every checkout on this machine holds — R87.
+ *
+ * Not the same question as `surveyWorkingCopies`, though it looks like it.
+ * That one answers "is there uncommitted work in the way of a run about to
+ * start", which is R46's warning. This one answers **"did this machine come
+ * back with somebody's unfinished work in it"**, and the difference is the
+ * commits: a checkout three commits ahead of `origin` holds work no clone has
+ * ever seen, and nothing until now reported that at all.
+ *
+ * It runs on the beat, so a daemon restarted after a crash says what it has
+ * within a second of coming up rather than when somebody thinks to look.
+ *
+ * Every reading is reported, clean ones included. The platform decides what is
+ * worth showing — a runner that filtered would be a runner deciding what a
+ * person is allowed to find out about their own machine.
+ */
+async function surveyWorkspaces(config) {
+  const readings = [];
+  for (const [slug, project] of Object.entries(config.projects)) {
+    for (const path of project.workspaces) {
+      try {
+        await access(join(path, '.git'));
+        const branch = (await git(path, ['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
+        const head = (await git(path, ['rev-parse', '--short', 'HEAD']).catch(() => '')).trim();
+
+        // Commits not on origin. `@{upstream}` is the honest question and it
+        // throws on a branch that has none — which is not an error, it is the
+        // answer: a branch nothing tracks has all of its commits unpushed.
+        let ahead = null;
+        const counted = await git(path, ['rev-list', '--count', '@{upstream}..HEAD'])
+          .catch(() => null);
+        if (counted !== null) {
+          ahead = Number(counted.trim()) || 0;
+        } else {
+          const all = await git(path, ['rev-list', '--count', 'HEAD']).catch(() => null);
+          ahead = all === null ? null : Number(all.trim()) || 0;
+        }
+
+        const porcelain = await git(path, ['status', '--porcelain']);
+        const lines = porcelain ? porcelain.split('\n').filter((line) => line.trim()) : [];
+        const stat = await git(path, ['diff', '--shortstat', 'HEAD']).catch(() => '');
+        const insertions = Number(/(\d+) insertion/.exec(stat)?.[1] ?? 0);
+        const deletions = Number(/(\d+) deletion/.exec(stat)?.[1] ?? 0);
+
+        readings.push({
+          path,
+          projectSlug: slug,
+          branch,
+          head,
+          ahead,
+          dirtyFiles: lines.length,
+          dirtyInsertions: insertions,
+          dirtyDeletions: deletions,
+        });
+      } catch (failure) {
+        // "I could not look" and "I looked and there is nothing there" must not
+        // arrive at the console as the same answer — the same rule the git
+        // survey follows, for the same reason.
+        readings.push({ path, projectSlug: slug, error: failure.message.split('\n')[0] });
+      }
+    }
+  }
+  return readings;
+}
+
 // --- reading the repository for the Git tab -----------------------------------
 //
 // R39. cawdev knew a great deal about git and could show almost none of it: what
@@ -2191,6 +2257,45 @@ async function performWorkspaceRequest(config, request) {
       const sha = await git(cwd, ['rev-parse', '--short', 'HEAD']);
       const subject = await git(cwd, ['log', '-1', '--format=%s']).catch(() => '');
       result = `${sha} ${subject}`.trim();
+      ok = true;
+    } catch (failure) {
+      result = failure.message;
+    }
+  } else if (request.kind === 'RESET') {
+    // R87's start-over. The destructive one, and the only kind on this channel
+    // that is: the platform has already discarded the run and told somebody
+    // what was about to be lost, and this is the machine making it true.
+    log(`  resetting ${cwd}, as asked`);
+    try {
+      const branch = (await git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
+      const defaultBranch = request.defaultBranch?.trim() || 'main';
+
+      // Uncommitted work first, tracked and untracked. A reset --hard that
+      // left untracked files behind would leave the next run in a checkout
+      // that is still dirty, which is the whole thing this is fixing.
+      await git(cwd, ['reset', '--hard']);
+      await git(cwd, ['clean', '-fd']);
+
+      // Then the branch itself. Back to what origin has, if origin has it;
+      // deleted and recut from the default branch if it was never pushed —
+      // there is nothing to go back TO, and leaving it would leave the next
+      // run's `checkout -b` refusing a name that already exists.
+      await git(cwd, ['fetch', '--prune', 'origin']).catch(() => null);
+      const onOrigin = await git(cwd, ['rev-parse', '--verify', `origin/${branch}`])
+        .then(() => true)
+        .catch(() => false);
+
+      if (onOrigin) {
+        await git(cwd, ['reset', '--hard', `origin/${branch}`]);
+        result = `${cwd} is back to origin/${branch}.`;
+      } else if (branch === defaultBranch) {
+        result = `${cwd} is clean on ${branch}.`;
+      } else {
+        await git(cwd, ['checkout', defaultBranch]);
+        await git(cwd, ['reset', '--hard', `origin/${defaultBranch}`]).catch(() => null);
+        await git(cwd, ['branch', '-D', branch]).catch(() => null);
+        result = `${branch} was never pushed, so it is gone; ${cwd} is on ${defaultBranch}.`;
+      }
       ok = true;
     } catch (failure) {
       result = failure.message;
@@ -4078,6 +4183,21 @@ async function main() {
       log(`could not survey the skill indexes: ${failure.message}`);
       return null;
     });
+    // R87. What every checkout HOLDS — commits included, which is the half
+    // nothing reported. A daemon that has just come back from a crash is the
+    // one thing that knows there are five commits and seven changed files in
+    // cawdev-2, and R80 kept that silently.
+    surveyWorkspaces(config)
+      .then((workspaces) => api(config, `/api/runners/${config.runnerId}/workspaces`, {
+        method: 'POST',
+        body: { workspaces },
+      }))
+      .then((recorded) => {
+        if (recorded?.holdingWork) {
+          log(`${recorded.holdingWork} checkout(s) hold unfinished work — resume or start over`);
+        }
+      })
+      .catch((failure) => log(`could not report the workspaces: ${failure.message}`));
     api(config, `/api/runners/${config.runnerId}/heartbeat`, {
       method: 'POST',
       body: {
@@ -4293,17 +4413,45 @@ async function main() {
         // bounds it by a constraint it does not have.
         //
         // Which checkout this one gets. Null for a run that needs none.
+        //
+        // R86/R87: the platform may NAME one, and then it is the only answer.
+        // A later run of a pinned branch has its unpushed commits in that one
+        // directory, and a resumed run has its uncommitted work there — so
+        // preparing it in whichever checkout happens to be free is preparing it
+        // from `origin` with the work still sitting three directories away.
+        // Waiting is the right behaviour and the reason is worth saying.
         let workspace = null;
         if (writes) {
-          workspace = config.projects[slug].workspaces.find((path) => !held.has(path)) ?? null;
-          if (!workspace) {
-            const total = config.projects[slug].workspaces.length;
-            noteQueued(
-              offered.run,
-              `no free workspace in ${slug} (${total} here, all busy)`,
-            );
-            skipped += 1;
-            continue;
+          const pinned = offered.workspace ?? null;
+          if (pinned) {
+            if (!config.projects[slug].workspaces.includes(pinned)) {
+              // Not one of ours. The platform pins a machine as well as a
+              // path, so this means the config changed under a live branch —
+              // which is a thing to say out loud rather than quietly ignore.
+              noteQueued(
+                offered.run,
+                `its branch is in ${pinned}, which this machine does not serve`,
+              );
+              skipped += 1;
+              continue;
+            }
+            if (held.has(pinned)) {
+              noteQueued(offered.run, `waiting for ${pinned}, which is busy`);
+              skipped += 1;
+              continue;
+            }
+            workspace = pinned;
+          } else {
+            workspace = config.projects[slug].workspaces.find((path) => !held.has(path)) ?? null;
+            if (!workspace) {
+              const total = config.projects[slug].workspaces.length;
+              noteQueued(
+                offered.run,
+                `no free workspace in ${slug} (${total} here, all busy)`,
+              );
+              skipped += 1;
+              continue;
+            }
           }
         }
         if (workspace) {
