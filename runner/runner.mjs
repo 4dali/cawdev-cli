@@ -939,8 +939,9 @@ async function resolveSkills(config, run, cwd, baseCommit, asked) {
   // A profile that writes no code is offered nothing by the platform, and this
   // says the same thing again on the machine — for the reason the ceiling is
   // enforced in two places: a claim from an older platform has never been
-  // through the check at all.
-  if (!writesCodeProfile(run)) {
+  // through the check at all. R96: the test is what it may WRITE, not whether
+  // it took a checkout, so an interview is offered nothing either.
+  if (!writesAnythingProfile(run)) {
     return { attached: [], notes: [] };
   }
 
@@ -1477,6 +1478,15 @@ async function surveyProjectGit(path, { fetch = true } = {}) {
   return {
     defaultBranch: branch,
     headSha: await git(path, ['rev-parse', base]).catch(() => null),
+    // R96. Whether the DEFAULT BRANCH has a brief, read from the ref rather
+    // than from the working tree for the reason the code map is: a checkout is
+    // usually sitting on somebody's branch, and "is there a brief" is a
+    // question about the project. Sent so the console knows whether to offer an
+    // interview; a machine that never looked says nothing, which is not the
+    // same as saying no.
+    brief: await git(path, ['cat-file', '-e', `${base}:${BRIEF.index}`])
+      .then(() => true)
+      .catch(() => false),
     commits: await readRecentCommits(path, base, branch),
     branches: await readBranches(path, base),
   };
@@ -1692,6 +1702,21 @@ async function firstRef(path, candidates) {
  * roadmap entry, which the agent reads for itself with `task_current`. Telling
  * it the task here would be a second copy that can disagree with the entry.
  */
+/**
+ * The one line every session with a checkout is given about the brief — R96.
+ *
+ * A brief nobody is told to read is a document that rots. It is a sentence
+ * rather than a paragraph because it competes with the instruction that follows
+ * it, and it says "if it is there" because most repositories have not had an
+ * interview yet and a session hunting for a missing file is a session wasting a
+ * turn.
+ */
+function briefLine(run) {
+  const index = run.brief?.index ?? BRIEF.index;
+  return `If \`${index}\` exists in this checkout, read it before anything else — `
+    + `it is this project's brief, and it holds what the code cannot say.\n`;
+}
+
 function promptFor(run) {
   if (run.profile && run.profile !== 'CODE') {
     return promptForProfile(run);
@@ -1733,6 +1758,7 @@ from the cawdev console. They are watching this session and can send you more
 instructions while you work, so finish a thought and stop rather than guessing
 at what they might want next.
 
+${briefLine(run)}
 If a decision is genuinely theirs, use the cawdev MCP tool \`ask_user\` and wait.
 
 Their instruction:
@@ -1746,6 +1772,7 @@ Start by calling the cawdev MCP tool \`task_current\`. It gives you the entry, i
 branch, and everything already said on this run — including, if you are resuming,
 what you said before.
 
+${briefLine(run)}
 ${run.rejection ? `THIS CARD WAS REVIEWED AND SENT BACK. The work is already on branch
 ${run.branch}; a previous session finished on it. ${run.rejection.decidedByEmail ?? 'The reviewer'}
 read it and said:
@@ -2951,10 +2978,46 @@ const ROADMAP_WRITE_CAWDEV = CAWDEV_TOOLS;
  */
 const READ_FILES = ['Read', 'Grep', 'Glob'];
 
+/**
+ * Where a project's brief lives — R96.
+ *
+ * The platform is the authority and sends it with the claim (`claimed.brief`).
+ * This is the same constant for the one place no claim is in hand: the git
+ * survey, which reports whether a repository already has a brief so the console
+ * knows whether to offer an interview.
+ */
+const BRIEF = {
+  path: 'docs/brief',
+  index: 'docs/brief/README.md',
+};
+
+/** What an interview may write, and nothing else — R96. */
+function briefWrites(run) {
+  const path = run?.brief?.path || BRIEF.path;
+  // Both verbs, because Claude Code writes a new file with one and changes an
+  // existing one with the other, and an interview run twice does both.
+  return [`Write(${path}/**)`, `Edit(${path}/**)`];
+}
+
 const PROFILE_TOOLS = {
   ASK: READ_ONLY_CAWDEV,
   ROADMAP: ROADMAP_WRITE_CAWDEV,
   AUDIT: [...READ_ONLY_CAWDEV, 'mcp__cawdev__propose_entry', ...READ_FILES],
+  // R96. Read the whole repository, ask in rounds, write the brief, commit it.
+  //
+  // The narrowing is HERE and not in the prompt, which is the whole reason the
+  // interview is a profile: a session that can rewrite the code and is asked
+  // not to is one refusal away from rewriting it. `Bash(git *)` is on the same
+  // grounds as CODE's — the prompt tells it to commit, so the permissions must
+  // let it — and it is git and nothing else.
+  INTERVIEW: (run) => [
+    ...READ_ONLY_CAWDEV,
+    'mcp__cawdev__ask_group',
+    'mcp__cawdev__await_group',
+    ...READ_FILES,
+    ...briefWrites(run),
+    'Bash(git *)',
+  ],
 };
 
 /**
@@ -2965,7 +3028,7 @@ const PROFILE_TOOLS = {
  * `--permission-mode acceptEdits` goes too: a session that cannot write files
  * has no use for permission to.
  */
-function argsForProfile(agentArgs, profile) {
+function argsForProfile(agentArgs, profile, run) {
   const kept = [];
   for (let i = 0; i < agentArgs.length; i++) {
     if (agentArgs[i] === '--allowedTools') {
@@ -2985,7 +3048,9 @@ function argsForProfile(agentArgs, profile) {
     }
     kept.push(agentArgs[i]);
   }
-  return [...kept, '--allowedTools', ...(PROFILE_TOOLS[profile] ?? READ_ONLY_CAWDEV)];
+  const allowed = PROFILE_TOOLS[profile] ?? READ_ONLY_CAWDEV;
+  return [...kept, '--allowedTools',
+    ...(typeof allowed === 'function' ? allowed(run) : allowed)];
 }
 
 /** What each profile is asked to do, in its own words. */
@@ -3021,11 +3086,71 @@ They asked:
 ${run.openingPrompt}`;
   }
 
+  if (run.profile === 'INTERVIEW') {
+    const brief = run.brief ?? { path: BRIEF.path, index: BRIEF.index, sections: [] };
+    const sections = (brief.sections ?? [])
+      .map((section) => `- \`${section.path}\` — ${section.title}: ${section.about}`)
+      .join('\n');
+    const emphasis = run.openingPrompt
+      ? `\nThey asked you to pay particular attention to:\n\n${run.openingPrompt}\n`
+      : '';
+
+    return `You are conducting a **CTO Interview** on this repository for the cawdev platform.
+
+The job is to end up with a brief that leaves nothing to doubt: a set of documents
+that a coding agent — or a person who joined this week — can read and then work on
+this project without guessing. You are on branch ${run.branch}, and you may write
+${brief.path} and NOTHING else. No code, no configuration, no other document.
+
+**Read first, ask second.** Spend the beginning of this session reading: the build
+files, the entry points, the routes, the schema, the tests, the READMEs, the git
+history. Use \`code_map\` and \`file_deps\` to find your way around rather than
+grepping blind. Everything you can answer by reading, you must NOT ask.
+
+**Then interview, in rounds.** Use \`ask_group\` with the title "CTO Interview".
+Each round is up to 12 questions that belong together, with an \`intro\` line
+saying what the round is about. Ask what the code cannot tell you:
+
+- why it exists, who uses it, and what would count as it failing them
+- what must never happen — the constraints somebody would be sacked for breaking
+- which decisions were deliberate, and what was rejected on the way
+- what is load-bearing that looks incidental, and what is dead that looks alive
+- the words this project uses for things, and where they differ from everybody else
+- how it is released, what breaks in production, and who finds out
+- what is planned, what is abandoned, and what is being avoided
+
+Make each question specific and show that you have read the code — "\`AccessGuard\`
+is called in every handler except three; is that deliberate?" is worth ten of "how
+does authorisation work?". Offer \`options\` when there is a small set of plausible
+answers; they can always write their own. Between rounds, read again: a good answer
+opens a door you have not looked through yet.
+
+**Keep going until nothing is in doubt.** Several rounds, not one. When you believe
+you are finished, ask yourself what a new agent would still get wrong, and ask THAT.
+
+**Then write the brief.** ${brief.index} is the index — what this project is in a
+paragraph, and a link to each section with a line saying what is in it. Then:
+
+${sections}
+
+Write for somebody who has the code in front of them and cannot ask anybody
+anything. Say what is true, not what would be nice; where the answer is "nobody
+knows", write that in ${brief.path}/06-open.md rather than inventing one. Attribute
+nothing to the person you interviewed by name — the brief is about the project.
+
+Commit the brief with git when it is written. Do not push and do not open a pull
+request: this project's own rules decide what happens next.
+
+Finally \`report\` kind "done": what you read, how many rounds you asked, what the
+brief now says, and what is still unanswered.
+${emphasis}`;
+  }
+
   if (run.profile === 'AUDIT') {
     return `You are auditing this repository for the cawdev platform. You can READ the code
 and the roadmap; you cannot change either. No edits, no commands, no git — and no
 creating roadmap entries directly.
-${about}
+${about}${briefLine(run)}
 What you find becomes a **proposal** with \`propose_entry\`, one per finding, each
 with a severity:
 
@@ -3379,6 +3504,11 @@ async function startRun(config, offered, workspace) {
     // R76. What the project turned on. Logged because a machine's operator
     // should be able to see, from the daemon's own output, that a session was
     // given a capability — the platform decides it, and this is where it lands.
+    // R96. Where this project's brief lives and what it is made of. The
+    // platform is the authority — a path a session is told by something that
+    // might be wrong is a brief written in the wrong place — and this is the
+    // one thing every profile's prompt is given about it.
+    run.brief = claimed.brief ?? null;
     skills = Array.isArray(claimed.skills) ? claimed.skills : [];
     if (skills.length) {
       log(`  the project asks for: ${skills.map((skill) => skill.key).join(', ')}`);
@@ -3393,7 +3523,7 @@ async function startRun(config, offered, workspace) {
 
   try {
     let branch = run.branch;
-    if (run.profile && run.profile !== 'CODE') {
+    if (!writesCodeProfile(run)) {
       // Nothing is prepared. It cuts no branch, and a dirty tree does not stop
       // it, because it is not going to write to one — refusing here would make
       // "what is R12 about?" unanswerable while somebody has edits open.
@@ -3442,8 +3572,27 @@ async function startRun(config, offered, workspace) {
   }
 }
 
-/** Whether this run is the kind that writes code, before the child exists. */
+/**
+ * Whether this run is the kind that takes a checkout, before the child exists.
+ *
+ * R96: an INTERVIEW does. It is prepared a working copy and cut a branch like a
+ * coding run, because the brief it writes is committed and goes out through the
+ * project's finish rules — what it may write in that copy is far narrower, and
+ * that is decided in PROFILE_TOOLS rather than here.
+ */
 function writesCodeProfile(run) {
+  return !run.profile || run.profile === 'CODE' || run.profile === 'INTERVIEW';
+}
+
+/**
+ * Whether this run may change the SOURCE — R96, and not the same question.
+ *
+ * An interview takes a checkout and writes only the brief. The platform draws
+ * the line in the same place (`RunProfile.writesAnything`), and this says it
+ * again on the machine for the reason the ceiling is enforced twice: a claim
+ * from an older platform has never been through the check at all.
+ */
+function writesAnythingProfile(run) {
   return !run.profile || run.profile === 'CODE';
 }
 
@@ -3615,10 +3764,14 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     agentArgs.push(...extras);
   }
   const writesCode = writesCodeProfile(run);
+  // The CODING arguments, which is not the same question as whether a checkout
+  // was prepared — R96. An interview has one and is still spawned with its own
+  // list: it may read everything, write the brief, and commit, and that is all.
+  const codesFreely = writesAnythingProfile(run);
   const args = [
     '--mcp-config',
     mcpConfigPath,
-    ...(writesCode ? agentArgs : argsForProfile(agentArgs, run.profile)),
+    ...(codesFreely ? agentArgs : argsForProfile(agentArgs, run.profile, run)),
   ];
   log(`  spawning: ${config.agentCommand} ${args.join(' ')} (prompt on stdin)`);
 

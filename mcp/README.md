@@ -163,6 +163,8 @@ token gets a refusal saying so.
 | `report` | `progress` as often as useful; `done` when finished, naming the branch and any PR; `blocked` when a person must resolve something. `done` and `blocked` end the run. |
 | `ask_user` | Ask the person who started the run, and wait. Blocks up to ten minutes, then hands back a `question_id`. |
 | `await_answer` | Resume waiting for a question `ask_user` handed back. |
+| `ask_group` | Ask a **round** — up to twelve questions that belong together, under one title. Blocks until every one of them has been answered, then hands back a `group_id`. |
+| `await_group` | Resume waiting for a round `ask_group` handed back. |
 | `approve` | **Not yours to call.** Claude Code calls it itself, as `--permission-prompt-tool`, when no rule covers a tool call. |
 
 **`ask_user` is for decisions that are genuinely theirs** — an architectural
@@ -173,6 +175,19 @@ costs somebody's attention.
 When `ask_user` returns without an answer, **do not guess and carry on.** You
 asked because the decision was not yours. Call `await_answer`, or `report`
 `blocked` and stop.
+
+**`ask_group` is for when you have several questions at once** — R96. One
+question at a time is right for a decision you hit halfway through a piece of
+work; it is wrong when you are trying to understand something, because forty
+separate inbox items arriving over an afternoon is not a conversation, it is an
+interruption repeated forty times. A round arrives as one form under one title,
+the person answers it in one sitting, and you are woken once when all of it is
+answered.
+
+Rounds, then, rather than one enormous list: at most twelve, and the next round
+should be shaped by the answers to this one. Give each round an `intro` saying
+what it is about, and offer `options` where there is a small set of plausible
+answers — they can always write their own.
 
 After `report done` or `report blocked`, the run is over and your token has
 expired with it. There is nothing further to do.

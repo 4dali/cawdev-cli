@@ -918,6 +918,77 @@ try {
   check('and closing it again is refused rather than silently doing nothing',
     /already/.test(closedTwice?.message ?? ''), JSON.stringify(closedTwice));
 
+  // --- R96: the CTO Interview, and a round of questions ----------------------
+
+  const interview = await console_(`/api/projects/${project}/runs/interview`, {
+    method: 'POST',
+    body: '{}',
+  });
+  check('an interview starts with nothing typed, on a branch of its own',
+    interview.profile === 'INTERVIEW' && interview.branch === 'cto-interview',
+    JSON.stringify([interview.profile, interview.branch]));
+
+  const interviewer = await asToken(runnerToken,
+    `/api/runners/${runner.id}/claim/${interview.id}`);
+  check('and the claim tells the machine where the brief goes',
+    interviewer.brief?.index === 'docs/brief/README.md'
+      && interviewer.brief?.sections?.length === 6,
+    JSON.stringify(interviewer.brief));
+
+  await asToken(interviewer.runToken,
+    `/api/projects/${project}/runs/${interview.id}/transition`, { state: 'RUNNING' });
+
+  const round = await asToken(interviewer.runToken,
+    `/api/projects/${project}/runs/${interview.id}/question-groups`,
+    {
+      title: 'CTO Interview',
+      intro: 'How this thing is released.',
+      questions: [
+        { question: 'Who may cut a release?', options: ['anybody', 'two people'] },
+        { question: 'What breaks most often?' },
+      ],
+    });
+  check('a round arrives under one title, with its questions in order',
+    round.title === 'CTO Interview' && round.questions.length === 2
+      && round.questions[0].group.position === 1,
+    JSON.stringify([round.title, round.questions.length]));
+
+  const roundInbox = await console_('/api/inbox');
+  check('the round is in the inbox, as questions that know what they came with',
+    roundInbox.waitingOnYou.some((row) => row.question.group?.title === 'CTO Interview'),
+    JSON.stringify(roundInbox.waitingOnYou.map((row) => row.question.group?.title)));
+
+  const halfARound = await console_(
+    `/api/projects/${project}/runs/${interview.id}/question-groups/${round.id}/answers`,
+    {
+      method: 'POST',
+      expect: 400,
+      body: JSON.stringify({ answers: { [round.questions[0].id]: 'Two people.' } }),
+    });
+  check('half a round is refused rather than half stored',
+    /whole round/i.test(halfARound?.message ?? ''), JSON.stringify(halfARound));
+
+  const wholeRound = await console_(
+    `/api/projects/${project}/runs/${interview.id}/question-groups/${round.id}/answers`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        answers: {
+          [round.questions[0].id]: 'Two people, never on a Friday.',
+          [round.questions[1].id]: 'The nightly import.',
+        },
+      }),
+    });
+  check('and answering it on one form releases the session',
+    wholeRound.length === 2 && wholeRound.every((each) => each.answered)
+      && (await console_(`/api/projects/${project}/runs/${interview.id}`)).state === 'RUNNING',
+    JSON.stringify(wholeRound.map((each) => each.answer)));
+
+  await console_(`/api/projects/${project}/runs/${interview.id}/transition`, {
+    method: 'POST',
+    body: JSON.stringify({ state: 'CANCELLED' }),
+  });
+
   // --- R28: profiles, and what an audit proposes ----------------------------
 
   const audit = await console_(`/api/projects/${project}/runs/ask`, {

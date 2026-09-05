@@ -242,6 +242,58 @@ async function pollForAnswer(config, project, runId, questionId, seconds) {
 }
 
 /**
+ * Waits for a whole round, re-polling quietly — R96.
+ *
+ * The same shape as {@link pollForAnswer} and deliberately not a generalisation
+ * of it: the platform returns 204 until EVERY question in the round is
+ * answered, so what "not yet" means differs, and one function taking a flag
+ * would hide exactly that.
+ */
+async function pollForGroup(config, project, runId, groupId, seconds) {
+  const deadline = Date.now() + seconds * 1000;
+  while (Date.now() < deadline) {
+    const remaining = Math.ceil((deadline - Date.now()) / 1000);
+    const response = await fetch(
+      `${config.url}/api/projects/${project}/runs/${runId}/question-groups/${groupId}/answers` +
+        `?wait=${Math.min(25, Math.max(1, remaining))}`,
+      { headers: { authorization: `Bearer ${config.token}` } },
+    );
+    if (response.status === 200) {
+      return await response.json();
+    }
+    if (response.status !== 204) {
+      const text = await response.text();
+      throw new CawdevError(safeJson(text)?.message ?? `waiting failed: HTTP ${response.status}`);
+    }
+    // 204 means "some of it is still unanswered" — ask again.
+  }
+  return null;
+}
+
+/**
+ * A finished round, as the session reads it back.
+ *
+ * Question and answer together, in the order they were asked. A list of answers
+ * alone would be positional, and an agent matching six answers to six questions
+ * by counting is an agent one skipped question away from acting on the wrong
+ * one.
+ */
+function renderRound(asked, answered) {
+  const title = asked?.title ?? 'The round';
+  const lines = answered.map((question, at) => {
+    const said = question.answeredByEmail
+      ? `${question.answeredByEmail}: ${question.answer}`
+      : question.answer;
+    const opinions = (question.opinions ?? [])
+      .map((opinion) => `     ${opinion.authorEmail}: ${opinion.body}`)
+      .join('\n');
+    const body = `${at + 1}. ${question.question}\n   ${said}`;
+    return opinions ? `${body}\n   what people said first:\n${opinions}` : body;
+  });
+  return `${title} — every question answered:\n\n${lines.join('\n\n')}`;
+}
+
+/**
  * The answer, with the argument that produced it.
  *
  * A question can be passed round before somebody answers it (R36), and the
@@ -974,6 +1026,91 @@ const TOOLS = [
         `inbox.\n\nCall await_answer with question_id ${asked.id} to keep waiting. Do not ` +
         `guess an answer and carry on — you asked because the decision was theirs.`
       );
+    },
+  },
+
+  {
+    name: 'ask_group',
+    description:
+      'Ask a ROUND of questions at once, and wait for all of them. Use it when you have several ' +
+      'things to settle that belong together — they arrive in the person\'s inbox under one ' +
+      'title, on one form, instead of interrupting them once per question. At most 12 in a ' +
+      'round; ask the rest in the next one. Blocks for up to ten minutes; if the round is ' +
+      'unfinished by then it returns a group_id for await_group.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description:
+            'What this round is called in their inbox. A CTO Interview uses "CTO Interview".',
+        },
+        intro: {
+          type: 'string',
+          description: 'One line above the questions saying what this round is about.',
+        },
+        questions: {
+          type: 'array',
+          maxItems: 12,
+          items: {
+            type: 'object',
+            properties: {
+              question: { type: 'string' },
+              options: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Optional one-click choices. They can still answer in free text.',
+              },
+            },
+            required: ['question'],
+          },
+        },
+      },
+      required: ['questions'],
+    },
+    handler: async (config, args) => {
+      const { runId, project } = await requireRun(config);
+      const asked = await api(config, `/api/projects/${project}/runs/${runId}/question-groups`, {
+        method: 'POST',
+        body: { title: args.title, intro: args.intro, questions: args.questions },
+      });
+
+      const answered = await pollForGroup(config, project, runId, asked.id, askTimeoutSeconds());
+      if (answered) {
+        return renderRound(asked, answered);
+      }
+      return (
+        `The round is unanswered. The run is WAITING_ON_USER and the questions are in their ` +
+        `inbox under "${asked.title}".\n\nCall await_group with group_id ${asked.id} to keep ` +
+        `waiting. Do not guess the answers and carry on — you asked because they were theirs.`
+      );
+    },
+  },
+
+  {
+    name: 'await_group',
+    description:
+      'Resume waiting for a round ask_group handed back. It returns when EVERY question in the ' +
+      'round has been answered — they were asked together because the answers only make sense ' +
+      'together.',
+    inputSchema: {
+      type: 'object',
+      properties: { group_id: { type: 'string' } },
+      required: ['group_id'],
+    },
+    handler: async (config, args) => {
+      const { runId, project } = await requireRun(config);
+      const answered = await pollForGroup(
+        config,
+        project,
+        runId,
+        args.group_id,
+        askTimeoutSeconds(),
+      );
+      if (answered) {
+        return renderRound(null, answered);
+      }
+      return `Still unfinished. Call await_group again with group_id ${args.group_id}.`;
     },
   },
 

@@ -27,6 +27,9 @@ import { once } from 'node:events';
  * @param skills what the claim says this project has turned on — R76. What the
  *   PROJECT asked for: whether any of it is attached is the machine's answer,
  *   which is the thing under test.
+ * @param brief where a brief lives and what it is made of — R96. The real claim
+ *   always carries it; a test can pass null to stand in for an API older than
+ *   R96, which is how the daemon's fallback gets exercised.
  */
 export async function fakePlatform({
   offers = [],
@@ -35,6 +38,13 @@ export async function fakePlatform({
   resume = null,
   runLive = false,
   skills = [],
+  brief = {
+    path: 'docs/brief',
+    index: 'docs/brief/README.md',
+    sections: [
+      { path: 'docs/brief/01-product.md', title: 'Product', about: 'What this is.' },
+    ],
+  },
 } = {}) {
   const seen = [];
   const transitions = [];
@@ -55,6 +65,8 @@ export async function fakePlatform({
   const outputs = [];
   /** What the daemon said the session consumed — R76. */
   const usage = [];
+  /** What the daemon read out of each repository — R24, and R96's `brief`. */
+  const gitReadings = [];
 
   const server = createServer((request, response) => {
     seen.push(`${request.method} ${request.url.split('?')[0]}`);
@@ -106,6 +118,7 @@ export async function fakePlatform({
           allowDirty,
           resume,
           skills,
+          brief,
         }));
       }
       if (url.endsWith('/session') && request.method === 'POST') {
@@ -149,6 +162,10 @@ export async function fakePlatform({
           id: url.split('/workspace-requests/')[1].split('/')[0],
           ...JSON.parse(body),
         });
+        return response.end('{}');
+      }
+      if (url.match(/\/git\/[^/]+$/) && request.method === 'POST') {
+        gitReadings.push({ slug: url.split('/git/')[1], ...JSON.parse(body) });
         return response.end('{}');
       }
       if (url.endsWith('/transition') && request.method === 'POST') {
@@ -212,6 +229,16 @@ export async function fakePlatform({
     sessionIds,
     outputs,
     usage,
+    gitReadings,
+    /** Waits for a reading of the repository to arrive — R24, R96. */
+    async untilGit(timeout = 20000) {
+      const deadline = Date.now() + timeout;
+      while (Date.now() < deadline) {
+        if (gitReadings.length) return gitReadings[gitReadings.length - 1];
+        await new Promise((wake) => setTimeout(wake, 150));
+      }
+      return null;
+    },
     /** Waits for a transcript line to arrive, or gives up — R76. */
     async untilSaidOnTheRun(pattern, timeout = 20000) {
       const deadline = Date.now() + timeout;
