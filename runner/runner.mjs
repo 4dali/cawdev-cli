@@ -27,6 +27,8 @@ import { codeMapOf } from '../lib/code-map.mjs';
 import { usageLimitOf } from '../lib/usage-limit.mjs';
 import { writeRunPlugin } from '../lib/run-plugin.mjs';
 import { AI_CONFIG, harnessPrompt, readRepoConfig } from '../lib/harness-prompt.mjs';
+import { GIT_READS, driftedFrom, toolsForStage } from '../lib/stage-tools.mjs';
+import { findSecret } from '../lib/secrets.mjs';
 
 // --- configuration -----------------------------------------------------------
 
@@ -185,6 +187,21 @@ const DEFAULTS = {
    */
   skillPrepareSeconds: 300,
   /**
+   * How long a session may say NOTHING before the daemon mentions it — R113.
+   *
+   * Nothing watched for silence before this. A run that stopped producing
+   * output at two in the morning was RUNNING until somebody looked at it, and
+   * the machine held its workspace the whole time — so the next coding run on
+   * that project queued behind a session that was not doing anything.
+   *
+   * Twenty minutes, and it is a SETTING because the right number is a fact
+   * about the repository: one whose test suite takes twelve minutes is not a
+   * hung session, and a daemon that cried wolf at ten would be turned off.
+   *
+   * Zero switches it off, for a machine doing something genuinely long.
+   */
+  idleSeconds: 1200,
+  /**
    * How often to take what a person has asked of a served checkout — R57.
    *
    * Faster than the heartbeat on purpose: these sit behind a button somebody is
@@ -241,6 +258,7 @@ async function readConfig() {
     browser: file.browser ?? DEFAULTS.browser,
     skillCache: file.skillCache ?? DEFAULTS.skillCache,
     skillPrepareSeconds: file.skillPrepareSeconds ?? DEFAULTS.skillPrepareSeconds,
+    idleSeconds: file.idleSeconds ?? DEFAULTS.idleSeconds,
   };
 
   if (!config.token) {
@@ -3082,6 +3100,20 @@ function briefWrites(run) {
 
 const PROFILE_TOOLS = {
   ASK: READ_ONLY_CAWDEV,
+  // R104's profile, and it was MISSING from this table until R112 — so a review
+  // run fell through to `?? READ_ONLY_CAWDEV` and could not read a file, let
+  // alone a diff. A profile with no entry here does not fail loudly; it runs
+  // with the narrowest list in the file and reports that it could not do the
+  // work, which is the least legible way for this to go wrong.
+  //
+  // A review reads and writes NOTHING: not the code, not the roadmap. `git` is
+  // read-only here on purpose — the diff is the subject, and a reviewer that
+  // could commit is a reviewer that could fix what it was asked to judge.
+  REVIEW: [
+    ...READ_ONLY_CAWDEV,
+    ...READ_FILES,
+    ...GIT_READS,
+  ],
   ROADMAP: ROADMAP_WRITE_CAWDEV,
   AUDIT: [...READ_ONLY_CAWDEV, 'mcp__cawdev__propose_entry', ...READ_FILES],
   // R96. Read the whole repository, ask in rounds, write the brief, commit it.
@@ -3114,6 +3146,25 @@ const PROFILE_TOOLS = {
  * `--permission-mode acceptEdits` goes too: a session that cannot write files
  * has no use for permission to.
  */
+/**
+ * Everything before `--allowedTools`, which is variadic and swallows the rest.
+ *
+ * <p>Shared by {@code argsForProfile} and R112's stage args so the two cannot
+ * disagree about where the permission list begins — a stage built on a list
+ * that still had the coding defaults on the end would be a stage with tools its
+ * table never granted, and nothing would have said so.
+ */
+function argsBefore(agentArgs) {
+  const kept = [];
+  for (let i = 0; i < agentArgs.length; i++) {
+    if (agentArgs[i] === '--allowedTools') {
+      break;
+    }
+    kept.push(agentArgs[i]);
+  }
+  return kept;
+}
+
 function argsForProfile(agentArgs, profile, run) {
   const kept = [];
   for (let i = 0; i < agentArgs.length; i++) {
@@ -3137,6 +3188,49 @@ function argsForProfile(agentArgs, profile, run) {
   const allowed = PROFILE_TOOLS[profile] ?? READ_ONLY_CAWDEV;
   return [...kept, '--allowedTools',
     ...(typeof allowed === 'function' ? allowed(run) : allowed)];
+}
+
+/**
+ * What one STAGE is asked to do, and what the stages before it produced — R112.
+ *
+ * <p>Each stage is its own process, so nothing carries across except what is
+ * written down. That is the cost of real enforcement and it is why R108's
+ * briefing and R109's stored plan had to exist first: they are the memory that
+ * makes a process boundary survivable.
+ *
+ * <p>The plan is handed on VERBATIM rather than summarised. A stage that
+ * re-derived the plan from a précis would be planning again, which is the one
+ * thing the gate exists to stop it doing after somebody approved the first one.
+ */
+function stagePrompt(stage, carried) {
+  const asked = {
+    PLAN: 'Work out what to do and WRITE THE PLAN. Do not change anything — you have no '
+      + 'tool that can, so do not spend turns discovering that. Read what you need, then say, '
+      + 'concretely: which files, what change in each, and how you will know it worked. '
+      + 'Somebody is going to read this and decide whether you may proceed.',
+    VERIFY: 'Check the plan against what is actually there. Does every file it names exist? '
+      + 'Does every interface it assumes still look like that? You cannot change anything — '
+      + 'say what is wrong with the plan, or say plainly that it holds.',
+    IMPLEMENT: 'Do the work in the plan. If the plan turns out to be wrong, say so and stop '
+      + 'rather than improvising a different change — somebody approved that plan, and a '
+      + 'different one has not been approved.',
+    TEST: 'Run what proves the work. Report what passed and what did not, with the output. A '
+      + 'failing test is a result, not a failure of this stage.',
+    MEMORY: 'Write what the NEXT session on this branch needs to know: what was done, what was '
+      + 'tried and rejected and why, and anything that turned out to matter and would not be '
+      + 'obvious from the diff. Be brief and concrete. This is saved as this branch\'s '
+      + 'briefing and handed to whoever comes next.',
+  }[stage.stage] ?? `Carry out the ${stage.stage} stage.`;
+
+  const before = [];
+  for (const [name, text] of Object.entries(carried ?? {})) {
+    if (text) {
+      before.push(`### What the ${name} stage produced\n\n${text}`);
+    }
+  }
+
+  return `\n\n---\n\n## This is the ${stage.stage} stage\n\n${asked}`
+    + (before.length ? `\n\n${before.join('\n\n')}` : '');
 }
 
 /** What each profile is asked to do, in its own words. */
@@ -3678,7 +3772,7 @@ async function startRun(config, offered, workspace) {
       body: { state: 'RUNNING', workspace: workspace ?? null },
     });
 
-    await spawnAgent(config, run, runToken, resolve(path), baseCommit, workspace, resume,
+    await walkLifecycle(config, run, runToken, resolve(path), baseCommit, workspace, resume,
         mcpServers, expertAgents, skills, instincts, briefing, lifecycle, shield);
   } catch (failure) {
     // Anything that goes wrong before or during the spawn is the run's failure,
@@ -3729,8 +3823,195 @@ function writesAnythingProfile(run) {
  * `cawdr_` token bound to one run, which expires with it — so the worst a
  * confused or misbehaving session can do is act on the run it was started for.
  */
-async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, resume,
+/**
+ * The daemon walks the lifecycle — R112.
+ *
+ * <p>R109 gave a run stages and handed them to the SESSION as an instruction. A
+ * session that ignores a gated stage is a session nobody stops, and one that
+ * reports PLAN while calling Edit is believed. This is the fix, and it is the
+ * same fix as R28's profiles: the narrowing is in what the process is SPAWNED
+ * with, not in what it is asked.
+ *
+ * <p>One process per stage. Nothing carries across but what is written down —
+ * which is why R108's briefing and R109's stored plan had to come first.
+ *
+ * <p>A run with NO lifecycle spawns exactly as it always did. That is not a
+ * fallback, it is the ordinary case for ASK, ROADMAP and AUDIT, and for every
+ * project that has not configured one.
+ */
+async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, resume,
     projectServers, expertAgents, skills, instincts, briefing, lifecycle, shield) {
+  const spawn = (stage, carried) => spawnAgent(config, run, runToken, cwd, baseCommit, workspace,
+    resume, projectServers, expertAgents, skills, instincts, briefing, lifecycle, shield,
+    stage, carried);
+
+  // No lifecycle, or a resume: one process, exactly as before.
+  //
+  // A RESUME is deliberately not staged. `--resume` continues one conversation,
+  // and there is no conversation to continue when the work was five of them —
+  // R69's follow-up goes to the last stage that ran, which is the one the
+  // person was reading when they typed it.
+  if (!lifecycle?.length || resume) {
+    return spawnAgent(config, run, runToken, cwd, baseCommit, workspace, resume,
+      projectServers, expertAgents, skills, instincts, briefing, lifecycle, shield);
+  }
+
+  log(`  walking ${lifecycle.length} stage(s): ${lifecycle.map((s) => s.stage).join(' → ')}`);
+  const carried = {};
+  let last = null;
+
+  for (let at = 0; at < lifecycle.length; at++) {
+    const stage = lifecycle[at];
+    // Two attempts at most, and the second only exists because a REFUSED gate
+    // should cost one cheap stage rather than a whole run. A third would be a
+    // loop nobody asked for.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await reportStage(config, run, stage.stage, 'begin');
+      log(`  ${stage.stage}${stage.model ? ` on ${stage.model}` : ''}`
+        + `${attempt ? ' (again, after the gate refused it)' : ''}`);
+
+      last = await spawn(stage, carried);
+
+      if (last?.code !== 0) {
+        // A stage that died is the run failing, and R80's carry-on already
+        // knows what to do with a failed run — including that it KEEPS the
+        // workspace, so picking it back up does not start from origin.
+        await reportStage(config, run, stage.stage, 'report', {
+          state: 'FAILED',
+          outcome: `The ${stage.stage} stage exited with code ${last?.code}.`,
+        });
+        await finish(config, run, 'FAILED',
+          `The ${stage.stage} stage exited with code ${last?.code}. ${last?.text ?? ''}`.trim());
+        return;
+      }
+
+      await reportStage(config, run, stage.stage, 'report', {
+        state: 'DONE',
+        // The PLAN's text IS the plan — the artefact R109 exists to store, and
+        // the thing a person reads in the gate below.
+        plan: stage.stage === 'PLAN' ? last.text : null,
+        outcome: last.text,
+      });
+
+      if (stage.gate !== 'ASK') {
+        break;
+      }
+
+      const decision = await awaitGate(config, run, stage, last.text);
+      if (decision.allowed) {
+        break;
+      }
+      if (attempt === 1) {
+        await finish(config, run, 'FINISHED',
+          `Stopped at the ${stage.stage} gate: ${decision.reason ?? 'refused twice.'}`);
+        return;
+      }
+      // Refused once: the reason is the point of refusing, so it goes into the
+      // next attempt rather than into a log nobody reads.
+      carried[`${stage.stage} (refused)`] =
+        `${last.text}\n\n**This was refused.** ${decision.reason ?? 'No reason was given.'}`;
+    }
+
+    carried[stage.stage] = last.text;
+
+    // R108. The MEMORY stage's output IS the briefing, saved by the DAEMON
+    // rather than by the session calling a tool. One less thing to trust, and
+    // one less tool to hand a stage that should not be writing.
+    if (stage.stage === 'MEMORY' && last.text && run.branch) {
+      await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/briefing`, {
+        method: 'POST',
+        body: { body: last.text },
+      }).catch((failure) => log(`  could not save the briefing: ${failure.message}`));
+    }
+  }
+
+  // Every stage done, and nothing has ended the run — the agent's own
+  // `report done` usually has by now. This catches the lifecycle finishing
+  // without one, which would otherwise leave the run RUNNING for ever.
+  const current = await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}`)
+    .catch(() => null);
+  if (current?.live) {
+    await finish(config, run, 'FINISHED', last?.text ?? 'The lifecycle finished.');
+  }
+  await settleActions(config, run, cwd);
+}
+
+/** Tells the platform a stage began, or how it ended. Never fatal. */
+async function reportStage(config, run, stage, what, body = {}) {
+  const path = what === 'begin'
+    ? `/api/projects/${run.projectSlug}/runs/${run.id}/stages/${stage}/begin`
+    : `/api/projects/${run.projectSlug}/runs/${run.id}/stages/${stage}/report`;
+  await api(config, path, { method: 'POST', body })
+    .catch((failure) => log(`  could not report ${stage}: ${failure.message}`));
+}
+
+/**
+ * Waits for a person at a gated stage — R112.
+ *
+ * <p>On R51's approval and NOT on a third way of waiting. That is worth the
+ * sentence: reusing it brings the inbox row, the badge, the expiry and the
+ * decision UI, all of which already exist and none of which anybody has to
+ * maintain twice.
+ *
+ * <p>The summary is the stage's own output, which for a PLAN is the plan. So
+ * the person deciding is reading the plan — which is what R109 said an artefact
+ * was for, and would not be true of a summary this function wrote itself.
+ *
+ * <p><strong>Unreachable means refused</strong>, and it is the one direction
+ * this can fail in: a gate that let the run through when the platform was down
+ * would be a gate that opens under exactly the conditions nobody is watching.
+ */
+async function awaitGate(config, run, stage, text) {
+  let asked;
+  try {
+    asked = await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/approvals`, {
+      method: 'POST',
+      body: {
+        toolName: `stage:${stage.stage}`,
+        toolInput: JSON.stringify({ stage: stage.stage }),
+        summary: text?.trim()
+          || `The ${stage.stage} stage finished without saying anything.`,
+      },
+    });
+  } catch (failure) {
+    log(`  could not raise the ${stage.stage} gate: ${failure.message}`);
+    return { allowed: false, reason: `the gate could not be raised (${failure.message})` };
+  }
+
+  log(`  waiting at the ${stage.stage} gate`);
+  const deadline = Date.now() + gateTimeoutSeconds() * 1000;
+  while (Date.now() < deadline) {
+    const remaining = Math.ceil((deadline - Date.now()) / 1000);
+    try {
+      const decision = await api(config,
+        `/api/projects/${run.projectSlug}/runs/${run.id}/approvals/${asked.id}/decision`
+          + `?wait=${Math.min(25, Math.max(1, remaining))}`);
+      // A terminal state, or keep waiting. Checked on the STATE rather than on
+      // the transport — a 204 and a `{state: 'PENDING'}` both mean "not yet",
+      // and depending on which one the platform chose would be depending on
+      // something nobody promised.
+      if (decision && decision.state && decision.state !== 'PENDING') {
+        const allowed = decision.state === 'ALLOWED';
+        log(`  the ${stage.stage} gate was ${allowed ? 'allowed' : 'refused'}`);
+        return { allowed, reason: decision.reason ?? decision.note ?? null };
+      }
+    } catch (failure) {
+      log(`  waiting on the ${stage.stage} gate failed: ${failure.message}`);
+      return { allowed: false, reason: `waiting failed (${failure.message})` };
+    }
+  }
+  return { allowed: false, reason: 'nobody answered in time' };
+}
+
+/** A little past the platform's own expiry, like the MCP server's. */
+function gateTimeoutSeconds() {
+  const configured = Number(process.env.CAWDEV_GATE_TIMEOUT_SECONDS);
+  return Number.isFinite(configured) && configured > 0 ? configured : 960;
+}
+
+async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, resume,
+    projectServers, expertAgents, skills, instincts, briefing, lifecycle, shield, stage = null,
+    carried = null) {
   // R51: what this machine will let a STORED rule cover. The project's rules
   // are filtered through it before they go anywhere near a spawn, so the
   // platform can narrow what runs here and never widen it.
@@ -3874,8 +4155,12 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   // run that names none is spawned exactly as it was before R23.
   //
   // Before --allowedTools, which is variadic and would swallow it.
-  if (run.model) {
-    agentArgs.unshift('--model', run.model);
+  // R112. The stage's model when this is a stage, else the run's. This is the
+  // line that makes R109's router real: a router that resolved a model per
+  // stage into a single process was a row in a database that nothing read.
+  const model = stage?.model ?? run.model;
+  if (model) {
+    agentArgs.unshift('--model', model);
   }
 
   // How hard it is told to think: --effort low|medium|high|xhigh|max. Passed
@@ -3916,6 +4201,19 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     repoConfig: await readRepoConfig(cwd),
   });
 
+  // R112. A stage's tools are its own, narrowed from the PROFILE's rather than
+  // chosen freely — so a stage can never be handed something the profile would
+  // have refused. PLAN and VERIFY end up with no write tool at all, which is
+  // the whole entry.
+  const profileTools = codesFreely
+    ? agentArgs.slice(agentArgs.indexOf('--allowedTools') + 1)
+    : (PROFILE_TOOLS[run.profile] ?? READ_ONLY_CAWDEV);
+  const stageArgs = stage
+    ? [...argsBefore(agentArgs), '--allowedTools',
+      ...toolsForStage(stage.stage,
+        typeof profileTools === 'function' ? profileTools(run) : profileTools)]
+    : null;
+
   const args = [
     '--mcp-config',
     mcpConfigPath,
@@ -3923,7 +4221,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     // still says, in the session's own listing, that cawdev gave it something —
     // which is a lie a person would have to go and check.
     ...(pluginRoot ? ['--plugin-dir', pluginRoot] : []),
-    ...(codesFreely ? agentArgs : argsForProfile(agentArgs, run.profile, run)),
+    ...(stageArgs ?? (codesFreely ? agentArgs : argsForProfile(agentArgs, run.profile, run))),
   ];
   log(`  spawning: ${config.agentCommand} ${args.join(' ')} (prompt on stdin)`);
 
@@ -3986,7 +4284,8 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     // Not on a resume: that session already has all of this in its context, and
     // sending it again is a repeat wearing a resume's clothes — R69's rule about
     // the opening prompt, applied to the thing that now travels with it.
-    writeUserMessage(child, resume?.prompt ?? (promptFor(run) + harness));
+    writeUserMessage(child, resume?.prompt
+      ?? (promptFor(run) + harness + (stage ? stagePrompt(stage, carried) : '')));
 
     let lastText = '';
     // The last of what the CLI said on stderr, for the exit decision below.
@@ -3994,6 +4293,42 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     // alone would call every window a crash.
     let stderrTail = '';
     const transcript = new Transcript(config, run);
+
+    // R113. Nothing watched for silence, and a session that stops producing
+    // output holds its workspace until a person notices.
+    //
+    // It SAYS SO rather than killing. A daemon that ended runs on a timer would
+    // eventually end a legitimate twelve-minute test suite, and the cost of
+    // being wrong in that direction is somebody's work — while the cost of
+    // being wrong in this one is a line in a transcript.
+    let idleTimer = null;
+    let said = false;
+    const quiet = () => {
+      if (!config.idleSeconds) {
+        return;
+      }
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        if (said) {
+          return;
+        }
+        said = true;
+        const minutes = Math.round(config.idleSeconds / 60);
+        log(`  ${run.label}: nothing for ${minutes} minute(s)`);
+        transcript.push({
+          kind: 'ERROR',
+          body: `cawdev: this session has said nothing for ${minutes} minutes. It may be `
+            + 'thinking, running something long, or stuck — nothing has been stopped, and it '
+            + 'is holding this project\'s checkout while it is here.',
+        });
+      }, config.idleSeconds * 1000);
+      // Never hold the process open on this alone: a daemon that could not exit
+      // because a watchdog was pending would be a worse bug than the one it is
+      // here to catch.
+      idleTimer.unref?.();
+    };
+    quiet();
+
 
     // R61. Asked for a browser and not given one. Said on the RUN for the same
     // reason a refused rule is: the session is about to report that it could
@@ -4086,7 +4421,48 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
             });
           }
         }
+        // R113. Anything at all counts as alive.
+        said = false;
+        quiet();
+
         for (const recorded of linesOf(event, line)) {
+          // R113. The half of R110 that had the best argument and no code.
+          //
+          // A session that greps a config, cats a `.env`, or hits a stack trace
+          // with a token in it puts that in a transcript the platform stores
+          // and the console renders to everybody with READER. The permission
+          // handler cannot see this: it is asked about INPUTS, and this is what
+          // came back.
+          //
+          // Replaced rather than dropped. A tool result that vanished would be
+          // a session whose next turn makes no sense, and the redaction says
+          // what happened — which is also the only way anybody finds out.
+          if (shield?.blockSecrets !== false && recorded.kind === 'TOOL_RESULT') {
+            const found = findSecret(recorded.body);
+            if (found) {
+              recorded.body = `[cawdev removed ${found.name} from this result] ${found.redacted}`;
+              // Not awaited: this handler is the stream's, and a synchronous
+              // reader that stopped to talk to the platform would stall the
+              // transcript behind the network.
+              api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/blocks`, {
+                method: 'POST',
+                body: { kind: 'SECRET', detail: `${found.name}: ${found.redacted}` },
+              }).catch(() => {
+                // Bookkeeping. The credential is already out of the line above,
+                // which is the part that mattered.
+              });
+            }
+          }
+          // R113. What it SAID it was doing against what it DID. Noticed, never
+          // blocked: R112 does the blocking by not handing over the tool, and a
+          // second thing that can stop a run is a second thing that can stop it
+          // wrongly.
+          if (stage && recorded.kind === 'TOOL') {
+            const drifted = driftedFrom(stage.stage, recorded.body);
+            if (drifted) {
+              transcript.push({ kind: 'ERROR', body: drifted });
+            }
+          }
           transcript.push(recorded);
         }
       }
@@ -4110,7 +4486,11 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       await transcript.flush();
       await finish(config, run, 'FAILED', `Could not spawn the agent: ${failure.message}`);
       await rm(mcpDirectory, { recursive: true, force: true });
-      resolvePromise();
+      clearTimeout(idleTimer);
+      // A spawn that never happened has no exit code. The run is already
+      // FAILED above, so the loop is told the stage did not succeed and stops
+      // — it must not read `code: undefined` as "fine".
+      resolvePromise(stage ? { code: -1, signal: null, text: failure.message } : undefined);
     });
 
     // `close`, not `exit`, for the reason git() gives: the last stream-json
@@ -4166,12 +4546,16 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
               resetsAt: limit.resetsAt ? limit.resetsAt.toISOString() : null,
             }],
           }).catch((failure) => log(`  could not report the window: ${failure.message}`));
-        } else {
+        } else if (!stage) {
           const summary = signal
             ? `The agent was terminated (${signal}).`
             : `The agent exited with code ${code} without reporting. ${lastText}`.trim();
           await finish(config, run, code === 0 ? 'FINISHED' : 'FAILED', summary);
         }
+        // R112. A STAGE ending is not the RUN ending. The loop decides that —
+        // it is the only thing that knows whether there is another stage — and
+        // a stage that finished the run here would end it four fifths of the
+        // way through the first time PLAN succeeded.
       }
 
       // The run has ended, which is the moment its project's rules queue a
@@ -4180,14 +4564,22 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       // pass that performs them. It has to come BEFORE the last reading, or
       // the push state and PR link the console shows would be the ones from
       // before the rules ran.
-      await settleActions(config, run, cwd);
+      //
+      // R112: not between stages. A push after PLAN would push nothing and a
+      // pull request after it would be a pull request for an empty branch.
+      if (!stage) {
+        await settleActions(config, run, cwd);
+      }
 
       // The last reading, after the agent has stopped changing things and after
       // anything the rules did. It usually lands *after* the run is already
       // FINISHED, because the agent ends its own run by reporting — which the
       // API allows for exactly this.
       await reportCommits(config, run, cwd, baseCommit);
-      resolvePromise();
+      // R112. A stage hands its result back so the loop can store the plan,
+      // gate on it, and carry it into the next stage. A run with no lifecycle
+      // resolves with nothing, exactly as it always did.
+      resolvePromise(stage ? { code, signal, text: lastText } : undefined);
     });
   });
 }

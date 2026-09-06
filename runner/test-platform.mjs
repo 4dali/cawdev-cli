@@ -44,6 +44,10 @@ export async function fakePlatform({
   mcpServers = [],
   expertAgents = [],
   skills = [],
+  instincts = [],
+  workflow = [],
+  shield = null,
+  gateDecision = null,
   brief = {
     path: 'docs/brief',
     index: 'docs/brief/README.md',
@@ -73,6 +77,14 @@ export async function fakePlatform({
   const usage = [];
   /** What the daemon read out of each repository — R24, and R96's `brief`. */
   const gitReadings = [];
+  /** R112: every stage begin and report the daemon sent, in order. */
+  const stageCalls = [];
+  /** R112: the approvals it raised at a gate. */
+  const gates = [];
+  /** R108: the briefings it saved. */
+  const briefings = [];
+  /** R110: what it said the shield stopped. */
+  const blocks = [];
 
   const server = createServer((request, response) => {
     seen.push(`${request.method} ${request.url.split('?')[0]}`);
@@ -126,6 +138,9 @@ export async function fakePlatform({
           mcpServers,
           expertAgents,
           skills,
+          instincts,
+          workflow,
+          shield,
           brief,
         }));
       }
@@ -136,6 +151,35 @@ export async function fakePlatform({
         });
         return response.end('{}');
       }
+      // R112. The stages a run walks, and the gate it may stop at.
+      //
+      // `gateDecision` is what a person would have answered. Null leaves the
+      // approval PENDING, which is how a test watches the daemon WAIT — the
+      // interesting half, and the one a stub that always answered could not
+      // show.
+      if (url.includes('/stages/') && request.method === 'POST') {
+        const [, stage, what] = url.match(/\/stages\/([A-Z]+)\/(begin|report)/) ?? [];
+        stageCalls.push({ stage, what, body: JSON.parse(body || '{}') });
+        return response.end(JSON.stringify({ stage, state: 'DONE' }));
+      }
+      if (url.includes('/approvals') && request.method === 'POST') {
+        gates.push(JSON.parse(body || '{}'));
+        return response.end(JSON.stringify({ id: `approval-${gates.length}` }));
+      }
+      if (url.includes('/decision')) {
+        // PENDING is how a test watches the daemon WAIT, which is the
+        // interesting half — a stub that always answered could not show it.
+        return response.end(JSON.stringify({ state: gateDecision ?? 'PENDING' }));
+      }
+      if (url.endsWith('/briefing') && request.method === 'POST') {
+        briefings.push(JSON.parse(body || '{}'));
+        return response.end(JSON.stringify({ id: 'briefing-1' }));
+      }
+      if (url.endsWith('/blocks') && request.method === 'POST') {
+        blocks.push(JSON.parse(body || '{}'));
+        return response.end(JSON.stringify({ kind: 'SECRET' }));
+      }
+
       if (url.endsWith('/tool-rules')) {
         // A list, because the real one answers with a list. The catch-all below
         // answers `{}`, which the daemon then reports as "could not read this
@@ -202,6 +246,10 @@ export async function fakePlatform({
   const url = `http://127.0.0.1:${server.address().port}`;
   return {
     url,
+    stageCalls,
+    gates,
+    briefings,
+    blocks,
     /**
      * The environment to spawn the daemon with, and it is not `process.env`.
      *
