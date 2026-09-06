@@ -37,6 +37,7 @@ const SECTION_ORDER = [
   'Phase 3 — the console drives the agent',
   'Phase 4 — roadmap, issues and development: three boards and one dashboard',
   'Phase 5 — agents, skills and a marketplace',
+  'Phase 6 — the meta-harness: a lifecycle, not a chat',
   'The generated files and the tools',
   // Named rather than appended: six entries were arriving here silently, which
   // is the state R45's note exists to end. Last, because a finding somebody
