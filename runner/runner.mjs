@@ -3106,6 +3106,11 @@ const PROFILE_TOOLS = {
     ...READ_ONLY_CAWDEV,
     'mcp__cawdev__ask_group',
     'mcp__cawdev__await_group',
+    // R101. Where it stands, and the wait on the person's decision. Without
+    // these the session cannot find out that it has asked its last round, and
+    // the refusal it gets from ask_group reads as a failure.
+    'mcp__cawdev__interview_rounds',
+    'mcp__cawdev__await_more_rounds',
     ...READ_FILES,
     ...briefWrites(run),
     'Bash(git *)',
@@ -3227,8 +3232,19 @@ is worth ten of "how does authorisation work?". Offer \`options\` when there is 
 set of plausible answers; they can always write their own. Between rounds, read again:
 a good answer opens a door you have not looked through yet.
 
-**Keep going until nothing is in doubt.** Several rounds, not one. Before you stop, ask
-yourself what a new agent would still get wrong here, and ask THAT.
+**How many rounds you get, and who decides.** You start with THREE rounds of up to
+twelve questions. That is a sitting, and it is enough for what this project is, what
+it must never do, and how work is done here — so spend them on what an agent cannot
+work out by reading. Call \`interview_rounds\` if you are unsure where you stand.
+
+When you have used them, call \`await_more_rounds\` and WAIT. The person is shown two
+buttons. *I have more time* gives you three more; *finish here* means stop asking and
+write the brief from what has been answered — not from what you wish you had asked.
+**Six rounds is the ceiling and it is not yours to raise**; asking past your allowance
+is refused by the platform, and the refusal is not a failure, it is the answer.
+
+Before your last allowed round, ask yourself what a new agent would still get wrong
+here, and spend that round on it.
 
 **Then write the brief.** ${brief.index} is the index, and it is the file every future
 session is handed: open it with a short paragraph saying what this project is and what

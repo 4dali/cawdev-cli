@@ -270,6 +270,21 @@ async function pollForGroup(config, project, runId, groupId, seconds) {
   return null;
 }
 
+/** Where an interview stands, in the words the agent needs — R101. */
+function renderRounds(where) {
+  const left = Math.max(0, where.roundsAllowed - where.roundsAsked);
+  if (where.finishNow) {
+    return 'They have said to finish. Write the brief from what has been answered.';
+  }
+  return (
+    `Round ${where.roundsAsked} of ${where.roundsAllowed} asked, ${where.roundsAnswered} ` +
+    `answered. You may ask ${left} more (the ceiling is ${where.mostRounds}). ` +
+    (left === 0
+      ? 'Call await_more_rounds: the person is being asked whether they have time for more.'
+      : '')
+  ).trim();
+}
+
 /**
  * A finished round, as the session reads it back.
  *
@@ -1137,6 +1152,61 @@ const TOOLS = [
         return renderRound(null, answered);
       }
       return `Still unfinished. Call await_group again with group_id ${args.group_id}.`;
+    },
+  },
+
+  {
+    name: 'interview_rounds',
+    description:
+      'CTO INTERVIEW ONLY. Where this interview stands: rounds asked, rounds answered, and how ' +
+      'many you may ask. The budget is the platform\'s, not yours — asking past it is refused.',
+    inputSchema: { type: 'object', properties: {} },
+    handler: async (config) => {
+      const { runId, project } = await requireRun(config);
+      const where = await api(config, `/api/projects/${project}/runs/${runId}/interview`);
+      return renderRounds(where);
+    },
+  },
+
+  {
+    name: 'await_more_rounds',
+    description:
+      'CTO INTERVIEW ONLY. You have asked every round you are allowed. Call this and WAIT: the ' +
+      'person is being shown two buttons — "I have more time", which gives you three more ' +
+      'rounds, and "finish here", which means write the brief from what has been answered. Do ' +
+      'not ask another round until this says you may.',
+    inputSchema: { type: 'object', properties: {} },
+    handler: async (config) => {
+      const { runId, project } = await requireRun(config);
+      const where = await api(config, `/api/projects/${project}/runs/${runId}/interview`);
+
+      const deadline = Date.now() + askTimeoutSeconds() * 1000;
+      while (Date.now() < deadline) {
+        const remaining = Math.ceil((deadline - Date.now()) / 1000);
+        const response = await fetch(
+          `${config.url}/api/projects/${project}/runs/${runId}/interview/decision` +
+            `?asked=${where.roundsAsked}&wait=${Math.min(25, Math.max(1, remaining))}`,
+          { headers: { authorization: `Bearer ${config.token}` } },
+        );
+        if (response.status === 200) {
+          const decided = await response.json();
+          return decided.finishNow
+            ? 'They said FINISH HERE. Write the brief now, from what has been answered — not ' +
+              'from what you wish you had asked. Do not ask another round.'
+            : `They have more time. ${renderRounds(decided)}`;
+        }
+        if (response.status !== 204) {
+          const text = await response.text();
+          throw new CawdevError(
+            safeJson(text)?.message ?? `waiting failed: HTTP ${response.status}`,
+          );
+        }
+      }
+      return (
+        'Nobody has decided yet. Call await_more_rounds again to keep waiting, or write the ' +
+        'brief from what has been answered — which is never wrong, because everything you have ' +
+        'asked has been answered.'
+      );
     },
   },
 
