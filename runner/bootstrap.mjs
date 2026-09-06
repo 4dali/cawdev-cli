@@ -146,7 +146,14 @@ export async function mintRunnerToken(session, slugs, name) {
   for (const slug of slugs) {
     grants[slug] = ['runner:operate'];
   }
-  const minted = await session.request('/api/agent-tokens', {
+  // `/api/tokens`, which is what the spec has always called it. This said
+  // `/api/agent-tokens` — the name on the console's PAGE rather than the one on
+  // the endpoint — so R93's walk had never once minted a token against a real
+  // platform. Every test passed because the fake session next door was written
+  // from the same wrong guess, which is the failure `openapi.test.mjs` now
+  // makes impossible: paths are checked against `openapi.yaml`, not against a
+  // second copy of the assumption.
+  const minted = await session.request('/api/tokens', {
     method: 'POST',
     body: { label: `${name} (runner)`, grants },
   });

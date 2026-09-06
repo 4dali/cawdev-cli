@@ -44,7 +44,7 @@ function fakeSession({ projects = [], email = 'you@example.com' } = {}) {
       if (path === '/api/projects') {
         return projects;
       }
-      if (path === '/api/agent-tokens') {
+      if (path === '/api/tokens') {
         seen.push(JSON.stringify(options.body.grants));
         return { secret: 'cawd_minted', token: { id: 'abc' } };
       }
