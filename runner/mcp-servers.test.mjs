@@ -143,7 +143,7 @@ setTimeout(() => {}, 60000);
  * @param workspaces how many checkouts the project has here — R47. Two runs in
  *   two workspaces is how "share one index" is proved.
  */
-async function daemonWith(t, { name, wants, offers, workspaces = 1 }) {
+async function daemonWith(t, { name, wants, offers, workspaces = 1, experts = [] }) {
   const home = await mkdtemp(join(tmpdir(), 'cawdev-skillcfg-'));
   const indexer = await aFakeIndexer(home);
   const agent = await anEchoingAgent(home);
@@ -173,6 +173,7 @@ async function daemonWith(t, { name, wants, offers, workspaces = 1 }) {
       profile: 'CODE',
     }],
     mcpServers,
+    expertAgents: experts,
     // The child has to outlive the reaper: everything here is read off what it
     // printed, and a run the platform calls FINISHED is one the daemon stops
     // before it has said anything.
@@ -509,4 +510,47 @@ setTimeout(() => {}, 60000);
   // thing that knows where one child ended and the next began.
   assert.deepEqual(reported && { tokensIn: reported.tokensIn, tokensOut: reported.tokensOut },
     { tokensIn: 120, tokensOut: 7 });
+});
+
+// --- R104: the experts were loaded and unreachable ---------------------------
+//
+// The platform picks a run's experts by ACTION and the daemon writes them into
+// a plugin directory, both correctly and both tested. Nothing allowed the tool
+// that CALLS one. A session is spawned with `--setting-sources ''`, so it gets
+// exactly the list it is handed — and `Agent` was in no profile's list and in
+// no default, which made every expert on every project a file the CLI loaded
+// and the session could not use. `run-plugin.mjs` names the symptom in its own
+// header: a session that quietly does not delegate.
+
+const AN_EXPERT = {
+  key: 'code-reviewer',
+  name: 'code-reviewer',
+  description: 'Reviews a diff',
+  body: 'You review diffs.',
+  model: null,
+};
+
+test('a run with an expert can reach it', async (t) => {
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-expert-yes',
+    experts: [AN_EXPERT],
+  });
+
+  assert.ok(await platform.untilSaidOnTheRun(/ARGV /), said());
+  const argv = argvFrom(platform);
+  assert.match(argv, /--plugin-dir/, 'the expert was not delivered at all');
+  assert.match(argv, /(^| )Agent( |$)/,
+    `the expert is loaded and unreachable:\n${argv}`);
+});
+
+test('a run with no experts is spawned exactly as it was before', async (t) => {
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-expert-no',
+  });
+
+  assert.ok(await platform.untilSaidOnTheRun(/ARGV /), said());
+  // Vanilla, deliberately. Handing `Agent` to a session with an empty plugin
+  // directory offers a capability with nothing behind it, which is how a run
+  // spends a turn discovering there is nobody to ask.
+  assert.doesNotMatch(argvFrom(platform), /(^| )Agent( |$)/);
 });

@@ -56,11 +56,13 @@ export function bannerLines(config, ink) {
     say('serving', ink.danger('nothing'));
   }
 
-  // The machine's own ceiling, and it counts EVERY profile — R70. Said here
-  // because the line above it counts only one, and two numbers that bound
-  // different things read as one number applied twice unless each says which.
-  say('at once', `${ink.text(String(config.maxSessions))} `
-    + ink.muted('sessions, this machine — any profile'));
+  // R109 removed the machine-wide `maxSessions`: it bounded PROCESSES, and a
+  // delegated expert runs inside its parent's session and costs none, so the
+  // number it capped was never the number anybody was worried about. The line
+  // stayed and printed `undefined sessions, this machine`, which reads as a
+  // misconfiguration on a machine that has none. What bounds a run is the
+  // workspace, and the line above already says how many there are.
+  say('at once', ink.muted('one coding run per checkout — the only gate there is'));
 
   // Said either way. "Off" is the answer to a question somebody will ask when
   // a run reports it could not look at the page, and a line that only appears

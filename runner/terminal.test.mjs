@@ -29,19 +29,30 @@ const plainBanner = (c, depth = 3) =>
 
 // --- the launch banner --------------------------------------------------------
 
-test('the banner carries the five settings that decide what the machine does', () => {
+test('the banner carries the settings that decide what the machine does', () => {
   const said = plainBanner(config);
   assert.match(said, /http:\/\/localhost:8091/, 'which cawdev this is');
   assert.match(said, /macbook/, 'the name runs are claimed under');
   assert.match(said, /dycrypt\s+1 checkout/);
   assert.match(said, /cawdev\s+2 checkouts/, "R47's per-project ceiling");
-  assert.match(said, /4 sessions/, "the machine's own cap");
-  // R70: two numbers that bound different things read as one number applied
-  // twice unless each says which, and this banner is where somebody looks
-  // first when a question is sitting in a queue.
+  // R70's second number is gone with R109's `maxSessions` — it bounded
+  // PROCESSES, and a delegated expert runs inside its parent's session and
+  // costs none. The line outlived the setting and printed `undefined sessions`
+  // on every config that did not still carry one, which is most of them and
+  // all of the ones R93 generates.
   assert.match(said, /2 checkouts, so 2 coding runs/, 'what the per-project number caps');
   assert.match(said, /1 checkout, so 1 coding run\b/, 'and it counts in ones too');
-  assert.match(said, /4 sessions, this machine — any profile/, 'and what the cap does not');
+  assert.match(said, /one coding run per checkout/, 'the only gate there is');
+});
+
+test('the banner says nothing about a setting that no longer exists', () => {
+  // The failure this replaces: `String(undefined)` reads as a misconfiguration
+  // on a machine that has none, and it was the first line of a log that ended
+  // in a run dying for an unrelated reason.
+  for (const c of [config, { ...config, maxSessions: undefined }]) {
+    assert.doesNotMatch(plainBanner(c), /undefined/,
+      'a banner is what somebody reads first when something is wrong');
+  }
 });
 
 test('the browser line is there when it is off, because that is the question', () => {

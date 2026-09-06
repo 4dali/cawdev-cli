@@ -37,6 +37,19 @@ const DEFAULTS = {
   url: 'http://localhost:8091',
   name: 'this-machine',
   /**
+   * The agent this machine spawns.
+   *
+   * There was no default here, and every config that worked happened to name
+   * one or inherit `CAWDEV_AGENT_COMMAND` from the shell that started the
+   * daemon. R93's generated config names neither — `configFor` writes the
+   * smallest file that boots, and this was not in it — so a machine set up by
+   * the walk spawned `undefined` and every run on it died with
+   * `The "file" argument must be of type string`, which names no cause and no
+   * cure. A default that is simply the thing this daemon exists to run costs
+   * nothing and cannot be missing.
+   */
+  agentCommand: 'claude',
+  /**
    * Verified against Claude Code 2.1.247.
    *
    * `--permission-mode acceptEdits` matters more than it looks: a spawned agent
@@ -3136,6 +3149,46 @@ function briefWrites(run) {
   return [`Write(${path}/**)`, `Edit(${path}/**)`];
 }
 
+/**
+ * The tool a session delegates with — R104, and the reason its experts were
+ * never reached.
+ *
+ * The platform picks a run's experts by ACTION and the daemon writes them into
+ * a plugin directory, both correctly. Nothing allowed the tool that calls one.
+ * A session spawned with `--setting-sources ''` gets exactly the list it is
+ * handed, `Agent` was in no profile's list and in no default, so every expert
+ * on every project was loaded and unreachable — the symptom `run-plugin.mjs`
+ * names in its own header: *a session that quietly does not delegate.*
+ *
+ * `Agent` is the name on **Claude Code 2.1.263**, checked against the running
+ * binary rather than remembered; `Task` is what older builds called it and is
+ * matched wherever this is recognised, so a machine on an older CLI is not
+ * silently narrowed.
+ */
+const DELEGATE = 'Agent';
+
+/**
+ * The profile's tools, plus delegation when this run has somebody to delegate
+ * TO.
+ *
+ * <p>Conditional on purpose, and it is the sentence the entry asks for: a
+ * project with no experts turned on runs exactly as it did before, and a
+ * project with one gets the tool that reaches it. Handing `Agent` to a session
+ * with an empty plugin directory offers a capability with nothing behind it,
+ * which is how a run spends a turn discovering there is nobody to ask.
+ *
+ * <p>Read-only stages drop it again in `toolsForStage`, because
+ * `canChangeThings` knows delegation is a writer. This function does not need
+ * to know that, and should not: one place decides what a stage may hold.
+ */
+function withDelegation(tools, expertAgents) {
+  const list = Array.isArray(tools) ? tools : [];
+  if (!expertAgents?.length || list.includes(DELEGATE)) {
+    return list;
+  }
+  return [...list, DELEGATE];
+}
+
 const PROFILE_TOOLS = {
   ASK: READ_ONLY_CAWDEV,
   // R104's profile, and it was MISSING from this table until R112 — so a review
@@ -3203,7 +3256,7 @@ function argsBefore(agentArgs) {
   return kept;
 }
 
-function argsForProfile(agentArgs, profile, run) {
+function argsForProfile(agentArgs, profile, run, expertAgents = []) {
   const kept = [];
   for (let i = 0; i < agentArgs.length; i++) {
     if (agentArgs[i] === '--allowedTools') {
@@ -3225,7 +3278,7 @@ function argsForProfile(agentArgs, profile, run) {
   }
   const allowed = PROFILE_TOOLS[profile] ?? READ_ONLY_CAWDEV;
   return [...kept, '--allowedTools',
-    ...(typeof allowed === 'function' ? allowed(run) : allowed)];
+    ...withDelegation(typeof allowed === 'function' ? allowed(run) : allowed, expertAgents)];
 }
 
 /**
@@ -4252,7 +4305,8 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   const stageArgs = stage
     ? [...argsBefore(agentArgs), '--allowedTools',
       ...toolsForStage(stage.stage,
-        typeof profileTools === 'function' ? profileTools(run) : profileTools)]
+        withDelegation(typeof profileTools === 'function' ? profileTools(run) : profileTools,
+          expertAgents))]
     : null;
 
   const args = [
@@ -4262,7 +4316,10 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     // still says, in the session's own listing, that cawdev gave it something —
     // which is a lie a person would have to go and check.
     ...(pluginRoot ? ['--plugin-dir', pluginRoot] : []),
-    ...(stageArgs ?? (codesFreely ? agentArgs : argsForProfile(agentArgs, run.profile, run))),
+    ...(stageArgs ?? (codesFreely
+      ? [...argsBefore(agentArgs), '--allowedTools',
+        ...withDelegation(agentArgs.slice(agentArgs.indexOf('--allowedTools') + 1), expertAgents)]
+      : argsForProfile(agentArgs, run.profile, run, expertAgents))),
   ];
   log(`  spawning: ${config.agentCommand} ${args.join(' ')} (prompt on stdin)`);
 
