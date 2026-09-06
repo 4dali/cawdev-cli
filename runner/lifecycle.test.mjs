@@ -127,7 +127,12 @@ test('with a lifecycle, the daemon walks it and reports every stage', async (t) 
   // thing R109's router could not do at all before this.
   assert.match(said(), /PLAN on haiku/);
 
-  await until(said, /IMPLEMENT/);
+  // Wait for the REPORT rather than for a log line. A log line saying
+  // IMPLEMENT means the stage started; the reports arrive when each process
+  // closes, and asserting on them straight after the log is a race that passes
+  // on a quiet machine and fails under a full suite — which is exactly how it
+  // behaved before this line.
+  assert.ok(await untilReported(platform, 'IMPLEMENT'), said());
   const reported = platform.stageCalls.map((each) => `${each.stage}:${each.what}`);
   assert.deepEqual(reported.slice(0, 4),
     ['PLAN:begin', 'PLAN:report', 'IMPLEMENT:begin', 'IMPLEMENT:report'], reported.join(' '));
