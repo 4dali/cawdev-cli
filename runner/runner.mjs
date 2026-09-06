@@ -26,6 +26,7 @@ import { bannerLines, tintLog } from './banner.mjs';
 import { codeMapOf } from '../lib/code-map.mjs';
 import { usageLimitOf } from '../lib/usage-limit.mjs';
 import { writeRunPlugin } from '../lib/run-plugin.mjs';
+import { AI_CONFIG, harnessPrompt, readRepoConfig } from '../lib/harness-prompt.mjs';
 
 // --- configuration -----------------------------------------------------------
 
@@ -3572,6 +3573,12 @@ async function startRun(config, offered, workspace) {
   // an MCP server executes on this machine, and these enter a context.
   let expertAgents = [];
   let skills = [];
+  // R107–R110. What this project tells a session, what the last one left, the
+  // lifecycle to walk, and what is guarded against.
+  let instincts = [];
+  let briefing = null;
+  let lifecycle = [];
+  let shield = null;
 
   try {
     log(`claiming ${run.projectSlug} ${run.label} on ${run.branch}`);
@@ -3615,6 +3622,19 @@ async function startRun(config, offered, workspace) {
     // count logged here is what the session will actually be handed.
     expertAgents = Array.isArray(claimed.expertAgents) ? claimed.expertAgents : [];
     skills = Array.isArray(claimed.skills) ? claimed.skills : [];
+    instincts = Array.isArray(claimed.instincts) ? claimed.instincts : [];
+    briefing = claimed.briefing ?? null;
+    lifecycle = Array.isArray(claimed.workflow) ? claimed.workflow : [];
+    shield = claimed.shield ?? null;
+    if (instincts.length) {
+      log(`  instincts: ${instincts.map((each) => each.key).join(', ')}`);
+    }
+    if (briefing) {
+      log(`  resuming from a briefing left on ${run.branch}`);
+    }
+    if (lifecycle.length) {
+      log(`  lifecycle: ${lifecycle.map((each) => each.stage).join(' → ')}`);
+    }
     if (expertAgents.length || skills.length) {
       log(`  experts: ${expertAgents.map((each) => each.key).join(', ') || 'none'}`
         + ` | skills: ${skills.map((each) => each.key).join(', ') || 'none'}`);
@@ -3659,7 +3679,7 @@ async function startRun(config, offered, workspace) {
     });
 
     await spawnAgent(config, run, runToken, resolve(path), baseCommit, workspace, resume,
-        mcpServers, expertAgents, skills);
+        mcpServers, expertAgents, skills, instincts, briefing, lifecycle, shield);
   } catch (failure) {
     // Anything that goes wrong before or during the spawn is the run's failure,
     // and the reason belongs on the run where someone will see it.
@@ -3710,7 +3730,7 @@ function writesAnythingProfile(run) {
  * confused or misbehaving session can do is act on the run it was started for.
  */
 async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, resume,
-    projectServers, expertAgents, skills) {
+    projectServers, expertAgents, skills, instincts, briefing, lifecycle, shield) {
   // R51: what this machine will let a STORED rule cover. The project's rules
   // are filtered through it before they go anywhere near a spawn, so the
   // platform can narrow what runs here and never widen it.
@@ -3793,6 +3813,11 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       // capability — see `suggestionFor`.
       CAWDEV_SKILL_SERVERS: JSON.stringify(
         attached.map(({ skill }) => skill.toolPrefix ?? `mcp__${skill.serverName}`)),
+      // R110. The policy, and the checkout it is measured against. The CHECK is
+      // the server's — it is the process Claude Code asks before a tool call,
+      // and there is nowhere else the answer can be given in time.
+      CAWDEV_SHIELD: JSON.stringify(shield ?? {}),
+      CAWDEV_WORKSPACE: cwd,
     },
   };
   await writeFile(mcpConfigPath, JSON.stringify({ mcpServers }, null, 2));
@@ -3882,6 +3907,15 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   // was prepared — R96. An interview has one and is still spawned with its own
   // list: it may read everything, write the brief, and commit, and that is all.
   const codesFreely = writesAnythingProfile(run);
+  // R107's two halves meet here: the platform's instincts, and the repository's
+  // own `.ai-config.md` read out of the checkout this run is standing in.
+  const harness = harnessPrompt({
+    instincts,
+    briefing,
+    lifecycle,
+    repoConfig: await readRepoConfig(cwd),
+  });
+
   const args = [
     '--mcp-config',
     mcpConfigPath,
@@ -3946,7 +3980,13 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     // answer and the preamble that told it what it may do. Writing promptFor()
     // again would ask it the original question a second time, which is a repeat
     // wearing a resume's clothes.
-    writeUserMessage(child, resume?.prompt ?? promptFor(run));
+    // R107–R109. The profile's prompt, then what this PROJECT adds — appended
+    // and labelled, so the session can tell a standing rule from its task.
+    //
+    // Not on a resume: that session already has all of this in its context, and
+    // sending it again is a repeat wearing a resume's clothes — R69's rule about
+    // the opening prompt, applied to the thing that now travels with it.
+    writeUserMessage(child, resume?.prompt ?? (promptFor(run) + harness));
 
     let lastText = '';
     // The last of what the CLI said on stderr, for the exit decision below.

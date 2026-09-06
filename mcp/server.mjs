@@ -20,6 +20,7 @@ import {
   summaryOf,
   withinCeiling,
 } from '../lib/tool-rules.mjs';
+import { findDestructive, withinScope } from '../lib/secrets.mjs';
 
 const NAME = 'cawdev';
 const VERSION = '0.1.0';
@@ -1290,8 +1291,25 @@ async function decide(config, args) {
     // reported itself blocked on npm, ng and most of Bash for a whole session,
     // and nothing appeared in anyone's inbox. Unreadable rules means no rule
     // applies, which means ask — the direction everything here fails in.
-    const live = (await liveRules(config, project))
-      .filter((pattern) => withinCeiling(grantable(), pattern));
+    // R110. The shield FIRST, and the ordering is the point — see shieldSays.
+    // A hit does not deny; it skips the rules and goes straight to a person,
+    // and it is recorded so somebody can see what was stopped.
+    const stopped = shieldSays(shieldPolicy(), toolName, input);
+    if (stopped) {
+      await api(config, `/api/projects/${project}/runs/${runId}/blocks`, {
+        method: 'POST',
+        body: { kind: stopped.kind, detail: `${stopped.reason}: ${stopped.detail}` },
+      }).catch(() => {
+        // Recording is bookkeeping. Failing to record must not turn a question
+        // into a denial — the person still gets asked below, which is the part
+        // that matters.
+      });
+    }
+
+    const live = stopped
+      ? []
+      : (await liveRules(config, project))
+        .filter((pattern) => withinCeiling(grantable(), pattern));
 
     const covered = coveredBy(live, toolName, input);
     if (covered) {
@@ -1312,7 +1330,9 @@ async function decide(config, args) {
     // Its own try, like liveRules and for the same reason: not knowing what was
     // granted is a fact about the platform, not about this call, and the honest
     // consequence is to ask again rather than to deny.
-    const granted = coveredBy(await sessionRules(config, project, runId), toolName, input);
+    const granted = stopped
+      ? null
+      : coveredBy(await sessionRules(config, project, runId), toolName, input);
     if (granted) {
       return allow(input, `allowed for this session by ${granted}`);
     }
@@ -1322,7 +1342,9 @@ async function decide(config, args) {
       body: {
         toolName,
         toolInput: JSON.stringify(input),
-        summary: summaryOf(toolName, input),
+        summary: stopped
+          ? `${summaryOf(toolName, input)} — stopped by the shield: ${stopped.reason}`
+          : summaryOf(toolName, input),
         suggestion: suggestionFor(toolName, input, { skillServers: skillServers() }),
         toolUseId: args.tool_use_id,
       },
@@ -1428,6 +1450,61 @@ function grantable() {
  * grants nothing by itself — a person still says yes, and R60's session rule is
  * what carries it.
  */
+/**
+ * What this project's shield says — R110.
+ *
+ * <p>Handed down from the claim through the runner's environment, like
+ * `CAWDEV_SKILL_SERVERS`. Unreadable means GUARDED, which is the opposite of
+ * how everything else in this file fails: an unreadable rule means "ask", and an
+ * unreadable shield means "ask" too — they agree, and the reason is the same.
+ * The direction that is never taken is "allow".
+ */
+function shieldPolicy() {
+  try {
+    const parsed = JSON.parse(process.env.CAWDEV_SHIELD ?? '{}');
+    return {
+      blockSecrets: parsed.blockSecrets !== false,
+      blockDestructive: parsed.blockDestructive !== false,
+      pathScope: Array.isArray(parsed.pathScope) ? parsed.pathScope : null,
+      root: process.env.CAWDEV_WORKSPACE ?? process.cwd(),
+    };
+  } catch {
+    return { blockSecrets: true, blockDestructive: true, pathScope: null, root: process.cwd() };
+  }
+}
+
+/**
+ * What the shield says about this call, or null — R110.
+ *
+ * <p>Checked BEFORE the project's rules, and that ordering is the entry. A rule
+ * reading `Bash(rm *)` is a rule somebody wrote meaning "may tidy up", and its
+ * literal effect includes `rm -rf /`. If the shield ran after it, the rule would
+ * silently cover the one command it exists to stop.
+ *
+ * <p>The result is a QUESTION, not a refusal: this returns a reason, and the
+ * caller falls through to asking a person. A shield that ended runs is a shield
+ * people turn off.
+ */
+function shieldSays(policy, toolName, input) {
+  if (policy.blockDestructive && toolName === 'Bash') {
+    const found = findDestructive(String(input.command ?? ''));
+    if (found) {
+      return { kind: 'DESTRUCTIVE', reason: found.name, detail: found.redacted };
+    }
+  }
+  const path = input.file_path ?? input.path ?? input.notebook_path;
+  if (path && !withinScope(String(path), policy.root, policy.pathScope)) {
+    return {
+      kind: 'SCOPE',
+      reason: policy.pathScope
+        ? 'outside the paths this project allows'
+        : 'outside this run\'s checkout',
+      detail: String(path),
+    };
+  }
+  return null;
+}
+
 function skillServers() {
   try {
     const parsed = JSON.parse(process.env.CAWDEV_SKILL_SERVERS ?? '[]');
