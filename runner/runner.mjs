@@ -1637,6 +1637,13 @@ async function surveyGit(config) {
     // task becomes the thing somebody turns off.
     await reportCodeMap(config, slug, path, reading.headSha ?? null,
         reading.defaultBranch ?? 'main');
+
+    // R99. The brief, on the same trigger and for the same reason: it is a fact
+    // about the default branch, and the platform holds no repository contents,
+    // so a document it hands to sessions has to have been read by something
+    // that has the checkout.
+    await reportBrief(config, slug, path, reading.headSha ?? null,
+        reading.defaultBranch ?? 'main');
   }
 }
 
@@ -1682,6 +1689,76 @@ async function reportCodeMap(config, slug, path, headSha, defaultBranch, { force
   }).catch((failure) => log(`  could not report the code map: ${failure.message}`));
 }
 
+/**
+ * Reads the brief off the default branch and reports it — R99.
+ *
+ * <p>Remembered per project like the map above, and skipped when it would say
+ * the same thing twice. The EMPTY report is deliberately still sent once when a
+ * brief disappears: "there is no brief here any more" is news, and a runner
+ * that only ever reported files would leave a deleted document being handed to
+ * every session for ever.
+ */
+const lastBriefed = new Map();
+
+/** A file bigger than this is not prose somebody wrote for an agent to read. */
+const BIGGEST_BRIEF_FILE = 200_000;
+
+async function reportBrief(config, slug, path, headSha, defaultBranch) {
+  const ref = await firstRef(path, [`origin/${defaultBranch}`, defaultBranch, 'HEAD']);
+  if (!ref) {
+    return;
+  }
+  const at = await git(path, ['rev-parse', ref]).catch(() => headSha);
+  if (at && lastBriefed.get(slug) === at) {
+    return;
+  }
+
+  const listed = await git(path, ['ls-tree', '-r', '--name-only', ref, '--', `${BRIEF.path}/`])
+    .catch(() => '');
+  const paths = listed.split('\n').map((each) => each.trim())
+    .filter((each) => each.endsWith('.md'))
+    .sort();
+
+  const files = [];
+  for (const each of paths) {
+    const body = await git(path, ['show', `${ref}:${each}`]).catch(() => null);
+    if (body === null) {
+      continue;
+    }
+    if (body.length > BIGGEST_BRIEF_FILE) {
+      log(`  ${each} is ${body.length} bytes; not reporting it as brief`);
+      continue;
+    }
+    files.push({ path: each, title: firstHeadingOf(body), body });
+  }
+
+  // Nothing to say, and nothing was ever said: the ordinary case for every
+  // project that has not been interviewed, and not worth a request.
+  if (!files.length && !lastBriefed.has(slug)) {
+    lastBriefed.set(slug, at);
+    return;
+  }
+
+  await api(config, `/api/runners/${config.runnerId}/git/${slug}/brief`, {
+    method: 'POST',
+    body: { headSha: at, files },
+  }).then(() => {
+    lastBriefed.set(slug, at);
+    log(files.length
+      ? `  read ${slug}'s brief at ${short(at)}: ${files.length} file(s)`
+      : `  ${slug} has no brief at ${short(at)} any more`);
+  }).catch((failure) => log(`  could not report the brief: ${failure.message}`));
+}
+
+/**
+ * The file's first markdown heading, so the console can list it without
+ * parsing markdown in a browser. Null when it has none.
+ */
+function firstHeadingOf(body) {
+  const heading = body.split('\n').find((line) => /^#{1,3}\s+\S/.test(line));
+  return heading ? heading.replace(/^#{1,3}\s+/, '').trim() : null;
+}
+
 /** The first of these refs this repository actually has. */
 async function firstRef(path, candidates) {
   for (const ref of candidates) {
@@ -1713,6 +1790,21 @@ async function firstRef(path, candidates) {
  */
 function briefLine(run) {
   const index = run.brief?.index ?? BRIEF.index;
+  const text = run.brief?.indexText;
+
+  // R99. Handed over rather than pointed at. A pointer is not a guarantee: the
+  // file may have been deleted, the checkout may be behind, and a session that
+  // never opened it looks exactly like one that did. When the platform has a
+  // reading, the session starts already knowing what this project is.
+  if (text) {
+    const stale = run.brief?.current === false
+      ? `\n(This was written at ${short(run.brief.writtenAtSha ?? '')} and the default branch `
+        + `has moved since. Trust the files over this if they disagree.)\n`
+      : '';
+    return `=== WHAT THIS PROJECT IS — from \`${index}\`, written for you ===\n\n`
+      + `${text.trim()}\n${stale}\n`
+      + `=== end of the brief's index. The sections it names are in the checkout. ===\n\n`;
+  }
   return `If \`${index}\` exists in this checkout, read it before anything else — `
     + `it is this project's brief, and it holds what the code cannot say.\n`;
 }
@@ -3094,48 +3186,59 @@ ${run.openingPrompt}`;
     const emphasis = run.openingPrompt
       ? `\nThey asked you to pay particular attention to:\n\n${run.openingPrompt}\n`
       : '';
+    const existing = brief.indexText
+      ? `\nThere is already a brief here. Read every file of it first and treat this as an
+UPDATE: confirm what is still true, correct what is not, and ask only about what has
+changed or was never answered. Do not re-ask what the brief already says.\n`
+      : '';
 
     return `You are conducting a **CTO Interview** on this repository for the cawdev platform.
 
-The job is to end up with a brief that leaves nothing to doubt: a set of documents
-that a coding agent — or a person who joined this week — can read and then work on
-this project without guessing. You are on branch ${run.branch}, and you may write
-${brief.path} and NOTHING else. No code, no configuration, no other document.
+**Who this is for.** The document you produce is read by CODING AGENTS — including
+you, next time — at the start of every session cawdev runs here. It is not a report
+for a board and not marketing. Write for something that has the code in front of it,
+cannot ask anybody anything, and will make expensive mistakes if it guesses.
 
-**Read first, ask second.** Spend the beginning of this session reading: the build
-files, the entry points, the routes, the schema, the tests, the READMEs, the git
-history. Use \`code_map\` and \`file_deps\` to find your way around rather than
-grepping blind. Everything you can answer by reading, you must NOT ask.
+You are on branch ${run.branch}, and you may write ${brief.path} and NOTHING else. No
+code, no configuration, no other document.
 
-**Then interview, in rounds.** Use \`ask_group\` with the title "CTO Interview".
-Each round is up to 12 questions that belong together, with an \`intro\` line
-saying what the round is about. Ask what the code cannot tell you:
+**Read first, ask second.** Start with \`code_map\` and \`file_deps\` — cawdev has
+already mapped this repository — then read what they point at: the build files, the
+entry points, the routes, the schema, the tests, the READMEs, the git history.
+Everything you can answer by reading, you must NOT ask.
+${existing}
+**Then interview, in rounds.** Use \`ask_group\` with the title "CTO Interview". Each
+round is up to 12 questions that belong together, with an \`intro\` line saying what
+the round is about. Ask what the code cannot tell you, and what an agent would get
+wrong:
 
-- why it exists, who uses it, and what would count as it failing them
-- what must never happen — the constraints somebody would be sacked for breaking
-- which decisions were deliberate, and what was rejected on the way
-- what is load-bearing that looks incidental, and what is dead that looks alive
-- the words this project uses for things, and where they differ from everybody else
-- how it is released, what breaks in production, and who finds out
-- what is planned, what is abandoned, and what is being avoided
+- what each part is RESPONSIBLE for, and which boundaries exist for a reason
+- the invariants — what must never happen, and what breaks if it does
+- where a new thing of each kind belongs, and which file looks right and is wrong
+- what is load-bearing and looks incidental; what is dead and looks alive
+- the words this code uses, and where they mean something unusual
+- how work is done here: branches, tests, migrations, what is generated
+- how it is built and deployed, what breaks in production, and who finds out
+- the traps: the mistakes people have already made in this repository
 
-Make each question specific and show that you have read the code — "\`AccessGuard\`
-is called in every handler except three; is that deliberate?" is worth ten of "how
-does authorisation work?". Offer \`options\` when there is a small set of plausible
-answers; they can always write their own. Between rounds, read again: a good answer
-opens a door you have not looked through yet.
+Make every question specific and show that you have read the code —
+"\`AccessGuard.require\` is called in every handler except three; is that deliberate?"
+is worth ten of "how does authorisation work?". Offer \`options\` when there is a small
+set of plausible answers; they can always write their own. Between rounds, read again:
+a good answer opens a door you have not looked through yet.
 
-**Keep going until nothing is in doubt.** Several rounds, not one. When you believe
-you are finished, ask yourself what a new agent would still get wrong, and ask THAT.
+**Keep going until nothing is in doubt.** Several rounds, not one. Before you stop, ask
+yourself what a new agent would still get wrong here, and ask THAT.
 
-**Then write the brief.** ${brief.index} is the index — what this project is in a
-paragraph, and a link to each section with a line saying what is in it. Then:
+**Then write the brief.** ${brief.index} is the index, and it is the file every future
+session is handed: open it with a short paragraph saying what this project is and what
+it must never do, then list each section with a line saying what is in it. Then:
 
 ${sections}
 
-Write for somebody who has the code in front of them and cannot ask anybody
-anything. Say what is true, not what would be nice; where the answer is "nobody
-knows", write that in ${brief.path}/06-open.md rather than inventing one. Attribute
+Write in plain prose, specific to this repository, naming real files and symbols.
+Say what is true rather than what would be nice; where the answer is "nobody knows",
+write that in ${brief.path}/08-open-questions.md rather than inventing one. Attribute
 nothing to the person you interviewed by name — the brief is about the project.
 
 Commit the brief with git when it is written. Do not push and do not open a pull

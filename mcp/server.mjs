@@ -839,6 +839,12 @@ const TOOLS = [
         config,
         `/api/projects/${project}/roadmap/${run.entryNumber}/runs`,
       ).catch(() => []);
+      // R99. What this project IS, as a machine last read it out of
+      // `docs/brief/`. Its own try, like the history above and for the same
+      // reason: a project nobody has interviewed answers 404, which is an
+      // ordinary answer and not a reason to fail the one call a resumed session
+      // re-orients from.
+      const brief = await api(config, `/api/projects/${project}/brief`).catch(() => null);
 
       const lines = [];
 
@@ -910,6 +916,26 @@ const TOOLS = [
           for (const opinion of question.opinions ?? []) {
             lines.push(`   ${opinion.authorEmail} thinks: ${opinion.body}`);
           }
+        }
+      }
+      // Last, deliberately. The task is what this call is for and belongs at
+      // the top; the brief is context, and a session that has already read it
+      // once should not have to scroll past it to find out what it is doing.
+      if (brief?.files?.length) {
+        const index = brief.files.find((file) => file.path === brief.index) ?? brief.files[0];
+        const rest = brief.files.filter((file) => file !== index).map((file) => file.path);
+        lines.push(
+          '',
+          `--- what this project is (${brief.index}, read at `
+            + `${(brief.writtenAtSha ?? '').slice(0, 8)}) ---`,
+          index.body.trim(),
+        );
+        if (rest.length) {
+          lines.push('', `The rest of the brief is in the checkout: ${rest.join(', ')}`);
+        }
+        if (brief.current === false) {
+          lines.push('The default branch has moved since this was written. '
+            + 'Trust the files over it.');
         }
       }
       return lines.join('\n');
