@@ -205,11 +205,15 @@ export async function socketToAttach(argv, ink = painter()) {
     if (!configPath) {
       // Nothing here at all: the walk, which asks what this machine serves.
       configPath = await runSetup(argv, ink);
-    } else if (file && !(await loadToken(urlOf(file, argv)))) {
+    } else if (file && !(await loadToken(daemonUrl(file)))) {
       // Configured but uncredentialed, and nothing minted here before. The
       // config answers every question the walk would ask, so only the token is
       // fetched. A file we could not parse is left alone deliberately: the
       // daemon's own complaint about it says more than a walk would.
+      //
+      // Asked under `daemonUrl`, not the one being signed in to: the question
+      // is "will the daemon find a token", and the daemon has never heard of
+      // `--url`.
       await runMint(configPath, file, argv, ink);
     }
   }
@@ -220,18 +224,50 @@ export async function socketToAttach(argv, ink = painter()) {
 }
 
 /**
- * Which cawdev a config is for, when one has to be picked before boot.
+ * The URL a daemon assumes when nothing says otherwise.
  *
- * What was typed wins, because `--url` is somebody answering this question out
- * loud; the config is next, because it is this machine's own standing answer;
- * and `urlFrom`'s default is last. Same order `readConfig` uses, kept in step
- * on purpose — a token minted against one instance is not a credential at
- * another, so choosing differently here would store the right token under the
- * wrong key.
+ * A third copy of a string that already exists in `runner.mjs`'s `DEFAULTS` and
+ * in `attach.mjs`'s `urlFrom`, and importing either would be worse: `DEFAULTS`
+ * lives in a module whose top level starts a daemon, and `urlFrom` folds in
+ * `--url`, which is the very thing this must not see. `openapi.test.mjs`'s
+ * neighbour pins the three in step instead.
  */
-export function urlOf(file, argv, env = process.env) {
+const DEFAULT_URL = 'http://localhost:8091';
+
+/**
+ * Two URLs, because they answer two different questions.
+ *
+ * **Where a person signs in** is a browser's question. **What this machine is
+ * called** is the daemon's, and it is the key the token is stored under. An
+ * earlier version of this file had one function for both, with a comment
+ * claiming they were kept in step — they are not, and the cost of the claim was
+ * a token minted at one URL, filed under it, and looked for under another. A
+ * live credential on the tokens page that nothing would ever read.
+ *
+ * They differ for an ordinary reason rather than a broken one: in development
+ * the console is on `:4200` and the API it proxies to is on `:8091`. A runner
+ * config naming `:8091` is right — the daemon calls `/api` directly — and a
+ * browser sent there gets no sign-in page, because the console is what serves
+ * one. So `--url` is how somebody says which door *they* are going through, and
+ * it has no business renaming the machine.
+ */
+export function signInUrl(file, argv, env = process.env) {
   const typed = valueOf(argv, '--url') ?? env.CAWDEV_URL;
   return String(typed ?? file?.url ?? urlFrom(argv)).replace(/\/+$/, '');
+}
+
+/**
+ * What `readConfig` will call this machine — and therefore the storage key.
+ *
+ * Deliberately a copy of the daemon's own precedence (`CAWDEV_URL`, the config,
+ * the default) rather than a call into it: `readConfig` is not exported, reads
+ * `process.argv` for its own `--config`, and throws when there is no token,
+ * which is the state this is deciding about. `--url` is absent because the
+ * daemon is never passed one, and a key the daemon cannot compute is a token it
+ * cannot find.
+ */
+export function daemonUrl(file, env = process.env) {
+  return String(env.CAWDEV_URL ?? file?.url ?? DEFAULT_URL).replace(/\/+$/, '');
 }
 
 /**
@@ -282,7 +318,8 @@ async function runSetup(argv, ink) {
  */
 async function runMint(configPath, file, argv, ink) {
   await mintForThisMachine({
-    url: urlOf(file, argv),
+    url: signInUrl(file, argv),
+    storeUrl: daemonUrl(file),
     config: file,
     configPath,
     say: (line) => console.log(line),

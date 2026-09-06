@@ -339,3 +339,43 @@ test('a config serving nothing is refused rather than granted an empty token', a
     /serves no projects/,
   );
 });
+
+test('the token is filed under the daemon\'s name, not the door you came through', async () => {
+  // In development the console is on :4200 and the API it proxies to is on
+  // :8091. Both are one cawdev. Filing under the sign-in URL put a working
+  // credential where `readConfig` never looks, and the command said "✓ Minted"
+  // and then "No runner token" three lines later.
+  const stored = [];
+
+  await mintForThisMachine({
+    url: 'http://localhost:4200',
+    storeUrl: 'http://localhost:8091',
+    config: { url: 'http://localhost:8091', name: 'laptop', projects: { board: '/code/board' } },
+    session: fakeSession(),
+    say: quiet,
+    store: (url, token) => {
+      stored.push([url, token]);
+      return Promise.resolve();
+    },
+  });
+
+  assert.deepEqual(stored, [['http://localhost:8091', 'cawd_minted']]);
+});
+
+test('one URL is the ordinary case and stays one', async () => {
+  const stored = [];
+
+  await mintForThisMachine({
+    url: 'https://cawdev.example',
+    config: { url: 'https://cawdev.example', name: 'laptop', projects: { board: '/code/board' } },
+    session: fakeSession(),
+    say: quiet,
+    store: (url, token) => {
+      stored.push([url, token]);
+      return Promise.resolve();
+    },
+  });
+
+  assert.deepEqual(stored, [['https://cawdev.example', 'cawd_minted']],
+    'storeUrl should default to the URL signed in to');
+});

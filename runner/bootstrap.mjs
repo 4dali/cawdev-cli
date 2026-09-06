@@ -432,6 +432,7 @@ export async function setUpThisMachine({
  */
 export async function mintForThisMachine({
   url,
+  storeUrl = url,
   config,
   configPath = null,
   say,
@@ -477,12 +478,23 @@ export async function mintForThisMachine({
 
   const name = config.name ?? defaultRunnerName();
   const token = await mintRunnerToken(session, slugs, name);
-  await store(url, token, { name });
+
+  // Filed under the name the DAEMON will look for, which is not always the door
+  // a person came through — in development the console is on `:4200` and the
+  // API it proxies to is on `:8091`, and both are this one cawdev. Storing it
+  // under the sign-in URL puts a working credential somewhere nothing reads.
+  await store(storeUrl, token, { name });
 
   say(`  ${ink.success('✓')} ${ink.muted('Minted a')} ${ink.text('runner:operate')} `
     + `${ink.muted(`token for ${slugs.length} project${slugs.length === 1 ? '' : 's'}`)}`);
   say(`  ${ink.success('✓')} ${ink.muted('Stored it in')} ${ink.accent(tokenFile())} `
     + `${ink.muted('— not in the config, which is a file people commit')}`);
+  if (storeUrl !== url) {
+    // Said out loud, once. Two URLs for one platform is ordinary in
+    // development and baffling in a log file six weeks later.
+    say(`  ${ink.muted('Signed in at')} ${ink.text(url)}${ink.muted(', filed under')} `
+      + `${ink.text(storeUrl)}${ink.muted(' — the config says that is this machine.')}`);
+  }
   say('');
 
   return { token, slugs, name };

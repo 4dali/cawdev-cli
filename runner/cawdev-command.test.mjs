@@ -15,12 +15,12 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
-import { mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fakePlatform } from './test-platform.mjs';
-import { findConfig, isTheCommand } from './cawdev.mjs';
+import { daemonUrl, findConfig, isTheCommand, signInUrl } from './cawdev.mjs';
 
 const CAWDEV = new URL('./cawdev.mjs', import.meta.url).pathname;
 
@@ -304,4 +304,62 @@ test('the rule itself: a link and its target are the same file', async (t) => {
   assert.equal(isTheCommand(CAWDEV, url), true, 'named directly');
   assert.equal(isTheCommand(join(home, 'something-else'), url), false);
   assert.equal(isTheCommand(undefined, url), false, 'imported, not run');
+});
+
+// --- the two URLs -------------------------------------------------------------
+//
+// Signing in and being addressed are different questions, and conflating them
+// minted a token at `:4200`, filed it under `:4200`, and left the daemon looking
+// under `:8091` where the config had named it. A live credential on the tokens
+// page that nothing would ever read, and a command that reported success and
+// then failed one line later.
+
+test('--url moves where you sign in, and never what this machine is called', () => {
+  const file = { url: 'http://localhost:8091', name: 'laptop', projects: { board: '/code/board' } };
+  const argv = ['--url', 'http://localhost:4200'];
+
+  assert.equal(signInUrl(file, argv, {}), 'http://localhost:4200',
+    'the console is where a browser can actually show a sign-in page');
+  assert.equal(daemonUrl(file, {}), 'http://localhost:8091',
+    '--url renamed the machine, so the token went somewhere the daemon never looks');
+});
+
+test('the daemon key follows the daemon: CAWDEV_URL, then the config, then the default', () => {
+  const file = { url: 'http://localhost:8091' };
+
+  assert.equal(daemonUrl(file, { CAWDEV_URL: 'https://elsewhere.example' }),
+    'https://elsewhere.example');
+  assert.equal(daemonUrl(file, {}), 'http://localhost:8091');
+  assert.equal(daemonUrl(null, {}), 'http://localhost:8091', 'the default drifted');
+  assert.equal(daemonUrl({ url: 'https://cawdev.example/' }, {}), 'https://cawdev.example',
+    'a trailing slash would file the token under a second name for one instance');
+});
+
+test('with no config, both questions have the same answer', () => {
+  // The walk's case. Nothing has named this machine yet, so there is nothing
+  // for `--url` to disagree with.
+  const argv = ['--url', 'https://cawdev.example'];
+  assert.equal(signInUrl(null, argv, {}), 'https://cawdev.example');
+  assert.equal(daemonUrl(null, { CAWDEV_URL: 'https://cawdev.example' }), 'https://cawdev.example');
+});
+
+test('the default URL is the same string in all three places that hold one', async () => {
+  // `cawdev.mjs` keeps its own copy on purpose — importing the daemon's
+  // `DEFAULTS` would run a module that starts a daemon, and `urlFrom` folds in
+  // `--url`, which is the one thing `daemonUrl` must not see. So the drift is
+  // pinned here instead.
+  const read = async (name) => readFile(new URL(`./${name}`, import.meta.url).pathname, 'utf8');
+
+  const found = new Set();
+  for (const [name, pattern] of [
+    ['runner.mjs', /^ {2}url: '([^']+)',$/m],
+    ['attach.mjs', /valueOf\(argv, '--url'\) \?\? process\.env\.CAWDEV_URL \?\? '([^']+)'/],
+    ['cawdev.mjs', /^const DEFAULT_URL = '([^']+)';$/m],
+  ]) {
+    const match = (await read(name)).match(pattern);
+    assert.ok(match, `${name} no longer states a default URL where this test looks`);
+    found.add(match[1]);
+  }
+
+  assert.equal(found.size, 1, `three defaults, ${found.size} values: ${[...found].join(', ')}`);
 });

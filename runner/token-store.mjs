@@ -61,6 +61,17 @@ export async function loadToken(url) {
 }
 
 /**
+ * The instances this machine holds a token for.
+ *
+ * For one message and it earns its place there: a token filed under a URL the
+ * daemon does not use is invisible, and "no token for X" with no further help
+ * sends somebody to mint a second one that lands in the same wrong place.
+ */
+export async function storedUrls() {
+  return Object.keys(await readAll());
+}
+
+/**
  * Remember the token this machine minted for itself.
  *
  * 0700 on the directory and 0600 forced **after** the write, because

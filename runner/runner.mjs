@@ -27,7 +27,7 @@ import { codeMapOf } from '../lib/code-map.mjs';
 import { usageLimitOf } from '../lib/usage-limit.mjs';
 import { writeRunPlugin } from '../lib/run-plugin.mjs';
 import { AI_CONFIG, harnessPrompt, readRepoConfig } from '../lib/harness-prompt.mjs';
-import { loadToken } from './token-store.mjs';
+import { loadToken, storedUrls } from './token-store.mjs';
 import { GIT_READS, driftedFrom, toolsForStage } from '../lib/stage-tools.mjs';
 import { findSecret } from '../lib/secrets.mjs';
 
@@ -278,10 +278,23 @@ async function readConfig() {
     // Reachable by a daemon started directly — `cawdev` mints one before it
     // gets here. So the way out is named, and it is a command rather than a
     // trip to the console with a secret in the clipboard.
+    //
+    // The other instances are named because of the way this went wrong once: a
+    // token minted through the console's origin and filed under it, while the
+    // config named the API's, so the store held a perfectly good credential and
+    // the daemon reported none. "No token" and "no token *here*" are different
+    // problems with different fixes, and only the message can tell them apart.
+    const held = await storedUrls();
+    const elsewhere = held.filter((each) => each !== config.url);
     throw new Error(
-      'No runner token for ' + config.url + '.\n' +
-        '  Run `cawdev` on this machine: it signs you in through your browser and mints one\n' +
-        '  for the projects this config serves. Nothing is typed and nothing is pasted.',
+      'No runner token for ' + config.url + '.\n'
+        + '  Run `cawdev` on this machine: it signs you in through your browser and mints one\n'
+        + '  for the projects this config serves. Nothing is typed and nothing is pasted.'
+        + (elsewhere.length
+          ? '\n\n  This machine does hold a token for ' + elsewhere.join(', ') + '.\n'
+            + '  If that is the same cawdev, point "url" in the config at it — that string is\n'
+            + '  what the token is filed under.'
+          : ''),
     );
   }
   if (!Object.keys(config.projects).length) {
