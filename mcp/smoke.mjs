@@ -110,8 +110,9 @@ try {
     textOf(where.result));
 
   const statuses = await request('tools/call', { name: 'roadmap_statuses', arguments: {} });
-  check('roadmap_statuses says what CODING requires',
-    /CODING\s+\(requires a branch\)/.test(textOf(statuses.result)),
+  // R84 retired CODING; IN_DEVELOPMENT is the status that carries a branch now.
+  check('roadmap_statuses says what IN DEVELOPMENT requires',
+    /IN DEVELOPMENT\s+\(requires a branch\)/.test(textOf(statuses.result)),
     textOf(statuses.result));
 
   const listed = await request('tools/call', {
@@ -138,17 +139,17 @@ try {
   // refusal, not a crash — and the message should say what is missing.
   const refused = await request('tools/call', {
     name: 'roadmap_set_status',
-    arguments: { project, number, status: 'CODING' },
+    arguments: { project, number, status: 'IN_DEVELOPMENT' },
   });
-  check('CODING without a branch is refused, readably',
+  check('IN DEVELOPMENT without a branch is refused, readably',
     refused.result?.isError && /branch/i.test(textOf(refused.result)),
     textOf(refused.result));
 
   const moved = await request('tools/call', {
     name: 'roadmap_set_status',
-    arguments: { project, number, status: 'CODING', branch: 'smoke-test' },
+    arguments: { project, number, status: 'IN_DEVELOPMENT', branch: 'smoke-test' },
   });
-  check('CODING with a branch is accepted', !moved.result?.isError
+  check('IN DEVELOPMENT with a branch is accepted', !moved.result?.isError
     && textOf(moved.result).includes('smoke-test'), textOf(moved.result));
 
   // R37: the argument, beside the decision. An agent that can read the

@@ -242,8 +242,14 @@ try {
     // on "the runner's default", and that must mean the same as omitting it.
     body: JSON.stringify({ entryNumber: entry.number, branch, model: '   ' }),
   });
+  // The claim is in the name: a blank must not become a MODEL. What it becomes
+  // instead is `modelFor`'s answer — the card's, else the person's default,
+  // else null — and asserting `=== null` made this pass only for an operator
+  // who has never set one. It failed for anybody who had, which is a test
+  // reporting whose account ran it.
   check('a blank model means the runner default, not a model called "   "',
-    started.model === null, JSON.stringify(started.model));
+    started.model === null || started.model.trim() !== '',
+    JSON.stringify(started.model));
   // R33: effort is the other dial, and it has to survive the round trip or the
   // picker is decoration.
   check('and a blank effort means the same', started.effort === null,
@@ -251,14 +257,15 @@ try {
   runId = started.id;
   check('start returns a queued run on the entry', started.state === 'QUEUED'
     && started.entryNumber === entry.number && started.branch === branch, JSON.stringify(started));
-  // R72: starting moves the card, and to IN PROGRESS rather than CODING. The
-  // distinction is the whole two-step — a run in the queue has a branch it
-  // *intends* to cut, and a card claiming CODING would be claiming the branch
-  // exists, which is what CODING means and what the exporter checks. CODING
-  // arrives when the run does, below.
+  // R84: starting moves the card to IN DEVELOPMENT, and there is no halfway
+  // house any more. R72 went to IN_PROGRESS first, meaning "started, no branch
+  // yet", because CODING had to mean "an agent is writing this second" and a
+  // queued run had nothing else to be. The WORK ITEM is that something else —
+  // it sits at READY until a machine takes it — so the distinction R72 was
+  // drawing is kept, on the object it was always about.
   const afterStart = await console_(`/api/projects/${project}/roadmap/${entry.number}`);
-  check('starting moves the card to IN PROGRESS, and names no branch yet',
-    afterStart.status === 'IN_PROGRESS' && !afterStart.branch,
+  check('starting moves the card to IN DEVELOPMENT',
+    afterStart.status === 'IN_DEVELOPMENT',
     `${afterStart.status} / ${afterStart.branch}`);
 
   // R63: a second session on the SAME card is refused, and the refusal is
@@ -705,8 +712,8 @@ try {
 
   const after = await console_(`/api/projects/${project}/roadmap?brief=true`);
   const card = after.find((e) => e.title === cardTitle);
-  check('a successful commit creates the named card, as CODING on the branch',
-    after.length === cardsBefore + 1 && card?.status === 'CODING'
+  check('a successful commit creates the named card, in development on the branch',
+    after.length === cardsBefore + 1 && card?.status === 'IN_DEVELOPMENT'
       && card.branch === session.branch,
     JSON.stringify(card));
 
@@ -932,10 +939,20 @@ try {
     `/api/runners/${runner.id}/claim/${interview.id}`);
   check('and the claim tells the machine where the brief goes',
     interviewer.brief?.index === 'docs/brief/README.md'
-      && interviewer.brief?.sections?.length === 6,
+      // Not a COUNT. This said six, the brief has eight, and a number here
+      // pins the one thing about the layout nobody promised to keep — while
+      // saying nothing about the thing that matters, which is that every
+      // section tells a machine where to write and what belongs there.
+      && interviewer.brief?.sections?.length > 0
+      && interviewer.brief.sections.every(
+        (each) => each.path?.startsWith('docs/brief/') && each.title && each.about),
     JSON.stringify(interviewer.brief));
 
-  await asToken(interviewer.runToken,
+  // The RUNNER's token, not the run's. A run token carries roadmap, changelog,
+  // report and ask — deliberately NOT `runner:operate`, because moving a run
+  // through its states is the machine's act and not the session's. This asked
+  // with the run's token and had been answered 403 on every push since R96.
+  await asToken(runnerToken,
     `/api/projects/${project}/runs/${interview.id}/transition`, { state: 'RUNNING' });
 
   const round = await asToken(interviewer.runToken,
@@ -1020,7 +1037,11 @@ try {
     `/api/projects/${project}/runs/${audit.id}/proposals/${finding.id}/accept`,
     {
       method: 'POST',
-      body: JSON.stringify({ section: 'Phase 9 — the smoke test', status: 'CONSIDERING' }),
+      // R85: an accepted finding is an ISSUE, and an issue's statuses are its
+      // own — NEW, CONFIRMED and the shared four. `CONSIDERING` is a roadmap
+      // status and the API refuses it here, which it had been doing on every
+      // push since R85.
+      body: JSON.stringify({ section: 'Phase 9 — the smoke test', status: 'CONFIRMED' }),
     });
   check('a person accepting it creates the entry',
     accepted.accepted && typeof accepted.entryNumber === 'number', JSON.stringify(accepted));
@@ -1031,16 +1052,22 @@ try {
   check('the card takes the finding’s title, with no severity welded on',
     acceptedCard.title === 'a finding', JSON.stringify(acceptedCard.title));
   check('it lands in the section the person chose, at the status they chose',
-    acceptedCard.section === 'Phase 9 — the smoke test' && acceptedCard.status === 'CONSIDERING',
+    acceptedCard.section === 'Phase 9 — the smoke test' && acceptedCard.status === 'CONFIRMED',
     JSON.stringify([acceptedCard.section, acceptedCard.status]));
   check('and it still says what the audit thought, and which audit',
     acceptedCard.audit?.severity === 'CRITICAL' && acceptedCard.audit?.runId === audit.id,
     JSON.stringify(acceptedCard.audit));
 
-  const boarded = (await console_(`/api/projects/${project}/roadmap?brief=true`))
+  // R85: an accepted finding is an ISSUE, so it is on the ISSUES board. This
+  // looked on the roadmap's, found nothing, and had been failing ever since —
+  // which is the entry working exactly as it said it would.
+  const boarded = (await console_(`/api/projects/${project}/issues?brief=true`))
     .find((entry) => entry.number === accepted.entryNumber);
-  check('the board carries the finding too, without a body',
+  check('the issues board carries the finding too, without a body',
     boarded?.audit?.severity === 'CRITICAL' && !boarded.body, JSON.stringify(boarded));
+  check('and it is NOT on the roadmap board, which asks a different question',
+    !(await console_(`/api/projects/${project}/roadmap?brief=true`))
+      .some((entry) => entry.number === accepted.entryNumber));
 
   const secondFinding = await asToken(auditor.runToken,
     `/api/projects/${project}/runs/${audit.id}/proposals`,
@@ -1049,8 +1076,10 @@ try {
     `/api/projects/${project}/runs/${audit.id}/proposals/${secondFinding.id}/accept`,
     { method: 'POST' });
   const unfiledCard = await console_(`/api/projects/${project}/roadmap/${unfiled.entryNumber}`);
-  check('accepting without saying where files it under a named bucket, at PLANNED',
-    unfiledCard.section === 'Found by an audit' && unfiledCard.status === 'PLANNED',
+  // R85: NEW, not PLANNED — "filed, nobody has looked" is where a finding
+  // starts, and PLANNED is a roadmap answer to a question issues do not ask.
+  check('accepting without saying where files it under a named bucket, at NEW',
+    unfiledCard.section === 'Found by an audit' && unfiledCard.status === 'NEW',
     JSON.stringify([unfiledCard.section, unfiledCard.status]));
 
   const thirdFinding = await asToken(auditor.runToken,
@@ -1061,10 +1090,11 @@ try {
     {
       method: 'POST',
       expect: 400,
-      body: JSON.stringify({ status: 'IN_PROGRESS' }),
+      body: JSON.stringify({ status: 'IN_DEVELOPMENT' }),
     });
   check('a finding cannot land as started — nobody has started it',
-    /PLANNED/.test(refusedStart?.message ?? ''), JSON.stringify(refusedStart));
+    /NEW/.test(refusedStart?.message ?? '') && /CONFIRMED/.test(refusedStart?.message ?? ''),
+    JSON.stringify(refusedStart));
 
   const twice = await console_(
     `/api/projects/${project}/runs/${audit.id}/proposals/${finding.id}/accept`,

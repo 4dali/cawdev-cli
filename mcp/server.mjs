@@ -376,9 +376,9 @@ const TOOLS = [
   {
     name: 'roadmap_statuses',
     description:
-      'The eight roadmap statuses, what each means, and what each one requires — CODING a ' +
-      'branch, MERGED the merge, SHIPPED a version, DECLINED a reason. REVIEW, between CODING ' +
-      'and MERGED, requires nothing. Read this rather than guessing.',
+      'The roadmap statuses, what each means, and what each one requires — IN DEVELOPMENT a ' +
+      'branch, MERGED the merge, SHIPPED a version, DECLINED a reason. Read this rather than ' +
+      'guessing: the set differs by KIND, and an issue calls two of them different words.',
     inputSchema: { type: 'object', properties: {} },
     handler: async (config) => {
       const statuses = await api(config, '/api/roadmap/statuses');
@@ -671,11 +671,12 @@ const TOOLS = [
     name: 'roadmap_set_status',
     description:
       'Move an entry to a status. Any status may move to any other — the rules are about what ' +
-      'a status must carry, not a permitted path. CODING needs a branch, MERGED the merge — the ' +
-      'PR, the merge commit or the sha — and SHIPPED a version. REVIEW, between the two, needs ' +
-      'nothing: it is work that is written and waiting to be read, and a session that has ' +
-      'opened a pull request and finished belongs there rather than in CODING. Move a card to ' +
-      'MERGED when its pull request lands; the branch may then be deleted.',
+      'a status must carry, not a permitted path. IN_DEVELOPMENT needs a branch, MERGED the ' +
+      'merge — the PR, the merge commit or the sha — and SHIPPED a version. Move a card to ' +
+      'MERGED when its pull request lands; the branch may then be deleted. ' +
+      'A card has ONE development status: how far the branch has got — written, reviewed, ' +
+      'done — is on the WORK ITEM, not here, and there is nothing to set on the card between ' +
+      'starting and merging.',
     inputSchema: {
       type: 'object',
       properties: {
