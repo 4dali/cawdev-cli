@@ -12,9 +12,7 @@ against your working copies — it should be a file you can read first.
 
 ## Setting it up
 
-Mint a token in the console under **Agent tokens** with the `runner:operate`
-scope on each project this machine should serve. Revoking that token stops the
-machine.
+Write the config — what this machine serves, and where:
 
 ```json
 {
@@ -27,9 +25,28 @@ machine.
 }
 ```
 
+Then run `cawdev` (below). Finding no token it can use, it signs you in through
+your browser and mints a `runner:operate` one scoped to exactly those projects,
+storing it in `~/.cawdev/token.json`, mode 0600. **Nothing is typed or pasted**,
+and you can still revoke it in the console under Agent tokens, which stops the
+machine.
+
+There is deliberately no `"token"` in the config above. This file names working
+copies and permissions, so it is the kind people keep beside their code and
+commit — `macbook-laptop.json` in this directory is tracked, and
+`configs.test.mjs` fails if one of them ever grows a credential. A token in a
+config is still *read*, because R93's generated `~/.cawdev/runner.config.json`
+is that shape and lives under a home directory.
+
+Driving the daemon directly, without the `cawdev` command, means supplying the
+credential yourself — it does not open browsers:
+
 ```sh
 CAWDEV_TOKEN=cawd_… node tools/runner/runner.mjs --config runner.config.json
 ```
+
+`readConfig` takes the token from `CAWDEV_TOKEN`, then the config, then
+`~/.cawdev/token.json` — the store last, because it is the one nobody typed.
 
 The name is how you will recognise it in the console's runner picker.
 Registering is idempotent by (owner, name), so restarting the daemon is the same

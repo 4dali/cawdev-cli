@@ -34,6 +34,7 @@ import { dirname, join, resolve } from 'node:path';
 import { painter } from '../lib/ansi.mjs';
 import { Select, pickFromLine, pickManyFromLine, plainLines } from './select.mjs';
 import { signInThroughBrowser, storedSession } from './sign-in.mjs';
+import { saveToken, tokenFile } from './token-store.mjs';
 
 /** Where a machine set up this way keeps its config — `findConfig`'s last candidate. */
 export function runnerConfigPath() {
@@ -397,4 +398,85 @@ export async function setUpThisMachine({
   say('');
 
   return { configPath, config, entries };
+}
+
+/**
+ * The credential, and only the credential — for a machine already configured.
+ *
+ * `setUpThisMachine` above answers "what does this machine serve?", which is
+ * four questions and a clone. A machine whose config already answers all of
+ * them and is missing only a token has nothing to be asked: the projects are
+ * named, the checkouts are there, and the one thing absent is the thing R93
+ * says a person should never have to carry.
+ *
+ * So this is the walk with everything it can already know taken out. Sign in
+ * through the browser, mint `runner:operate` on **the slugs the config already
+ * serves** — never a wider set, because a top-up that quietly granted more
+ * would be a privilege escalation performed by a convenience — and store it
+ * beside the session rather than in the config, for the reason `token-store`
+ * opens with.
+ *
+ * Claude Code's own sign-in is not asked about here. That question belongs to
+ * setting a machine up, and this machine has been set up; asking it again on
+ * every token renewal would make the answer noise.
+ *
+ * Every side effect is injected, so this can be tested without a network or a
+ * home directory.
+ */
+export async function mintForThisMachine({
+  url,
+  config,
+  configPath = null,
+  say,
+  ink = painter(3),
+  signIn = signInThroughBrowser,
+  store = saveToken,
+  session: given = null,
+} = {}) {
+  const slugs = Object.keys(config?.projects ?? {});
+  if (!slugs.length) {
+    throw new Error(
+      `${configPath ?? 'That config'} serves no projects, so there is no token to mint.\n`
+        + '  Add a "projects" map, or run cawdev --setup to be walked through it.',
+    );
+  }
+
+  const session = given ?? (await storedSession(url));
+
+  say('');
+  say(`  ${ink.bold('This machine has a config but no token')}`);
+  if (configPath) {
+    say(`  ${ink.muted('Config:')} ${ink.accent(configPath)}`);
+  }
+  say(`  ${ink.muted('Minting one for')} ${ink.text(slugs.join(', '))}${ink.muted(' — nothing to copy.')}`);
+
+  if (!session.signedIn) {
+    say('');
+    say(`  ${ink.muted('Signing in — a browser is about to open.')}`);
+    const result = await signIn(session, ({ url: verify, code }) => {
+      say('');
+      say(`  ${ink.muted('Approve this sign-in at')} ${ink.accent(verify)}`);
+      say(`  ${ink.muted('The code is')} ${ink.bold(code)}`);
+      say('');
+      say(`  ${ink.muted('Waiting…')}`);
+    });
+    if (!result.signedIn) {
+      throw new Error(result.refused
+        ? 'That sign-in was refused.'
+        : 'That sign-in expired. Run cawdev again to get a new code.');
+    }
+  }
+  say(`  ${ink.success('✓')} ${ink.muted('Signed in as')} ${ink.text(session.email)}`);
+
+  const name = config.name ?? defaultRunnerName();
+  const token = await mintRunnerToken(session, slugs, name);
+  await store(url, token, { name });
+
+  say(`  ${ink.success('✓')} ${ink.muted('Minted a')} ${ink.text('runner:operate')} `
+    + `${ink.muted(`token for ${slugs.length} project${slugs.length === 1 ? '' : 's'}`)}`);
+  say(`  ${ink.success('✓')} ${ink.muted('Stored it in')} ${ink.accent(tokenFile())} `
+    + `${ink.muted('— not in the config, which is a file people commit')}`);
+  say('');
+
+  return { token, slugs, name };
 }

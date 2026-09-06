@@ -27,6 +27,7 @@ import { codeMapOf } from '../lib/code-map.mjs';
 import { usageLimitOf } from '../lib/usage-limit.mjs';
 import { writeRunPlugin } from '../lib/run-plugin.mjs';
 import { AI_CONFIG, harnessPrompt, readRepoConfig } from '../lib/harness-prompt.mjs';
+import { loadToken } from './token-store.mjs';
 import { GIT_READS, driftedFrom, toolsForStage } from '../lib/stage-tools.mjs';
 import { findSecret } from '../lib/secrets.mjs';
 
@@ -235,11 +236,23 @@ async function readConfig() {
     // No config file is fine when everything comes from the environment.
   }
 
+  const url = (process.env.CAWDEV_URL ?? file.url ?? DEFAULTS.url).replace(/\/+$/, '');
+
   const config = {
     ...DEFAULTS,
     ...file,
-    url: (process.env.CAWDEV_URL ?? file.url ?? DEFAULTS.url).replace(/\/+$/, ''),
-    token: process.env.CAWDEV_TOKEN ?? file.token,
+    url,
+    /**
+     * Three places, in the order somebody would expect: what they exported,
+     * what the config says, and what this machine minted for itself.
+     *
+     * The store comes last because it is the one nobody typed — a token in the
+     * environment or in the config is somebody having said which credential to
+     * use, and preferring ours over theirs would be ignoring it. It comes at
+     * all because a config is a file people keep beside their code, and a
+     * credential does not belong in one.
+     */
+    token: process.env.CAWDEV_TOKEN ?? file.token ?? (await loadToken(url)),
     name: process.env.CAWDEV_RUNNER_NAME ?? file.name ?? DEFAULTS.name,
     agentCommand: process.env.CAWDEV_AGENT_COMMAND ?? file.agentCommand ?? DEFAULTS.agentCommand,
     // Which projects this runner serves, and where their working copies are.
@@ -262,9 +275,13 @@ async function readConfig() {
   };
 
   if (!config.token) {
+    // Reachable by a daemon started directly — `cawdev` mints one before it
+    // gets here. So the way out is named, and it is a command rather than a
+    // trip to the console with a secret in the clipboard.
     throw new Error(
-      'No CAWDEV_TOKEN. Mint one in the console under Agent tokens with the runner:operate ' +
-        'scope on the projects this runner should serve.',
+      'No runner token for ' + config.url + '.\n' +
+        '  Run `cawdev` on this machine: it signs you in through your browser and mints one\n' +
+        '  for the projects this config serves. Nothing is typed and nothing is pasted.',
     );
   }
   if (!Object.keys(config.projects).length) {

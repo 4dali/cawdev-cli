@@ -24,8 +24,9 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { attach, urlFrom, valueOf } from './attach.mjs';
-import { asker, setUpThisMachine } from './bootstrap.mjs';
+import { asker, mintForThisMachine, setUpThisMachine } from './bootstrap.mjs';
 import { liveSockets, probeSocket, socketPathFor } from './control.mjs';
+import { loadToken } from './token-store.mjs';
 import { painter } from '../lib/ansi.mjs';
 import { mark } from './brand.mjs';
 
@@ -182,22 +183,72 @@ export async function socketToAttach(argv, ink = painter()) {
   }
 
   let configPath = await findConfig(argv);
+  const file = configPath ? await readConfigFile(configPath) : null;
 
-  // R93. No config and no token in the environment is a machine nobody has set
-  // up, and it is the ONLY case that runs the walk by itself: a config that is
-  // there, or a token that is exported, is somebody having said how this
-  // machine is configured, and asking them again would be ignoring it.
+  // R93. A machine that cannot produce a token is one nobody has finished
+  // setting up, and it is the ONLY case that acts by itself: a token that is
+  // exported, or one written into the config, is somebody having said which
+  // credential to use, and asking them again would be ignoring it.
   //
   // The old behaviour here was to start a daemon that could not boot and then
   // print `readConfig`'s complaint out of a log file — accurate, and useless on
   // a laptop where the answer was "you have not set this up yet".
-  if (!configPath && !process.env.CAWDEV_TOKEN) {
-    configPath = await runSetup(argv, ink);
+  //
+  // **The guard used to ask whether a config EXISTED, and that was the bug.**
+  // A config with no token in it is the commonest shape there is: the file
+  // names working copies and permissions, so it is written by hand, copied
+  // between machines and committed — and it must not carry a credential. Such
+  // a machine skipped the walk, started a daemon that refused to boot, and was
+  // told to go and mint a token in the console by hand. Which is precisely the
+  // errand R93 exists to abolish, reached through a different door.
+  if (!process.env.CAWDEV_TOKEN && !file?.token) {
+    if (!configPath) {
+      // Nothing here at all: the walk, which asks what this machine serves.
+      configPath = await runSetup(argv, ink);
+    } else if (file && !(await loadToken(urlOf(file, argv)))) {
+      // Configured but uncredentialed, and nothing minted here before. The
+      // config answers every question the walk would ask, so only the token is
+      // fetched. A file we could not parse is left alone deliberately: the
+      // daemon's own complaint about it says more than a walk would.
+      await runMint(configPath, file, argv, ink);
+    }
   }
 
   console.log(`  ${ink.muted('No runner here yet — starting one')}`
     + `${configPath ? ` ${ink.muted('from')} ${ink.accent(configPath)}` : ''}${ink.muted('…')}`);
   return startDaemon(configPath, ink);
+}
+
+/**
+ * Which cawdev a config is for, when one has to be picked before boot.
+ *
+ * What was typed wins, because `--url` is somebody answering this question out
+ * loud; the config is next, because it is this machine's own standing answer;
+ * and `urlFrom`'s default is last. Same order `readConfig` uses, kept in step
+ * on purpose — a token minted against one instance is not a credential at
+ * another, so choosing differently here would store the right token under the
+ * wrong key.
+ */
+export function urlOf(file, argv, env = process.env) {
+  const typed = valueOf(argv, '--url') ?? env.CAWDEV_URL;
+  return String(typed ?? file?.url ?? urlFrom(argv)).replace(/\/+$/, '');
+}
+
+/**
+ * The config as an object, or null if it will not parse.
+ *
+ * Null rather than a throw: an unreadable config is the daemon's complaint to
+ * make — it names the file and the parse error — and swallowing it here to
+ * offer a setup walk would replace a precise message with a wrong guess about
+ * what somebody wants.
+ */
+export async function readConfigFile(path) {
+  try {
+    const parsed = JSON.parse(await readFile(path, 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -220,6 +271,23 @@ async function runSetup(argv, ink) {
   } finally {
     ask.close();
   }
+}
+
+/**
+ * Minting for a machine that is already configured.
+ *
+ * No `asker` here, and that is the point rather than an omission: this asks
+ * nothing. The config named the projects, the checkouts are on disk, and the
+ * browser handles the one interaction there is.
+ */
+async function runMint(configPath, file, argv, ink) {
+  await mintForThisMachine({
+    url: urlOf(file, argv),
+    config: file,
+    configPath,
+    say: (line) => console.log(line),
+    ink,
+  });
 }
 
 async function main() {

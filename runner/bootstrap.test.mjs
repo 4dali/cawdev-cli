@@ -24,6 +24,7 @@ import { test } from 'node:test';
 import {
   checkoutFor,
   configFor,
+  mintForThisMachine,
   mintRunnerToken,
   servable,
   setUpThisMachine,
@@ -270,4 +271,71 @@ test('a line naming a row that is not there settles nothing', () => {
   assert.deepEqual(pickManyFromLine(select, '1 9'), []);
   assert.deepEqual(pickManyFromLine(select, 'all'), []);
   assert.deepEqual(pickManyFromLine(select, ''), []);
+});
+
+// A machine that is configured and uncredentialed — the case that used to send
+// somebody to the console with a secret in their clipboard.
+
+test('a configured machine mints for the projects it already serves, and asks nothing', async () => {
+  const session = fakeSession();
+  const stored = [];
+
+  const result = await mintForThisMachine({
+    url: 'https://cawdev.example',
+    config: { url: 'https://cawdev.example', name: 'laptop', projects: { board: '/code/board', other: '/code/other' } },
+    configPath: '/code/board/runner.config.json',
+    session,
+    say: quiet,
+    // No `ask` at all. Passing one would let a question through unnoticed; the
+    // absence is what makes "this asks nothing" a fact rather than a comment.
+    store: (url, token, meta) => {
+      stored.push([url, token, meta.name]);
+      return Promise.resolve();
+    },
+  });
+
+  assert.equal(result.token, 'cawd_minted');
+  assert.deepEqual(result.slugs, ['board', 'other']);
+  assert.deepEqual(stored, [['https://cawdev.example', 'cawd_minted', 'laptop']]);
+  assert.ok(session.seen.includes('{"board":["runner:operate"],"other":["runner:operate"]}'),
+    session.seen.join(' | '));
+  // The walk's questions are not asked: no project list is fetched, because the
+  // config already answered which ones.
+  assert.ok(!session.seen.includes('GET /api/projects'), 'it went looking for projects it had');
+});
+
+test('the minted token never goes near the config file', async (t) => {
+  const machine = await aTempHome();
+  t.after(machine.clean);
+  const path = join(machine.home, 'runner.config.json');
+  const before = { url: 'https://cawdev.example', name: 'laptop', projects: { board: '/code/board' } };
+  await writeFile(path, JSON.stringify(before));
+
+  await mintForThisMachine({
+    url: 'https://cawdev.example',
+    config: before,
+    configPath: path,
+    session: fakeSession(),
+    say: quiet,
+    store: () => Promise.resolve(),
+  });
+
+  // Byte for byte. A config is a file people commit — `macbook-laptop.json` in
+  // this repository is tracked — so a top-up that helpfully wrote the token
+  // into it would be putting a credential in a git history.
+  assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), before);
+});
+
+test('a config serving nothing is refused rather than granted an empty token', async () => {
+  await assert.rejects(
+    () => mintForThisMachine({
+      url: 'https://cawdev.example',
+      config: { url: 'https://cawdev.example', name: 'laptop', projects: {} },
+      configPath: '/code/runner.config.json',
+      session: fakeSession(),
+      say: quiet,
+      store: () => Promise.resolve(),
+    }),
+    /serves no projects/,
+  );
 });

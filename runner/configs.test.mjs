@@ -60,3 +60,23 @@ test('no config carries merge-conflict markers', async () => {
     }
   }
 });
+
+test('no config in the repository carries a token', async () => {
+  // The rule the token store rests on. A runner config names working copies and
+  // permissions, so it is written by hand, copied between machines and — as
+  // `macbook-laptop.json` proves — committed. A `runner:operate` token in one
+  // is a credential in a git history, and CLAUDE.md's "secrets are gitignored"
+  // is not a rule about `.env` in particular.
+  //
+  // `~/.cawdev/token.json` is where a minted token goes instead. A token in a
+  // config is still READ, because R93's own generated file is that shape and it
+  // lives 0600 under a home directory — what must never happen is one arriving
+  // here.
+  const configs = (await readdir(HERE)).filter((name) => name.endsWith('.json'));
+
+  for (const name of configs) {
+    const config = JSON.parse(await readFile(join(HERE, name), 'utf8'));
+    assert.equal(config.token, undefined,
+      `${name} carries a token. Move it to ~/.cawdev/token.json and revoke this one.`);
+  }
+});
