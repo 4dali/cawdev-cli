@@ -33,20 +33,6 @@ const DEFAULTS = {
   url: 'http://localhost:8091',
   name: 'this-machine',
   /**
-   * How the agent is spawned. Overridable so the daemon can be exercised
-   * without spending anybody's Claude usage, and so R17's second CLI is a
-   * config change rather than a code change.
-   */
-  agentCommand: 'claude',
-  /**
-   * How many agent processes this machine will host at once.
-   *
-   * Only ASK runs can be concurrent — the others hold a working copy each — so
-   * in practice this bounds how many questions can be in flight. Without a
-   * bound, a queue of them is a fork bomb with better manners.
-   */
-  maxSessions: 4,
-  /**
    * Verified against Claude Code 2.1.247.
    *
    * `--permission-mode acceptEdits` matters more than it looks: a spawned agent
@@ -238,7 +224,6 @@ async function readConfig() {
     token: process.env.CAWDEV_TOKEN ?? file.token,
     name: process.env.CAWDEV_RUNNER_NAME ?? file.name ?? DEFAULTS.name,
     agentCommand: process.env.CAWDEV_AGENT_COMMAND ?? file.agentCommand ?? DEFAULTS.agentCommand,
-    maxSessions: file.maxSessions ?? DEFAULTS.maxSessions,
     // Which projects this runner serves, and where their working copies are.
     projects: normaliseProjects(file.projects ?? {}),
     /**
@@ -286,9 +271,10 @@ async function readConfig() {
  *
  * R47: a bare path means ONE workspace, which is what every config meant
  * before workspaces existed. Concurrency for a project is
- * `min(workspaces, maxSessions)`, and a run that waits now waits because there
- * is no free checkout — which is the truth, rather than "that project already
- * has a run here" standing in for it.
+ * the number of workspaces — R109 removed the machine-wide cap that used to
+ * also apply — and a run that waits now waits because there is no free checkout,
+ * which is the truth rather than "that project already has a run here" standing
+ * in for it.
  */
 function normaliseProjects(projects) {
   const normalised = {};
@@ -3473,20 +3459,6 @@ function heldBy(path) {
   return undefined;
 }
 
-/**
- * How many sessions this machine is holding — claimed or spawned, any profile.
- *
- * The number `maxSessions` is measured against, and it reads both maps for the
- * same reason `heldWorkspaces` does: a run lives in `taken` from the moment it
- * is claimed and only reaches `running` when its child exists, seconds later.
- * A live session is in both at once, which is why this is a union and not a
- * sum — `snapshotRuns` skips the same duplicate for the same reason.
- */
-function sessionsInFlight() {
-  const ids = new Set(running.keys());
-  for (const id of taken.keys()) ids.add(id);
-  return ids.size;
-}
 
 /** Every workspace spoken for right now. */
 function heldWorkspaces() {
@@ -4268,17 +4240,11 @@ async function reapCancelled(config) {
 function capabilities(config) {
   return JSON.stringify({
     projects: Object.keys(config.projects),
-    // The machine's own ceiling, and every profile counts against it. Without
-    // it the console can say a machine is live and serving a project, and still
-    // not explain why a fifth run is sitting there while four others go.
-    maxSessions: config.maxSessions,
-    // How many checkouts each project has here — R47 — which is the same thing
-    // as this project's cap on CODING runs and nothing else (R70). Coding
-    // concurrency is min(workspaces, maxSessions), so maxSessions alone stopped
-    // being the whole answer: a machine with four sessions and one checkout
-    // still runs one coding session at a time, and the console should be able
-    // to say so. The two numbers bound different things, which is why both are
-    // here and why the console words them differently.
+    // How many checkouts each project has here — R47 — which since R109 is the
+    // ONLY cap this machine reports, and the only one it enforces. The
+    // machine-wide `maxSessions` is gone: it bounded processes, a delegated
+    // expert costs none, and a gate measuring the wrong thing while looking
+    // like it worked is worse than no gate.
     workspaces: Object.fromEntries(
       Object.entries(config.projects).map(([slug, project]) => [slug, project.workspaces.length]),
     ),
@@ -4429,7 +4395,6 @@ async function main() {
         workspaces: Object.fromEntries(
           Object.entries(config.projects).map(([slug, p]) => [slug, p.workspaces.length]),
         ),
-        maxSessions: config.maxSessions,
         // R81. `cawdev` starts a daemon for you when it finds none, and
         // quitting the UI leaves it running — it is driving sessions. A
         // background process you did not know you started is the cost of that
@@ -4637,13 +4602,11 @@ async function main() {
         `/api/runners/${config.runnerId}/queue?wait=${config.pollSeconds}`,
       );
 
-      // TWO gates, and they are not the same gate applied twice — R70.
+      // ONE gate — R109. There were two; `maxSessions` bounded this machine
+      // and is gone, for the reason written where it used to be applied.
       //
-      // `maxSessions` bounds this MACHINE and is profile-blind: every run
-      // claimed here costs a process. A project's workspaces bound its CODING
-      // runs and nothing else: they are checkouts, and only a coding run needs
-      // one. A run that is not claimed was refused by one of the two, and the
-      // log says which.
+      // A project's workspaces bound its CODING runs and nothing else: they are
+      // checkouts, and only a coding run needs one.
       //
       // One run at a time per WORKSPACE — R47, and only for runs that use one.
       // The gate used to key on the project, because there was one checkout per
@@ -4683,29 +4646,21 @@ async function main() {
         }
         const writes = writesCodeProfile(offered.run);
 
-        // The machine's ceiling FIRST, because it is the one that applies to
-        // everything — R70. A bound on how many agent processes this laptop
-        // will host at once, whatever their profile: a question costs a
-        // process, a model call and memory even though it costs no checkout,
-        // and without this a queue of them is a fork bomb with better manners.
+        // ONE gate now — R109 removed the machine's.
         //
-        // Counted over both maps, not `running` alone. A claimed run has no
-        // child for a second or two, and the queue re-offers everything in that
-        // window — so counting live children only let one pass of this loop
-        // claim the entire queue, which is exactly the burst the cap exists to
-        // stop and exactly what R47 made reachable by freeing questions from
-        // the checkout gate.
-        if (sessionsInFlight() >= config.maxSessions) {
-          noteQueued(
-            offered.run,
-            `at ${config.maxSessions} session${config.maxSessions === 1 ? '' : 's'} `
-              + 'on this machine (every profile counts)',
-          );
-          skipped += 1;
-          continue;
-        }
-
-        // Then the project's own gate, which counts CODING runs only — R70.
+        // `maxSessions` bounded agent PROCESSES on this laptop, and R70's own
+        // note said why: a queue of runs is otherwise a fork bomb with better
+        // manners. What it never bounded is AGENTS. A delegated expert (R104)
+        // runs inside its parent's session and costs no process at all, so with
+        // sub-agents the number it capped stopped being the number anybody was
+        // worried about — and capping runs to bound agents would have been a
+        // gate measuring the wrong thing while looking like it worked.
+        //
+        // The workspace gate stays, because a checkout is a real, countable,
+        // contended thing. An operator who wants a ceiling has one: it is how
+        // many workspaces they give a project.
+        //
+        // The project's gate, which counts CODING runs only — R70.
         // It is a checkout, and the checkout is the whole reason for it: an
         // ASK, a ROADMAP or an AUDIT contends for no working copy, no branch
         // and no dev-stack port, so measuring it against a per-project budget
