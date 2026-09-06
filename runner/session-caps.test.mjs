@@ -1,13 +1,18 @@
 // node --test tools/runner/session-caps.test.mjs
 //
-// R70's "Done when", against the real daemon: the two caps are two caps.
+// R70's "Done when", against the real daemon — and since R109 there is ONE cap
+// rather than two.
 //
-// `maxSessions` bounds the MACHINE and counts every profile, because every run
-// costs a process. A project's workspaces bound its CODING runs and nothing
-// else, because a workspace is a checkout and only a coding run is given one.
-// Getting either wrong is expensive in a way a reader cannot see: too tight and
-// asking "what did that card decide?" queues behind an hour of work; too loose
-// and a laptop hosts twelve agents at once.
+// A project's workspaces bound its CODING runs and nothing else, because a
+// workspace is a checkout and only a coding run is given one. Getting it wrong
+// is expensive in a way a reader cannot see: too tight and asking "what did
+// that card decide?" queues behind an hour of work.
+//
+// `maxSessions` bounded the MACHINE and is gone. It counted processes, and a
+// delegated expert (R104) runs inside its parent's session and costs none — so
+// the number it capped had stopped being the number anybody was worried about.
+// What replaced it is nothing, deliberately: an operator who wants a ceiling
+// sets one by giving a project fewer checkouts.
 
 import assert from 'node:assert/strict';
 import { spawn, execFile } from 'node:child_process';
@@ -135,25 +140,24 @@ test('a coding run is still refused while the project is at its cap', async (t) 
   );
 });
 
-test('at maxSessions the machine claims nothing, whatever the profile', async (t) => {
+test('nothing bounds a machine any more, whatever the profile', async (t) => {
   const workspaces = [await aRepository(), await aRepository()];
-  const { said } = await daemonWith(t, {
+  const { said, platform } = await daemonWith(t, {
     name: 'test-caps-machine',
     workspaces,
-    maxSessions: 1,
     offers: [
       coding('run-one', 'the card'),
-      // Neither of these needs a checkout, and there is a spare one anyway —
-      // so the ONLY thing that can hold them back is the machine's own ceiling.
+      // Neither of these needs a checkout, and there is a spare one anyway. The
+      // machine's own ceiling used to hold them back at `maxSessions: 1`; R109
+      // removed it, so all three go.
       asking('run-two', 'what did R12 decide?', 'ASK'),
       asking('run-three', 'read the tools directory', 'AUDIT'),
     ],
   });
 
-  // The bug this pins: the cap used to be measured against live children only,
-  // and a claimed run has no child for a second or two. With the queue offering
-  // everything at once, one pass of the loop claimed the lot — a cap of one
-  // starting three sessions.
-  const held = await until(said, /at 1 session on this machine \(every profile counts\)/);
-  assert.ok(held, `the machine cap did not hold anything back:\n${said()}`);
+  await until(said, /claiming/);
+  // Nothing may be refused for the reason that no longer exists.
+  assert.doesNotMatch(said(), /on this machine \(every profile counts\)/,
+    `the machine cap is still holding something back:\n${said()}`);
+  assert.ok(platform, 'the daemon reached the platform');
 });

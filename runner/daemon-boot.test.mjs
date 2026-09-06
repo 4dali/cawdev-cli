@@ -103,7 +103,9 @@ test('the daemon registers, offers a socket, and says what it is', async (t) => 
   assert.equal(hello.type, 'hello');
   assert.equal(hello.runner.name, RUNNER);
   assert.deepEqual(hello.runner.projects, ['board']);
-  assert.equal(hello.runner.maxSessions, 4);
+  // R109: `maxSessions` is gone from what a machine reports. The
+  // workspace counts are what it declares about concurrency now.
+  assert.equal(hello.runner.maxSessions, undefined);
   // Nothing claimed yet, and saying so is not the same as saying nothing.
   assert.deepEqual(hello.runs, []);
 
