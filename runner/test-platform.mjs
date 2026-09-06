@@ -24,9 +24,13 @@ import { once } from 'node:events';
  * @param runLive whether a run reads as still going. False by default, which
  *   makes the daemon reap the child straight away; true for a test that needs
  *   the spawned session to stay up long enough to be looked at.
- * @param skills what the claim says this project has turned on — R76. What the
- *   PROJECT asked for: whether any of it is attached is the machine's answer,
- *   which is the thing under test.
+ * @param mcpServers what the claim says this project has turned on — R76.
+ *   What the PROJECT asked for: whether any of it is attached is the machine's
+ *   answer, which is the thing under test.
+ * @param expertAgents the experts the platform narrowed to this run's profile
+ *   — R104. Markdown, so the machine has no veto here and the list arrives as
+ *   given.
+ * @param skills the SKILL.md's this run was handed — R105.
  * @param brief where a brief lives and what it is made of — R96. The real claim
  *   always carries it; a test can pass null to stand in for an API older than
  *   R96, which is how the daemon's fallback gets exercised.
@@ -37,6 +41,8 @@ export async function fakePlatform({
   workspaceRequests = [],
   resume = null,
   runLive = false,
+  mcpServers = [],
+  expertAgents = [],
   skills = [],
   brief = {
     path: 'docs/brief',
@@ -117,6 +123,8 @@ export async function fakePlatform({
           defaultBranch: 'main',
           allowDirty,
           resume,
+          mcpServers,
+          expertAgents,
           skills,
           brief,
         }));

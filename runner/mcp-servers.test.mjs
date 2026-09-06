@@ -1,4 +1,4 @@
-// node --test tools/runner/skills.test.mjs
+// node --test tools/runner/mcp-servers.test.mjs
 //
 // R76's half that does not live in the platform: whether the MACHINE lets a
 // project's skill be attached, and what it costs the second time.
@@ -141,7 +141,7 @@ async function daemonWith(t, { name, wants, offers, workspaces = 1 }) {
     paths.push(await aRepository());
   }
 
-  const skills = wants === undefined ? [] : [{
+  const mcpServers = wants === undefined ? [] : [{
     key: 'codegraph',
     name: 'CodeGraph',
     serverName: 'codegraph',
@@ -155,13 +155,13 @@ async function daemonWith(t, { name, wants, offers, workspaces = 1 }) {
 
   const platform = await fakePlatform({
     offers: offers ?? [{
-      id: 'run-skills',
+      id: 'run-mcp-servers',
       projectSlug: 'board',
       label: 'a card',
       branch: 'r76-work',
       profile: 'CODE',
     }],
-    skills,
+    mcpServers,
     // The child has to outlive the reaper: everything here is read off what it
     // printed, and a run the platform calls FINISHED is one the daemon stops
     // before it has said anything.

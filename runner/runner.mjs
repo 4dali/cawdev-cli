@@ -16,6 +16,7 @@ import {
   access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+
 import { join, resolve } from 'node:path';
 import { describeTurn, totalsOf } from '../lib/usage.mjs';
 import { withinCeiling } from '../lib/tool-rules.mjs';
@@ -24,6 +25,7 @@ import { painter } from '../lib/ansi.mjs';
 import { bannerLines, tintLog } from './banner.mjs';
 import { codeMapOf } from '../lib/code-map.mjs';
 import { usageLimitOf } from '../lib/usage-limit.mjs';
+import { writeRunPlugin } from '../lib/run-plugin.mjs';
 
 // --- configuration -----------------------------------------------------------
 
@@ -3591,7 +3593,12 @@ async function startRun(config, offered, workspace) {
   // The conversation this run is continuing, when it is continuing one — R69.
   let resume = null;
   // What this project has turned on — R76. Asked for, never granted: the
-  // The platform decides: a skill a project turned on is attached here.
+  // platform decides, and the machine still has the veto at spawn.
+  let mcpServers = [];
+  // R104/R105: and what it turned on that is MARKDOWN rather than a command.
+  // Two lists rather than one, because they are two decisions with two risks:
+  // an MCP server executes on this machine, and these enter a context.
+  let expertAgents = [];
   let skills = [];
 
   try {
@@ -3628,9 +3635,17 @@ async function startRun(config, offered, workspace) {
     // might be wrong is a brief written in the wrong place — and this is the
     // one thing every profile's prompt is given about it.
     run.brief = claimed.brief ?? null;
+    mcpServers = Array.isArray(claimed.mcpServers) ? claimed.mcpServers : [];
+    if (mcpServers.length) {
+      log(`  the project asks for: ${mcpServers.map((each) => each.key).join(', ')}`);
+    }
+    // R104: already narrowed to this run's PROFILE by the platform, so the
+    // count logged here is what the session will actually be handed.
+    expertAgents = Array.isArray(claimed.expertAgents) ? claimed.expertAgents : [];
     skills = Array.isArray(claimed.skills) ? claimed.skills : [];
-    if (skills.length) {
-      log(`  the project asks for: ${skills.map((skill) => skill.key).join(', ')}`);
+    if (expertAgents.length || skills.length) {
+      log(`  experts: ${expertAgents.map((each) => each.key).join(', ') || 'none'}`
+        + ` | skills: ${skills.map((each) => each.key).join(', ') || 'none'}`);
     }
   } catch (failure) {
     // Losing the race is normal when two runners serve one project, and is not
@@ -3672,7 +3687,7 @@ async function startRun(config, offered, workspace) {
     });
 
     await spawnAgent(config, run, runToken, resolve(path), baseCommit, workspace, resume,
-        skills);
+        mcpServers, expertAgents, skills);
   } catch (failure) {
     // Anything that goes wrong before or during the spawn is the run's failure,
     // and the reason belongs on the run where someone will see it.
@@ -3722,7 +3737,8 @@ function writesAnythingProfile(run) {
  * `cawdr_` token bound to one run, which expires with it — so the worst a
  * confused or misbehaving session can do is act on the run it was started for.
  */
-async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, resume, skills) {
+async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, resume,
+    projectServers, expertAgents, skills) {
   // R51: what this machine will let a STORED rule cover. The project's rules
   // are filtered through it before they go anywhere near a spawn, so the
   // platform can narrow what runs here and never widen it.
@@ -3769,7 +3785,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   // for CodeGraph is the index. It never throws and never fails a run: every
   // outcome comes back as a sentence for the transcript.
   const { attached, notes: skillNotes } =
-      await resolveSkills(config, run, cwd, baseCommit, skills);
+      await resolveSkills(config, run, cwd, baseCommit, projectServers);
   for (const { skill, local } of attached) {
     mcpServers[skill.serverName] = {
       command: skill.command,
@@ -3808,6 +3824,13 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     },
   };
   await writeFile(mcpConfigPath, JSON.stringify({ mcpServers }, null, 2));
+
+  // R104/R105. The experts and skills the project turned on, as one plugin in
+  // the daemon's own directory — see writeRunPlugin for why not the checkout.
+  const pluginRoot = await writeRunPlugin(mcpDirectory, expertAgents, skills);
+  if (pluginRoot) {
+    log(`  loading ${expertAgents.length} expert(s) and ${skills.length} skill(s)`);
+  }
 
   // The prompt goes on stdin, NOT as an argument.
   //
@@ -3890,6 +3913,10 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   const args = [
     '--mcp-config',
     mcpConfigPath,
+    // Only when there is something in it. An empty plugin loads nothing and
+    // still says, in the session's own listing, that cawdev gave it something —
+    // which is a lie a person would have to go and check.
+    ...(pluginRoot ? ['--plugin-dir', pluginRoot] : []),
     ...(codesFreely ? agentArgs : argsForProfile(agentArgs, run.profile, run)),
   ];
   log(`  spawning: ${config.agentCommand} ${args.join(' ')} (prompt on stdin)`);
