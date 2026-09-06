@@ -396,11 +396,19 @@ const SKILLS_HERE = {
 
 // --- talking to cawdev -------------------------------------------------------
 
-async function api(config, path, { method = 'GET', body } = {}) {
+async function api(config, path, { method = 'GET', body, token } = {}) {
   const response = await fetch(`${config.url}${path}`, {
     method,
     headers: {
-      authorization: `Bearer ${config.token}`,
+      // The MACHINE's token by default — `runner:operate`, which is what
+      // claiming, reporting and transitioning need.
+      //
+      // `token` overrides it with the RUN's own, which carries `agent:ask`.
+      // That is not a convenience: raising an approval is the run asking a
+      // person something, and the credential for that is the one minted for
+      // this run and dying with it. A daemon token that could raise approvals
+      // could raise them for any run it has ever been offered.
+      authorization: `Bearer ${token ?? config.token}`,
       ...(body ? { 'content-type': 'application/json' } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
@@ -3897,7 +3905,7 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
         break;
       }
 
-      const decision = await awaitGate(config, run, stage, last.text);
+      const decision = await awaitGate(config, run, runToken, stage, last.text);
       if (decision.allowed) {
         break;
       }
@@ -3961,11 +3969,14 @@ async function reportStage(config, run, stage, what, body = {}) {
  * this can fail in: a gate that let the run through when the platform was down
  * would be a gate that opens under exactly the conditions nobody is watching.
  */
-async function awaitGate(config, run, stage, text) {
+async function awaitGate(config, run, runToken, stage, text) {
   let asked;
   try {
     asked = await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/approvals`, {
       method: 'POST',
+      // The RUN's token: approvals are on `agent:ask`, which a machine token
+      // does not carry and should not.
+      token: runToken,
       body: {
         toolName: `stage:${stage.stage}`,
         toolInput: JSON.stringify({ stage: stage.stage }),
@@ -3985,7 +3996,7 @@ async function awaitGate(config, run, stage, text) {
     try {
       const decision = await api(config,
         `/api/projects/${run.projectSlug}/runs/${run.id}/approvals/${asked.id}/decision`
-          + `?wait=${Math.min(25, Math.max(1, remaining))}`);
+          + `?wait=${Math.min(25, Math.max(1, remaining))}`, { token: runToken });
       // A terminal state, or keep waiting. Checked on the STATE rather than on
       // the transport — a 204 and a `{state: 'PENDING'}` both mean "not yet",
       // and depending on which one the platform chose would be depending on

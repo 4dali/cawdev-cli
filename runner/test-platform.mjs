@@ -92,7 +92,11 @@ export async function fakePlatform({
     request.on('data', (chunk) => (body += chunk));
     request.on('end', () => {
       const url = request.url ?? '';
-      response.writeHead(200, { 'content-type': 'application/json' });
+      // setHeader rather than writeHead, so a handler below can still choose a
+      // STATUS. With the header written eagerly, `response.statusCode = 403`
+      // was a line that did nothing — which is how this stub answered 200 to a
+      // request the real platform refuses, and certified a bug (R114).
+      response.setHeader('content-type', 'application/json');
 
       // R93. A machine with no config signs in before it does anything else,
       // so the fake has to be able to refuse a stored session and hand out a
@@ -163,6 +167,20 @@ export async function fakePlatform({
         return response.end(JSON.stringify({ stage, state: 'DONE' }));
       }
       if (url.includes('/approvals') && request.method === 'POST') {
+        // R114 found this by running it: approvals are on `agent:ask`, which a
+        // MACHINE token does not carry. The daemon raised a stage gate with
+        // `config.token` and got a 403 from the real platform, while this stub
+        // answered 200 to anything — so the tests could not see it.
+        //
+        // A stub that is more permissive than the thing it stands in for is a
+        // stub that certifies bugs.
+        const auth = request.headers.authorization ?? '';
+        if (!auth.includes('cawdr_')) {
+          response.statusCode = 403;
+          return response.end(JSON.stringify({
+            message: 'This token is missing the agent:ask scope.',
+          }));
+        }
         gates.push(JSON.parse(body || '{}'));
         return response.end(JSON.stringify({ id: `approval-${gates.length}` }));
       }
