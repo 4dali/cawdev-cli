@@ -112,11 +112,22 @@ if (args.includes('init') || args.includes('index')) {
  */
 async function anEchoingAgent(home) {
   const script = join(home, 'agent.mjs');
+  // The config is COPIED to a file rather than printed.
+  //
+  // It used to be echoed on stdout and read back off the run's transcript,
+  // which caps a non-JSON line at 4000 characters — and an MCP config is longer
+  // than that on a CI runner, whose paths differ from a laptop's. The four
+  // tests below then failed with `Unterminated string in JSON`, on main, on
+  // every push, for as long as anybody had been looking. A test whose subject is
+  // "what was the child handed" should not be reading it through a transport
+  // that truncates.
+  const configCopy = join(home, 'mcp-config.json');
   await writeFile(script, `#!/usr/bin/env node
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 const at = process.argv.indexOf('--mcp-config');
 const config = at === -1 ? '{}' : await readFile(process.argv[at + 1], 'utf8');
-console.log('MCPCONFIG ' + JSON.stringify(JSON.parse(config)));
+await writeFile(${JSON.stringify(configCopy)}, config);
+console.log('MCPCONFIG written');
 console.log('ARGV ' + process.argv.slice(2).join(' '));
 // Stays up: the daemon reaps a child whose run has ended, and a stub that
 // exited before the daemon read its stdout is indistinguishable from one that
@@ -202,6 +213,8 @@ async function daemonWith(t, { name, wants, offers, workspaces = 1 }) {
 
   return {
     platform,
+    // Where the stub wrote its copy of the config — see `mcpConfigFrom`.
+    home,
     paths,
     indexer,
     said: () => said,
@@ -224,11 +237,16 @@ function saidByTheAgent(platform, tag) {
   return line ? line.body.slice(line.body.indexOf(tag + ' ') + tag.length + 1) : null;
 }
 
-/** The MCP config the child was handed, read back out of what it printed. */
-function mcpConfigFrom(platform) {
-  const said = saidByTheAgent(platform, 'MCPCONFIG');
-  assert.ok(said, `the agent never printed its config:\n${JSON.stringify(platform.outputs, null, 2)}`);
-  return JSON.parse(said);
+/**
+ * The MCP config the child was handed, read off the copy it wrote.
+ *
+ * Off DISK rather than the transcript — see `anEchoingAgent`. The transcript
+ * still carries `MCPCONFIG written`, which is what the tests wait on, because
+ * "the child has started and read its arguments" is a thing only the stream can
+ * say.
+ */
+async function mcpConfigFrom(where) {
+  return JSON.parse(await readFile(join(where, 'mcp-config.json'), 'utf8'));
 }
 
 function argvFrom(platform) {
@@ -237,13 +255,13 @@ function argvFrom(platform) {
 
 test('a skill the project turned on is in the session\'s MCP config',
   async (t) => {
-    const { said, untilSaid, platform } = await daemonWith(t, {
+    const { said, untilSaid, platform, home } = await daemonWith(t, {
       name: 'test-skill-yes',
       wants: {},
     });
 
     assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /), said());
-    const config = mcpConfigFrom(platform);
+    const config = await mcpConfigFrom(home);
     assert.ok(config.mcpServers.codegraph, `no codegraph server:\n${said()}`);
     // cawdev's own entry survives beside it, and is not the skill's. A skill
     // that could shadow it would intercept the run's own token.
@@ -264,7 +282,7 @@ test('a skill the project turned on is in the session\'s MCP config',
   });
 
 test('availability is not pre-approval: the tools are not in --allowedTools', async (t) => {
-  const { platform, said, untilSaid } = await daemonWith(t, {
+  const { platform, said, untilSaid, home } = await daemonWith(t, {
     name: 'test-skill-not-granted',
     wants: {},
   });
@@ -283,7 +301,7 @@ test('the platform decides: a skill a project turned on is attached here', async
   // no create endpoint, so turning one on runs a command cawdev itself shipped.
   // A second allowlist on every machine was therefore guarding against a
   // project owner enabling a vetted skill — friction, not a boundary.
-  const { platform, said, untilSaid } = await daemonWith(t, {
+  const { platform, said, untilSaid, home } = await daemonWith(t, {
     name: 'test-skill-platform-decides',
     wants: {},
     // No `skills` key at all. Once, this meant "none"; now the config has no
@@ -291,7 +309,7 @@ test('the platform decides: a skill a project turned on is attached here', async
   });
 
   assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /), said());
-  assert.ok(mcpConfigFrom(platform).mcpServers.codegraph,
+  assert.ok((await mcpConfigFrom(home)).mcpServers.codegraph,
     `the platform turned it on and it was not attached:\n${said()}`);
 });
 
@@ -299,13 +317,13 @@ test('a config written before R76 needs no edit to get a skill', async (t) => {
   // The upgrade path, and the point of removing the allowlist: an operator who
   // turns CodeGraph on in the console does not then have to go and edit a JSON
   // file on the machine before anything happens.
-  const { platform, said } = await daemonWith(t, {
+  const { platform, said, home } = await daemonWith(t, {
     name: 'test-skill-old-config',
     wants: {},
   });
 
   assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /), said());
-  assert.ok(mcpConfigFrom(platform).mcpServers.codegraph, said());
+  assert.ok((await mcpConfigFrom(home)).mcpServers.codegraph, said());
   // Still not pre-approved: the first call stops and asks (R51). Removing the
   // machine's allowlist did not remove the machine's consent — it moved it to
   // the moment the tool is actually used, which is where R51 already put it.
@@ -313,20 +331,20 @@ test('a config written before R76 needs no edit to get a skill', async (t) => {
 });
 
 test('a project that turned nothing on is spawned exactly as before', async (t) => {
-  const { platform, said, untilSaid } = await daemonWith(t, {
+  const { platform, said, untilSaid, home } = await daemonWith(t, {
     name: 'test-skill-unasked',
     wants: undefined,
   });
 
   assert.ok(await platform.untilSaidOnTheRun(/MCPCONFIG /), said());
-  assert.equal(mcpConfigFrom(platform).mcpServers.codegraph, undefined);
+  assert.equal((await mcpConfigFrom(home)).mcpServers.codegraph, undefined);
   // And nothing is said about it, because nothing was refused.
   assert.doesNotMatch(said(), /has not allowed it/);
 });
 
 test('the pin is checked against what was sent, and a disagreement is said out loud',
   async (t) => {
-    const { platform, untilSaid, said } = await daemonWith(t, {
+    const { platform, untilSaid, said, home } = await daemonWith(t, {
       name: 'test-skill-pin',
       // The row claims one version and the command names none — which is what a
       // migration that edited one and forgot the other looks like.
@@ -339,7 +357,7 @@ test('the pin is checked against what was sent, and a disagreement is said out l
     // Running what was SENT, not what was claimed: the arguments are what
     // executes, and quietly substituting a version nobody sent would be worse
     // than saying so.
-    assert.ok(mcpConfigFrom(platform).mcpServers.codegraph);
+    assert.ok((await mcpConfigFrom(home)).mcpServers.codegraph);
   });
 
 // --- the index, which is the integration work --------------------------------
@@ -414,7 +432,7 @@ test('the index is kept out of the checkout\'s own status', async (t) => {
 });
 
 test('an index that cannot be built is a sentence, not a failed run', async (t) => {
-  const { platform, untilSaid, said } = await daemonWith(t, {
+  const { platform, untilSaid, said, home } = await daemonWith(t, {
     name: 'test-skill-index-broken',
     // A command that is not there at all, which is what a missing binary or a
     // registry that would not serve one looks like.
