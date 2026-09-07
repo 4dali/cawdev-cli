@@ -167,6 +167,21 @@ const DEFAULTS = {
    *   "grantable": ["Bash(mvn *)", "Bash(npm *)"]
    */
   grantable: [],
+  /**
+   * Whether this machine applies rules set in the CONSOLE — R126.
+   *
+   * <p>Off, and it has to be. Every other rule the platform sends is filtered
+   * through `grantable` above, which is what lets the comment on this file say
+   * the platform can narrow what runs here and never widen it. A console rule
+   * is the exception: it RAISES the ceiling.
+   *
+   * <p>So the machine agrees or it does not. Turning this on says: I want to
+   * grant permissions from the web page, on this laptop, and I accept that
+   * anything able to write to my cawdev can then widen what an unattended agent
+   * does in my checkouts. That is a real decision and it is yours, which is
+   * exactly the argument `bypassPermissions` gets a few lines above.
+   */
+  acceptsRulesFromConsole: false,
   pollSeconds: 25,
   heartbeatSeconds: 30,
   /**
@@ -297,6 +312,8 @@ async function readConfig() {
     allowedTools: file.allowedTools ?? [],
     /** The machine's ceiling on stored rules. Per project ones add to it. */
     grantable: file.grantable ?? DEFAULTS.grantable,
+    acceptsRulesFromConsole:
+      file.acceptsRulesFromConsole ?? DEFAULTS.acceptsRulesFromConsole,
     /** Whether a run here may reach the operator's browser. Per project too. */
     browser: file.browser ?? DEFAULTS.browser,
     skillCache: file.skillCache ?? DEFAULTS.skillCache,
@@ -602,6 +619,46 @@ async function projectRules(config, slug) {
   } catch (failure) {
     log(`  could not read ${slug}'s tool rules (${failure.message}); the session will ask`);
     return [];
+  }
+}
+
+/**
+ * The ceiling this machine declared for itself, flattened for reporting — R126.
+ *
+ * <p>The machine's own `grantable` plus every project's, which is what the
+ * spawn actually assembles. Sent so the console can SHOW it beside what it
+ * granted; it is never read back, because the file is the truth.
+ */
+function declaredCeiling(config) {
+  const perProject = Object.entries(config.projects ?? {})
+    .flatMap(([slug, settings]) => (settings.grantable ?? []).map((p) => `${slug}: ${p}`));
+  return { machine: config.grantable ?? [], projects: perProject };
+}
+
+/**
+ * What the CONSOLE has granted this machine — R126.
+ *
+ * <p>Only asked for when this machine says it accepts them. Not asking is the
+ * enforcement: a daemon that fetched them and then filtered them would be one
+ * config typo away from applying them, and the whole point is that the machine
+ * decides.
+ *
+ * <p>Unreachable means none, like `projectRules` above: the session asks a
+ * person instead, which is the safe direction to fail in.
+ */
+async function machineRules(config) {
+  if (config.acceptsRulesFromConsole !== true || !config.runnerId) {
+    return { patterns: [], everything: false };
+  }
+  try {
+    const answer = await api(config, `/api/runners/${config.runnerId}/tool-rules`);
+    return {
+      patterns: (answer?.rules ?? []).map((rule) => rule.pattern).filter(Boolean),
+      everything: answer?.allowsEverything === true,
+    };
+  } catch (failure) {
+    log(`  could not read this machine's rules (${failure.message}); the session will ask`);
+    return { patterns: [], everything: false };
   }
 }
 
@@ -4364,10 +4421,26 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   // down is a ReferenceError on every single spawn. That shipped, and every
   // coding run failed with "Cannot access 'ceiling' before initialization"
   // until somebody tried to start one.
+  // R126. What the CONSOLE granted this machine, when this machine says it
+  // accepts that. It goes into the CEILING rather than through it, which is the
+  // whole difference between this and a project rule: a project rule is
+  // narrowed by what the laptop already allows, and this is the laptop being
+  // told — by its own operator, through a page it opted in to — to allow more.
+  const granted = await machineRules(config);
   const ceiling = [
     ...(config.grantable ?? []),
     ...(config.projects[run.projectSlug]?.grantable ?? []),
+    ...granted.patterns,
   ];
+  if (granted.patterns.length) {
+    log(`  this machine has been granted: ${granted.patterns.join(', ')}`);
+  }
+  if (granted.everything) {
+    // Said every time, and not once at boot. "Everything" is the setting people
+    // turn on for an afternoon and forget, and the log of the run it applied to
+    // is where somebody looks afterwards.
+    log('  !! this machine allows EVERYTHING: this session will not ask before any command');
+  }
   // Only a coding session can be given anything by a rule. Asked in the same
   // breath as the ceiling so the two cannot drift apart.
   const stored = writesCodeProfile(run) ? await projectRules(config, run.projectSlug) : [];
@@ -4478,8 +4551,36 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
         ...(config.allowedTools ?? []),
         ...(config.projects[run.projectSlug]?.allowedTools ?? []),
         ...admitted,
+        // R126. What the console granted THIS MACHINE. Straight in rather than
+        // through `withinCeiling`, because these ARE the ceiling — filtering
+        // them through it would mean a grant could only ever restate something
+        // the config already allowed, which is a grant that does nothing.
+        //
+        // Coding only, like everything else here: a machine that may run `mvn`
+        // unattended has said nothing about handing it to a session that was
+        // asked a question.
+        ...granted.patterns,
       ];
   const agentArgs = [...config.agentArgs];
+
+  // R126. "Allow everything on this machine", expressed in the CLI's own words
+  // rather than as a pattern list that tries to name everything. `agentArgs`'s
+  // own comment already points at bypassPermissions as the honest way to say
+  // this — "a real decision about what an unattended agent may do in your
+  // checkout, so it is yours to make" — and this is that decision made through
+  // the console instead of by hand.
+  //
+  // Coding only. Nothing else is spawned with a permission mode at all:
+  // argsForProfile strips it, deliberately, so an ASK session cannot be handed
+  // the shell by a setting made about builds.
+  if (granted.everything && writesAnythingProfile(run)) {
+    const mode = agentArgs.indexOf('--permission-mode');
+    if (mode !== -1) {
+      agentArgs[mode + 1] = 'bypassPermissions';
+    } else {
+      agentArgs.push('--permission-mode', 'bypassPermissions');
+    }
+  }
 
   // R61. Whether this session may drive the browser: the run asks, and this
   // machine answers. Both have to say yes.
@@ -5145,6 +5246,12 @@ async function main() {
     body: {
       name: config.name,
       capabilities: capabilities(config),
+      // R126. What this machine says about itself: whether it applies rules set
+      // in the console, and the ceiling it declared for itself. The second is a
+      // READING the console shows read-only — a ceiling the console could edit
+      // would not be a ceiling.
+      acceptsConsoleRules: config.acceptsRulesFromConsole === true,
+      grantable: JSON.stringify(declaredCeiling(config)),
     },
   });
   config.runnerId = runner.id;
@@ -5195,6 +5302,11 @@ async function main() {
         id: config.runnerId,
         name: config.name,
         url: config.url,
+        // R126. Whether this machine takes rules from the console — so the
+        // terminal only offers `M` when pressing it would do something. A key
+        // that takes an answer the platform then refuses reads as cawdev being
+        // broken, which is R58's rule about `a` applied to this one.
+        acceptsConsoleRules: config.acceptsRulesFromConsole === true,
         projects: Object.keys(config.projects),
         // How many checkouts each has — R62. The per-project half of R47's
         // gate, which the bar shows as `cawdev 1/2`. Added rather than
@@ -5281,6 +5393,11 @@ async function main() {
         // stores what this machine said, not its own reading of it.
         workingCopies: workingCopies ? JSON.stringify(workingCopies) : null,
         skillIndexes: skillIndexes ? JSON.stringify(skillIndexes) : null,
+        // R126, on every beat and not only at registration: a machine that is
+        // reconfigured to stop accepting console rules stops honouring them
+        // without anybody having to revoke anything.
+        acceptsConsoleRules: config.acceptsRulesFromConsole === true,
+        grantable: JSON.stringify(declaredCeiling(config)),
       },
     }).then((me) => {
       // R73/R80. The heartbeat's answer is what the platform decided about

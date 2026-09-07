@@ -149,7 +149,7 @@ export function questionBanner(asking, width, ink = painter(3)) {
  * rather than sending a decision with nothing to write, which the server would
  * quietly turn into an allow-once.
  */
-export function permissionDecision(approval, key) {
+export function permissionDecision(approval, key, machine = {}) {
   switch (key) {
     case 'y':
       return { allow: true, scope: 'ONCE' };
@@ -162,6 +162,16 @@ export function permissionDecision(approval, key) {
     case 'Y':
       return approval.suggestion
         ? { allow: true, scope: 'PROJECT', pattern: approval.suggestion }
+        : null;
+    case 'M':
+      // R126, the widest of the four: every project that ever runs on this
+      // machine. Null — and so not offered — for the two reasons it can be:
+      // no pattern to write, as with `Y`, and a machine whose own config does
+      // not accept rules from the console. A key that takes an answer the
+      // platform then refuses reads as cawdev being broken, which is R58's
+      // rule about the `a` key applied to this one.
+      return approval.suggestion && machine.acceptsConsoleRules
+        ? { allow: true, scope: 'RUNNER', pattern: approval.suggestion }
         : null;
     default:
       return null;
@@ -190,18 +200,26 @@ export function permissionDecision(approval, key) {
  * long wording says what `s` covers, because "for this session" and "every
  * Bash for this session" are not the same promise.
  */
-export function permissionBanner(pending, width, ink = painter(3)) {
+export function permissionBanner(pending, width, ink = painter(3), machine = {}) {
   if (!pending) return [];
   // Called with a pending record by the client, and with the approval itself by
   // the rule's own tests — the banner is about the request either way.
   const approval = pending.approval ?? pending;
   const covers = approval.suggestion ?? `every ${approval.toolName}`;
 
+  // R126's key is offered only when this machine accepts rules from the
+  // console — the same test `permissionDecision` makes, asked once here so the
+  // banner and the key handler cannot disagree about what is on offer.
+  const onTheMachine = approval.suggestion && machine.acceptsConsoleRules;
+
   const long = [
     `${ink.success('y')} allow once`,
     `${ink.success('s')} allow ${covers} this session`,
     ...(approval.suggestion
       ? [`${ink.warn('Y')} always allow ${approval.suggestion} here`]
+      : []),
+    ...(onTheMachine
+      ? [`${ink.warn('M')} always, on this machine`]
       : []),
     `${ink.danger('n')} refuse`,
   ];
@@ -211,6 +229,7 @@ export function permissionBanner(pending, width, ink = painter(3)) {
     ...(approval.suggestion
       ? [`${ink.warn('Y')} always allow ${approval.suggestion} here`]
       : []),
+    ...(onTheMachine ? [`${ink.warn('M')} this machine`] : []),
     `${ink.danger('n')} refuse`,
   ];
 
@@ -220,7 +239,10 @@ export function permissionBanner(pending, width, ink = painter(3)) {
   // and the only one of the four that can wait for a wider terminal. `n
   // refuse` never moves, because it is the one somebody reaches for when they
   // do not like what they are looking at.
-  const without = (choices) => choices.filter((each) => !/\bY\b/.test(stripAnsi(each)));
+  // R126's `M` goes with `Y`: both are standing rules, both are the widest and
+  // least urgent clauses, and dropping one while keeping the other would leave
+  // the banner offering the WIDER of the two on the narrower terminal.
+  const without = (choices) => choices.filter((each) => !/\b[YM]\b/.test(stripAnsi(each)));
   const rows = (choices) => wrapChoices(choices, width);
   const keys = [long, without(long), short, without(short)]
     .map(rows)
@@ -1153,6 +1175,7 @@ export class Attached {
       case 'y':
       case 's':
       case 'Y':
+      case 'M':
         return void this.allow(key);
       case 'n': {
         if (!this.pendingOn(this.current())) {
@@ -1849,18 +1872,27 @@ export class Attached {
     if (!pending) {
       return this.note('nothing is waiting for permission on this one');
     }
-    const decision = permissionDecision(pending.approval, key);
+    const decision = permissionDecision(pending.approval, key, this.runner ?? {});
     if (!decision) {
-      // `Y` on a compound command: the server can write no rule for it, and a
-      // decision with nothing to remember would silently be an allow-once.
+      // Two ways to get here and they need different sentences. `Y` or `M` on a
+      // compound command: no rule can be written and a decision with nothing to
+      // remember would silently be an allow-once. `M` on a machine that does
+      // not accept console rules: the rule could be written and would not be
+      // applied, which is worth saying out loud rather than as "no rule".
+      if (key === 'M' && pending.approval.suggestion) {
+        return this.note('this machine does not take rules from the console — add '
+          + '"acceptsRulesFromConsole": true to its config');
+      }
       return this.note(
-        'no project rule can be written for that one — s allows it for this session');
+        'no standing rule can be written for that one — s allows it for this session');
     }
     return this.decide(decision, decision.scope === 'PROJECT'
       ? `allowed, and ${pending.approval.suggestion} is now a project rule`
-      : decision.scope === 'SESSION'
-        ? `allowed ${decision.pattern} for the rest of this run`
-        : 'allowed, once');
+      : decision.scope === 'RUNNER'
+        ? `allowed, and ${decision.pattern} is now allowed on this machine`
+        : decision.scope === 'SESSION'
+          ? `allowed ${decision.pattern} for the rest of this run`
+          : 'allowed, once');
   }
 
   /**
@@ -2083,7 +2115,7 @@ export class Attached {
       // transcript this program exists to show. The picker's title carries the
       // call, and the whole of it was printed above.
       banner: this.select && this.select.kind !== 'runs' ? [] : pending
-        ? permissionBanner(pending, width, this.ink)
+        ? permissionBanner(pending, width, this.ink, this.runner ?? {})
         : questionBanner(this.askingOn(run), width, this.ink),
     };
 

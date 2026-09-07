@@ -59,8 +59,8 @@ test('nothing else is a decision', () => {
 
 // --- and what the banner offers -----------------------------------------------
 
-const banner = (approval, width = 80) =>
-  permissionBanner(approval, width).map(stripAnsi).join('\n');
+const banner = (approval, width = 80, machine = {}) =>
+  permissionBanner(approval, width, undefined, machine).map(stripAnsi).join('\n');
 
 test('the banner offers all three, plus the refusal', () => {
   const said = banner(request());
@@ -91,4 +91,51 @@ test('no line is wider than the pane it is drawn in', () => {
 
 test('nothing pending is nothing drawn', () => {
   assert.deepEqual(permissionBanner(null, 80), []);
+});
+
+// --- R126: the fourth length of yes -------------------------------------------
+
+test('M is a rule on the MACHINE, and only when the machine takes them', () => {
+  const approval = { toolName: 'Bash', suggestion: 'Bash(mvn *)' };
+
+  assert.deepEqual(permissionDecision(approval, 'M', { acceptsConsoleRules: true }),
+    { allow: true, scope: 'RUNNER', pattern: 'Bash(mvn *)' });
+
+  // A machine whose own config does not accept console rules would have the
+  // rule written and never applied. Offering the key anyway is how a terminal
+  // comes to take an answer the platform then refuses.
+  assert.equal(permissionDecision(approval, 'M', { acceptsConsoleRules: false }), null);
+  assert.equal(permissionDecision(approval, 'M', {}), null);
+});
+
+test('M needs a pattern, exactly as Y does', () => {
+  // A compound command the server could write no rule for. A decision with
+  // nothing to remember would silently become an allow-once.
+  const compound = { toolName: 'Bash', suggestion: null };
+  assert.equal(permissionDecision(compound, 'M', { acceptsConsoleRules: true }), null);
+});
+
+test('the banner offers M only when the machine takes rules', () => {
+  const pending = { approval: { toolName: 'Bash', suggestion: 'Bash(mvn *)' } };
+
+  const offered = banner(pending, 120, { acceptsConsoleRules: true });
+  assert.match(offered, /M always, on this machine/);
+
+  const not = banner(pending, 120, {});
+  assert.doesNotMatch(not, /\bM\b/);
+  // And the other three are untouched by its absence.
+  assert.match(not, /y once|y allow once/);
+  assert.match(not, /n refuse/);
+});
+
+test('on a narrow terminal M goes with Y, never instead of it', () => {
+  const pending = { approval: { toolName: 'Bash', suggestion: 'Bash(mvn *)' } };
+  const narrow = banner(pending, 30, { acceptsConsoleRules: true });
+
+  // Both are standing rules and M is the WIDER of the two. Dropping Y while
+  // keeping M would leave the narrow terminal offering the bigger grant.
+  const hasY = /\bY\b/.test(narrow);
+  const hasM = /\bM\b/.test(narrow);
+  assert.equal(hasM, hasY, `M and Y must come and go together: ${narrow}`);
+  assert.match(narrow, /n refuse|refuse/);
 });
