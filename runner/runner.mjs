@@ -71,7 +71,11 @@ const DEFAULTS = {
     // 2.1.247 — one process, one session id, many turns.
     //
     // The cost of this is that the session no longer ends by itself when the
-    // first turn finishes, which is why endSession() exists below.
+    // first turn finishes, which is why endSession() exists below. It is
+    // called for a STAGE and never for a run: a stage has one turn and nobody
+    // to prompt it, and for four months nothing called it at all — which is
+    // the deadlock its own comment describes, sitting in the file unnoticed
+    // because the only agent any test ever spawned exited by itself.
     '--input-format',
     'stream-json',
     '--verbose',
@@ -216,6 +220,19 @@ const DEFAULTS = {
    */
   idleSeconds: 1200,
   /**
+   * How long a stage gets to leave after its input is closed — see endSession.
+   *
+   * Generous, because closing stdin is a request and a CLI is entitled to
+   * finish flushing before it honours one. Bounded, because the entire point
+   * is that the walk cannot be made to wait on something that will not happen:
+   * at this a SIGTERM goes to the process group, at twice it a SIGKILL.
+   *
+   * A setting rather than a constant for two reasons: a slow machine can be
+   * given room, and an escalation nobody can trigger in under a minute is an
+   * escalation no test will ever cover.
+   */
+  sessionExitSeconds: 30,
+  /**
    * How often to take what a person has asked of a served checkout — R57.
    *
    * Faster than the heartbeat on purpose: these sit behind a button somebody is
@@ -285,6 +302,7 @@ async function readConfig() {
     skillCache: file.skillCache ?? DEFAULTS.skillCache,
     skillPrepareSeconds: file.skillPrepareSeconds ?? DEFAULTS.skillPrepareSeconds,
     idleSeconds: file.idleSeconds ?? DEFAULTS.idleSeconds,
+    sessionExitSeconds: file.sessionExitSeconds ?? DEFAULTS.sessionExitSeconds,
   };
 
   if (!config.token) {
@@ -3526,6 +3544,81 @@ function writeUserMessage(child, text) {
 }
 
 /**
+ * Ends the session — the function `agentArgs`'s comment has promised since R22
+ * and which, until now, did not exist.
+ *
+ * <p>R22 keeps a session's stdin OPEN so a person can prompt it again without a
+ * second process. The cost, which that comment states, is that the CLI no
+ * longer exits when its turn finishes: it is sitting there waiting for more
+ * input. For a RUN that is the point — the session stays open for whatever gets
+ * typed next, and the run ends when the agent reports, which the platform turns
+ * into a terminal state that `reapCancelled` acts on.
+ *
+ * <p>For a STAGE there is nobody to type anything. A stage is one instruction
+ * and one turn, the next stage is a different process, and {@link
+ * walkLifecycle} advances on the child's `close`. So the walk waited on an
+ * event nothing was ever going to cause, and a run sat RUNNING between PLAN and
+ * VERIFY — holding its project's only checkout, with a finished plan nobody was
+ * ever shown — until a person went looking.
+ *
+ * <p>Closing the input is the whole fix; the rest of this is distrust. A CLI
+ * that ignores EOF would reproduce that deadlock exactly, so the wait is
+ * bounded — SIGTERM to the process GROUP, because an agent that spawned a build
+ * should not leave it behind, and then SIGKILL. Neither is a failure: {@link
+ * walkLifecycle} judges a stage by whether its TURN ended, so a stage that did
+ * all of its work and had to be helped out of the door still counts as done.
+ *
+ * <p>Deliberately NOT called for a run without a lifecycle. Doing that would
+ * undo R22 for every ASK session on the machine.
+ */
+function endSession(child, describe, seconds) {
+  if (child.cawdevEnding) {
+    return;
+  }
+  child.cawdevEnding = true;
+
+  if (child.stdin && !child.stdin.destroyed && !child.stdin.writableEnded) {
+    try {
+      child.stdin.end();
+    } catch (failure) {
+      // A stdin already gone is the state this wanted anyway.
+      if (failure.code !== 'EPIPE') {
+        log(`  could not close ${describe}'s input: ${failure.message}`);
+      }
+    }
+  }
+
+  const grace = Math.max(1, seconds) * 1000;
+  child.cawdevExitTimers = [
+    setTimeout(() => {
+      log(`  ${describe} has not exited ${seconds}s after its input closed; stopping it`);
+      try {
+        process.kill(-child.pid, 'SIGTERM');
+      } catch { /* already gone, which is what was wanted */ }
+    }, grace),
+    setTimeout(() => {
+      log(`  ${describe} is still here; killing it`);
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch { /* already gone */ }
+    }, grace * 2),
+  ];
+  // Never hold the daemon open on these. A machine that could not exit because
+  // it was waiting to kill something is this same bug one level up.
+  for (const timer of child.cawdevExitTimers) {
+    timer.unref?.();
+  }
+}
+
+/** Stops the escalation above — the child left, which is all anybody wanted. */
+function stopEndingSession(child) {
+  for (const timer of child.cawdevExitTimers ?? []) {
+    clearTimeout(timer);
+  }
+  child.cawdevExitTimers = [];
+}
+
+/**
  * Long-polls for prompts typed in the console and writes them into the session.
  *
  * Delivery is acknowledged only after the write, so a prompt that never reached
@@ -3963,16 +4056,27 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
 
       last = await spawn(stage, carried);
 
-      if (last?.code !== 0) {
+      // A clean exit, OR a turn that ended. The second half is the half that
+      // matters now: `endSession` closes a stage's input when its turn is over
+      // and forces the process down if that is ignored, so a stage that did
+      // every bit of its work can still leave on a signal — and reading that as
+      // a failure would fail a run for a shutdown the daemon performed itself.
+      //
+      // Neither half alone is enough. A CLI that exits 0 having said nothing
+      // did not do the work; one killed mid-thought did not either.
+      if (last?.code !== 0 && !last?.turnEnded) {
         // A stage that died is the run failing, and R80's carry-on already
         // knows what to do with a failed run — including that it KEEPS the
         // workspace, so picking it back up does not start from origin.
+        const how = last?.signal
+          ? `was stopped (${last.signal}) before finishing its turn`
+          : `exited with code ${last?.code}`;
         await reportStage(config, run, stage.stage, 'report', {
           state: 'FAILED',
-          outcome: `The ${stage.stage} stage exited with code ${last?.code}.`,
+          outcome: `The ${stage.stage} stage ${how}.`,
         });
         await finish(config, run, 'FAILED',
-          `The ${stage.stage} stage exited with code ${last?.code}. ${last?.text ?? ''}`.trim());
+          `The ${stage.stage} stage ${how}. ${last?.text ?? ''}`.trim());
         return;
       }
 
@@ -4368,8 +4472,9 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     child.cawdevWritesCode = writesCode;
     running.set(run.id, child);
 
-    // The opening instruction, as a user message. stdin is NOT closed: the
-    // session stays open for whatever a person types next.
+    // The opening instruction, as a user message. stdin is NOT closed here:
+    // the session stays open for whatever a person types next. For a stage,
+    // endSession() closes it when the turn ends — see there.
     //
     // On a resume it is the FOLLOW-UP and nothing else — R69. The session is
     // being handed back its own transcript, so it already has the question, the
@@ -4386,6 +4491,10 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       ?? (promptFor(run) + harness + (stage ? stagePrompt(stage, carried) : '')));
 
     let lastText = '';
+    // Whether the CLI ever said its turn was over. This, and not the exit code,
+    // is what says a STAGE did its work — see the failure branch in
+    // walkLifecycle, and endSession above for why the two came apart.
+    let turnEnded = false;
     // The last of what the CLI said on stderr, for the exit decision below.
     // The usage-limit notice is written there, and a decision made on stdout
     // alone would call every window a crash.
@@ -4490,8 +4599,22 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
         buffer = buffer.slice(newline + 1);
         if (!line) continue;
         const event = safeJson(line);
-        if (event?.type === 'result' && typeof event.result === 'string') {
-          lastText = event.result;
+        if (event?.type === 'result') {
+          if (typeof event.result === 'string') {
+            lastText = event.result;
+          }
+          // The turn is over. An errored result is still an ending, so the
+          // session is closed either way — but it is not work done, and the
+          // walk is told the difference rather than left to read an exit code
+          // that says nothing about it.
+          turnEnded = turnEnded || event.is_error !== true;
+          // R22's cost, paid. A stage has nobody to prompt it and one turn to
+          // give, so this is where its process is asked to leave; without it
+          // the walk waits on a `close` that cannot come. A run with no
+          // lifecycle keeps its input open, exactly as R22 intends.
+          if (stage) {
+            endSession(child, `the ${stage.stage} stage`, config.sessionExitSeconds);
+          }
         }
         // R69. The handle this conversation can be continued with. The CLI
         // announces it on `init` and nowhere else, so it is caught here rather
@@ -4588,7 +4711,8 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       // A spawn that never happened has no exit code. The run is already
       // FAILED above, so the loop is told the stage did not succeed and stops
       // — it must not read `code: undefined` as "fine".
-      resolvePromise(stage ? { code: -1, signal: null, text: failure.message } : undefined);
+      resolvePromise(
+        stage ? { code: -1, signal: null, text: failure.message, turnEnded: false } : undefined);
     });
 
     // `close`, not `exit`, for the reason git() gives: the last stream-json
@@ -4598,6 +4722,12 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     child.on('close', async (code, signal) => {
       prompts.stop();
       workingCopy.stop();
+      // Both of these outlive the child otherwise. The idle watchdog did, and
+      // went on posting "this session has said nothing for 20 minutes" against
+      // a run that had ended twenty minutes earlier — a note on a closed
+      // transcript, naming a session nobody could look at.
+      stopEndingSession(child);
+      clearTimeout(idleTimer);
       // Flushed before the transition, so the last thing the session said is
       // already readable when its state changes to FINISHED.
       await transcript.flush();
@@ -4677,7 +4807,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       // R112. A stage hands its result back so the loop can store the plan,
       // gate on it, and carry it into the next stage. A run with no lifecycle
       // resolves with nothing, exactly as it always did.
-      resolvePromise(stage ? { code, signal, text: lastText } : undefined);
+      resolvePromise(stage ? { code, signal, text: lastText, turnEnded } : undefined);
     });
   });
 }

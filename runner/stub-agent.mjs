@@ -16,15 +16,26 @@
 //
 // It behaves like the real thing in the ways that matter to the runner: it is
 // spawned in the working copy with CAWDEV_TOKEN in its environment, it talks to
-// the platform through the same MCP tools, and it exits. What it does *not* do
-// is think — it follows a fixed script, which is exactly what a test wants.
+// the platform through the same MCP tools, and — since the stage walk hung on
+// exactly this — it does NOT exit when its turn ends. What it does *not* do is
+// think: it follows a fixed script, which is exactly what a test wants.
+//
+// That last point used to read "and it exits", and the claim was the problem.
+// The real CLI is spawned with `--input-format stream-json` and its stdin held
+// open (R22), so when a turn finishes it sits there waiting for the next one
+// and leaves only when its input closes. A stub that called process.exit()
+// instead modelled away the single fact the daemon's stage walk depends on, and
+// a walk that waited for a process which was never going to leave looked
+// perfectly healthy against it. So: say the turn is over, then wait to be
+// dismissed. CAWDEV_STUB_EXIT=1 restores the old, less honest behaviour for
+// anything that genuinely wants a one-shot process.
 //
 // The script is chosen by CAWDEV_STUB_SCRIPT:
 //   report-and-finish  (default) progress, then done
 //   ask-then-finish              ask a question, wait for the answer, then done
 //   permission-then-finish       ask permission for a command, wait, then done
 //   crash                        exit non-zero without reporting
-//   hang                         never exit, for testing cancellation
+//   hang                         never say anything, for testing cancellation
 //
 // It announces a session id on `init`, like the real CLI, so R69's resume path
 // has something to record and hand back.
@@ -33,6 +44,17 @@ const url = (process.env.CAWDEV_URL ?? 'http://localhost:8091').replace(/\/+$/, 
 const token = process.env.CAWDEV_TOKEN;
 const project = process.env.CAWDEV_PROJECT;
 const script = process.env.CAWDEV_STUB_SCRIPT ?? 'report-and-finish';
+
+// The real CLI leaves when its input closes, and not before. Modelling that is
+// the whole reason this file is not three lines shorter.
+function leave(code = 0) {
+  if (code !== 0 || process.env.CAWDEV_STUB_EXIT) {
+    process.exit(code);
+  }
+  process.stdin.on('end', () => process.exit(0));
+  process.stdin.on('close', () => process.exit(0));
+  process.stdin.resume();
+}
 
 function say(text) {
   // The real CLI emits stream-json; the runner only reads `result` events, so
@@ -122,6 +144,9 @@ if (script === 'hang') {
     }
     if (!answer) {
       await report('BLOCKED', 'Nobody answered the stub agent.');
+      say('nobody answered');
+      // Straight out, unlike the finish below: this is the stub giving up, and
+      // there is nothing after it worth staying open for.
       process.exit(0);
     }
     await report('PROGRESS', `Got the answer: ${answer}`);
@@ -157,10 +182,12 @@ if (script === 'hang') {
     }
     if (!decision) {
       await report('BLOCKED', 'Nobody decided the stub agent\'s permission request.');
+      say('nobody decided');
       process.exit(0);
     }
     if (decision.state !== 'ALLOWED') {
       await report('BLOCKED', `Refused (${decision.state}): ${decision.reason ?? 'no reason given'}`);
+      say('refused');
       process.exit(0);
     }
     await report('PROGRESS', 'Allowed. Pretending to run mvn --version.');
@@ -168,5 +195,5 @@ if (script === 'hang') {
 
   await report('DONE', 'Stub agent finished. No code was written, which is the point.');
   say('done');
-  process.exit(0);
+  leave();
 }

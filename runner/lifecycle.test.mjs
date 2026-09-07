@@ -41,12 +41,41 @@ const CODING = {
   branch: 'r1-work', profile: 'CODE',
 };
 
-async function daemonWith(t, { name, workflow, gateDecision }) {
+/**
+ * An agent that behaves like the real `claude` in the one way that matters
+ * here: it says its turn is over and then STAYS, because its stdin is open and
+ * it is waiting for whatever gets typed next (R22). It leaves when its input
+ * closes — or, with `deaf`, not even then.
+ *
+ * Written to a file rather than reached for in stub-agent.mjs because these
+ * tests are about the LOOP and want an agent with no platform in it at all.
+ */
+async function anAgentThatLingers(home, { deaf = false } = {}) {
+  const path = join(home, deaf ? 'deaf-agent.mjs' : 'lingering-agent.mjs');
+  await writeFile(path, `#!/usr/bin/env node
+process.stdout.write(JSON.stringify(
+  { type: 'system', subtype: 'init', session_id: 'lingering' }) + '\\n');
+process.stdout.write(JSON.stringify({ type: 'result', result: 'the stage is done' }) + '\\n');
+${deaf
+    ? "// Ignores EOF entirely — the case the escalation exists for.\nsetTimeout(() => {}, 600000);"
+    : "process.stdin.on('end', () => process.exit(0));"}
+process.stdin.resume();
+`, { mode: 0o755 });
+  return path;
+}
+
+async function daemonWith(t,
+    { name, workflow, gateDecision, agent, sessionExitSeconds, runLive = false }) {
   const workspace = await aRepository();
   const platform = await fakePlatform({
     offers: [CODING],
     workflow,
     gateDecision,
+    // A run the fake platform calls FINISHED is reaped, and a reaped child is
+    // indistinguishable from one that left of its own accord — which is the
+    // whole subject of the two tests that pass an agent. They need the run to
+    // stay live so that nothing but the daemon's own stage handling ends it.
+    runLive,
   });
   const home = await mkdtemp(join(tmpdir(), 'cawdev-lifecycle-cfg-'));
   const config = join(home, 'config.json');
@@ -54,9 +83,16 @@ async function daemonWith(t, { name, workflow, gateDecision }) {
     url: platform.url,
     name,
     // `/bin/echo` exits 0 immediately and says nothing a stream parser can use,
-    // which is exactly what this needs: the subject is the LOOP, not the agent.
-    agentCommand: '/bin/echo',
+    // which is exactly what most of this needs: the subject is the LOOP, not
+    // the agent. It is also the reason the walk could deadlock for months with
+    // every test here green — see the two that pass an agent of their own.
+    // Named directly, never as an argument to `node`: the runner puts
+    // `--mcp-config` first, and node would exit on a flag it does not know.
+    // The shebang runs it and the cawdev flags land in an argv it ignores —
+    // which is what the real CLI does with the ones it does not need either.
+    agentCommand: agent ?? '/bin/echo',
     pollSeconds: 1,
+    ...(sessionExitSeconds ? { sessionExitSeconds } : {}),
     projects: { board: { workspaces: [workspace] } },
   }));
 
@@ -218,4 +254,60 @@ test('a refused gate re-runs THAT stage rather than ending the run', async (t) =
 
   assert.ok(await until(said, /the PLAN gate was refused/), said());
   assert.ok(await until(said, /again, after the gate refused it/), said());
+});
+
+test('a stage whose agent does not exit by itself is still walked past', async (t) => {
+  // The bug this file could not see. `/bin/echo` leaves the moment it is
+  // spawned, so every test above walked its lifecycle against an agent that
+  // ended itself — while the real CLI, spawned with `--input-format
+  // stream-json` and its stdin held open by R22, says its turn is over and then
+  // waits for the next one. The walk advances on the child's `close`, so it
+  // waited for an event nothing was going to cause: PLAN finished, its plan was
+  // written, and the run sat RUNNING holding the project's only checkout.
+  //
+  // So: an agent that lingers, and the assertion is simply that the SECOND
+  // stage happens.
+  const home = await mkdtemp(join(tmpdir(), 'cawdev-lingering-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-lingering-agent',
+    agent: await anAgentThatLingers(home),
+    runLive: true,
+    workflow: [
+      { stage: 'PLAN', gate: 'AUTO' },
+      { stage: 'IMPLEMENT', gate: 'AUTO' },
+    ],
+  });
+
+  assert.ok(await untilReported(platform, 'IMPLEMENT'), said());
+  // And it got there as work done, not as a run that failed on the way.
+  assert.deepEqual(platform.transitions.filter((each) => each.state === 'FAILED'), [], said());
+});
+
+test('an agent that ignores the closed input is stopped rather than waited on', async (t) => {
+  // Closing stdin is a request, and the deadlock comes back in full if a CLI
+  // declines it. Nothing about this run may depend on the agent's cooperation,
+  // so the wait is bounded — and a stage forced out after its turn ended is
+  // DONE, because the daemon is the one that forced it.
+  const home = await mkdtemp(join(tmpdir(), 'cawdev-deaf-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-deaf-agent',
+    agent: await anAgentThatLingers(home, { deaf: true }),
+    runLive: true,
+    sessionExitSeconds: 2,
+    workflow: [
+      { stage: 'PLAN', gate: 'AUTO' },
+      { stage: 'IMPLEMENT', gate: 'AUTO' },
+    ],
+  });
+
+  assert.ok(await until(said, /has not exited 2s after its input closed/), said());
+  assert.ok(await untilReported(platform, 'IMPLEMENT'), said());
+  const plan = platform.stageCalls.find(
+    (each) => each.stage === 'PLAN' && each.what === 'report');
+  assert.equal(plan.body.state, 'DONE', JSON.stringify(plan.body));
+  assert.deepEqual(platform.transitions.filter((each) => each.state === 'FAILED'), [], said());
 });
