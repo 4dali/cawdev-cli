@@ -64,6 +64,27 @@ process.stdin.resume();
   return path;
 }
 
+/**
+ * An agent that never ends its turn — R122.
+ *
+ * <p>It says hello and then works for ever, so nothing it does ends the stage:
+ * the only thing that stops it is the daemon's own reaper, which takes down the
+ * process group of any run the platform no longer calls live. That is the real
+ * shape of a run whose agent reported done in the middle of its lifecycle, and
+ * it is the case the walk used to read as a dead stage.
+ */
+async function anAgentThatIsReaped(home) {
+  const path = join(home, 'working-agent.mjs');
+  await writeFile(path, `#!/usr/bin/env node
+process.stdout.write(JSON.stringify(
+  { type: 'system', subtype: 'init', session_id: 'working' }) + '\\n');
+// No result, ever. The turn does not end; the reaper ends the process.
+setTimeout(() => {}, 600000);
+process.stdin.resume();
+`, { mode: 0o755 });
+  return path;
+}
+
 async function daemonWith(t,
     { name, workflow, gateDecision, agent, sessionExitSeconds, runLive = false }) {
   const workspace = await aRepository();
@@ -310,4 +331,44 @@ test('an agent that ignores the closed input is stopped rather than waited on', 
     (each) => each.stage === 'PLAN' && each.what === 'report');
   assert.equal(plan.body.state, 'DONE', JSON.stringify(plan.body));
   assert.deepEqual(platform.transitions.filter((each) => each.state === 'FAILED'), [], said());
+});
+
+test('a stage stopped because the run already ended is not a failed stage', async (t) => {
+  // R117, exactly: the agent reported done inside VERIFY, the reaper took the
+  // child down because the run was no longer live, and the walk read its own
+  // daemon's kill as a stage that died. The run was FINISHED and the console
+  // drew it stuck in VERIFY, with every stage behind it PENDING for ever.
+  //
+  // `runLive: false` is that state — the fake platform answers FINISHED, which
+  // is what the platform says once an agent has reported.
+  const home = await mkdtemp(join(tmpdir(), 'cawdev-reaped-'));
+  t.after(async () => rm(home, { recursive: true, force: true }));
+
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-reaped-mid-lifecycle',
+    agent: await anAgentThatIsReaped(home),
+    workflow: [
+      { stage: 'PLAN', gate: 'AUTO' },
+      { stage: 'IMPLEMENT', gate: 'AUTO' },
+      { stage: 'MEMORY', gate: 'AUTO' },
+    ],
+  });
+
+  assert.ok(await untilReported(platform, 'PLAN'), said());
+  const plan = platform.stageCalls.find((each) => each.stage === 'PLAN' && each.what === 'report');
+  assert.equal(plan.body.state, 'DONE', JSON.stringify(plan.body));
+
+  // And the stages that will never run say so, rather than sitting at PENDING
+  // on a run that is over. SKIPPED is the state that means *not going to*.
+  assert.ok(await untilReported(platform, 'MEMORY'), said());
+  for (const stage of ['IMPLEMENT', 'MEMORY']) {
+    const report = platform.stageCalls
+      .find((each) => each.stage === stage && each.what === 'report');
+    assert.equal(report.body.state, 'SKIPPED', `${stage}: ${JSON.stringify(report?.body)}`);
+  }
+
+  // The one thing that must not happen: a run that finished being failed by
+  // the daemon that stopped it.
+  const failed = platform.transitions.filter((each) => each.state === 'FAILED');
+  assert.deepEqual(failed, [], JSON.stringify(failed));
 });

@@ -4023,6 +4023,29 @@ function writesAnythingProfile(run) {
  * fallback, it is the ordinary case for ASK, ROADMAP and AUDIT, and for every
  * project that has not configured one.
  */
+/**
+ * Says so about the stages that will never run — R122.
+ *
+ * <p>A lifecycle can end before its last stage in three ordinary ways: the
+ * agent reports done inside one, a person cancels, or a gate is refused twice.
+ * In all three the stages behind it stay {@code PENDING}, which is the state
+ * meaning *not yet* — so the console draws a run that is over as one still
+ * working, and the stage it stopped in as the stage it is stuck in.
+ *
+ * <p>{@code SKIPPED} is the state that says the difference, and it already
+ * exists for the stages a project has switched off. Reported one at a time and
+ * never fatally: this is bookkeeping after the fact, and a run that has already
+ * ended must not be failed because a tidying call did not land.
+ */
+async function skipRest(config, run, lifecycle, from, why) {
+  for (let at = from; at < lifecycle.length; at++) {
+    await reportStage(config, run, lifecycle[at].stage, 'report', {
+      state: 'SKIPPED',
+      outcome: why,
+    });
+  }
+}
+
 async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, resume,
     projectServers, expertAgents, skills, instincts, briefing, lifecycle, shield) {
   const spawn = (stage, carried) => spawnAgent(config, run, runToken, cwd, baseCommit, workspace,
@@ -4065,6 +4088,38 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
       // Neither half alone is enough. A CLI that exits 0 having said nothing
       // did not do the work; one killed mid-thought did not either.
       if (last?.code !== 0 && !last?.turnEnded) {
+        // Before this is a failure, ask whether the RUN is still going — R122.
+        //
+        // `reapCancelled` stops the process group of any run that is no longer
+        // live, and that includes a run the AGENT itself ended by reporting
+        // done in the middle of its lifecycle. The kill being read here is then
+        // the daemon's own, and reading it as a dead stage is how a FINISHED
+        // run comes to be drawn as stuck: R117 reported done inside VERIFY, the
+        // reaper stopped the child, and the console showed a finished run whose
+        // VERIFY stage said `exited with code 143` with three stages PENDING
+        // behind it for ever.
+        //
+        // Asked of the platform rather than remembered locally, because the run
+        // can end from three places — the agent's report, a person cancelling,
+        // the sweeper — and only one of them passes through this process.
+        const ended = await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}`)
+          .catch(() => null);
+        if (ended && ended.live === false) {
+          const why = ended.state === 'FINISHED'
+            ? `The run was reported finished during the ${stage.stage} stage.`
+            : `The run was ${String(ended.state).toLowerCase()} during the ${stage.stage} stage.`;
+          await reportStage(config, run, stage.stage, 'report', {
+            // DONE when the run reached its own ending here — the stage did not
+            // fail, it is where the work stopped — and SKIPPED for every other
+            // way a run can be over, where nobody claims the work was finished.
+            state: ended.state === 'FINISHED' ? 'DONE' : 'SKIPPED',
+            plan: stage.stage === 'PLAN' ? last?.text ?? null : null,
+            outcome: `${why} ${last?.text ?? ''}`.trim(),
+          });
+          await skipRest(config, run, lifecycle, at + 1, why);
+          return;
+        }
+
         // A stage that died is the run failing, and R80's carry-on already
         // knows what to do with a failed run — including that it KEEPS the
         // workspace, so picking it back up does not start from origin.
@@ -4097,8 +4152,12 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
         break;
       }
       if (attempt === 1) {
-        await finish(config, run, 'FINISHED',
-          `Stopped at the ${stage.stage} gate: ${decision.reason ?? 'refused twice.'}`);
+        const why = `Stopped at the ${stage.stage} gate: ${decision.reason ?? 'refused twice.'}`;
+        // The same trail R122 came from: a run that ends here never reaches the
+        // stages after it, and stages left PENDING on a run that is over read
+        // as a lifecycle still going.
+        await skipRest(config, run, lifecycle, at + 1, why);
+        await finish(config, run, 'FINISHED', why);
         return;
       }
       // Refused once: the reason is the point of refusing, so it goes into the
