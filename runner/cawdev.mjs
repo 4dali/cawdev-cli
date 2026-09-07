@@ -8,9 +8,11 @@
 //
 // **Finding no daemon, it starts one.** That was decided by the person who
 // asked for this entry, and it has a cost worth naming: a background process
-// somebody did not know they started. So the cost is paid out loud — quitting
-// the UI leaves the daemon running, because it is driving runs, and says so,
-// naming the runner and the command that stops it.
+// somebody did not know they started. R81 paid that cost out loud and left the
+// process running; R123 pays it by ENDING it — one word started the window and
+// the machine, and `q` stops both, asking twice while sessions are live.
+// `--leave-running` is the old answer, for a machine that should outlive the
+// window, and there the goodbye still names the runner and the `kill`.
 //
 // R52's discovery is unchanged where it still applies: one daemon is the answer
 // without asking, and more than one means naming which.

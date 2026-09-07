@@ -606,7 +606,7 @@ const COMMANDS = [
   ['/runs', 'the run list — the same as L'],
   ['/cancel', 'cancel the session you are watching'],
   ['/log', "the daemon's own log, on or off"],
-  ['/quit', 'leave; the runner keeps going'],
+  ['/quit', 'stop the runner and leave (--leave-running keeps it up)'],
 ];
 
 /**
@@ -1042,6 +1042,11 @@ export class Attached {
    * <p>Only ever closes an ANSWER. A permission request and a prompt are
    * different questions with different lives, and a poll that tidied those away
    * would be closing boxes nobody asked it to touch.
+   *
+   * <p>And what decides that is the box that is OPEN, never the claim held
+   * beside it. The claim says WHICH question is being answered; it does not say
+   * that anything is still on screen, and it outlives its box every time
+   * somebody escapes one.
    */
   answeredElsewhere(runId, asked) {
     const open = this.answering;
@@ -1057,7 +1062,14 @@ export class Attached {
       return false;
     }
     this.answering = null;
-    if (this.mode === 'keys' && !this.select) {
+    // The claim is stale on every way out that is not an answer — esc from the
+    // picker, a run taken off `L`, a POST that failed — so a poll that trusted
+    // it closed whatever happened to be open INSTEAD: a permission request, a
+    // command half typed, the run list, all of them over the words "answered
+    // elsewhere". That is the one thing the paragraph above promises this
+    // cannot do, which makes it a thing to check rather than to promise.
+    const onScreen = this.select?.kind === 'question' || this.input?.kind === 'answer';
+    if (!onScreen) {
       return false;
     }
     this.mode = 'keys';
@@ -1172,8 +1184,9 @@ export class Attached {
    * pressed it once nobody wants to press it three more times to get out of a
    * picker they opened by accident.
    *
-   * R81's rule holds on the way out: the daemon survives, and the goodbye names
-   * it and says how to stop it.
+   * The way out is `quit`'s, and since R123 that takes the daemon with it — so
+   * where there is work the second press asks again rather than leaving, and a
+   * third is what actually goes.
    */
   onInterrupt() {
     const closed = this.closeEverything();
@@ -1272,9 +1285,11 @@ export class Attached {
       this.input = null;
       this.history.reset();
       if (back) {
+        // Back to the options, still answering them.
         return this.reopen(back);
       }
       this.mode = 'keys';
+      this.answering = null;
       return this.note('cancelled');
     }
 
@@ -1445,6 +1460,10 @@ export class Attached {
     if (outcome.done === 'cancelled') {
       this.mode = 'keys';
       this.select = null;
+      // With the box goes the claim on the question it was answering — R119.
+      // Nothing reads it while nothing is open, but a field that says an answer
+      // is being written when none is is one the next reader will believe.
+      this.answering = null;
       // Escape leaves without changing anything, which is the promise the key
       // makes everywhere else.
       return this.note('');
@@ -2139,10 +2158,12 @@ export class Attached {
  * What is said on the way out — R81, and a function so it can be read without
  * quitting anything.
  *
- * The entry is explicit about this: quitting does not kill the daemon, and
- * "a background process you did not know you started is the cost of this choice
- * and it should be paid out loud". So the goodbye names the runner, what it is
- * still driving, and the exact command that stops it.
+ * Two shapes since R123, because there are two ways to leave. Stopping it says
+ * what went with it and how to have it not, which is where somebody who wanted
+ * the machine left running finds that out. Leaving it running is R81's sentence
+ * unchanged — "a background process you did not know you started is the cost of
+ * this choice and it should be paid out loud" — so it names the runner, what it
+ * is still driving, and the exact command that stops it.
  */
 export function farewell(runner, runs, ink = painter(3), stopping = false) {
   const name = runner?.name ?? 'the runner';

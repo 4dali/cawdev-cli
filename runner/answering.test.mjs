@@ -506,11 +506,58 @@ test('and news about another run leaves this question alone', () => {
 
 test('a permission request is not closed by a question being answered', () => {
   // Two different things stop a session, and only one of them is this poll's.
-  const { ui } = client({ question: null, pending: approval() });
-  ui.onKey('y');
-  const before = ui.mode;
-  ui.answeredElsewhere(RUN.id, [asked({ answered: true })]);
-  assert.equal(ui.mode, before);
+  //
+  // The setup is the whole test: the claim on a question outlives the picker it
+  // was made for — esc leaves the box behind and the poll arrives seconds later
+  // — so what must not happen is news about the question closing the DECISION
+  // that took the screen in the meantime, over the words "answered elsewhere".
+  const { ui } = client({ pending: approval() });
+  ui.onKey('a');
+  ui.onKey(ESC);
+  ui.announce();
+  assert.equal(ui.select.kind, 'permission', 'the permission request is what is open');
+
+  assert.equal(ui.answeredElsewhere(RUN.id, [asked({ answered: true })]), false);
+  assert.equal(ui.select.kind, 'permission', 'and it is still there to be decided');
+});
+
+test('nor the run list, which was never answering anything', () => {
+  const { ui } = client();
+  ui.onKey('a');
+  ui.onKey(ESC);
+  ui.onKey('L');
+  assert.equal(ui.answeredElsewhere(RUN.id, [asked({ answered: true })]), false);
+  assert.equal(ui.select.kind, 'runs');
+});
+
+test('nor a command half typed under it', () => {
+  const { ui } = client();
+  ui.onKey('a');
+  ui.onKey(ESC);
+  ui.onKey('/');
+  type(ui, 'log');
+  assert.equal(ui.answeredElsewhere(RUN.id, [asked({ answered: true })]), false);
+  assert.equal(ui.mode, 'typing');
+  assert.equal(ui.input.line.text, '/log', 'nobody typing this asked for it to go');
+});
+
+test('escaping the question drops the claim on it', () => {
+  // Not because anything reads it while nothing is open, but because a field
+  // saying an answer is being written when none is is one the next reader
+  // believes.
+  const { ui } = client();
+  ui.onKey('a');
+  assert.ok(ui.answering, 'opened, and this is what it is answering');
+  ui.onKey(ESC);
+  assert.equal(ui.answering, null);
+});
+
+test('and so does escaping a line with no options behind it', () => {
+  const { ui } = client({ question: asked({ options: [] }) });
+  ui.onKey('a');
+  assert.ok(ui.answering);
+  ui.onKey(ESC);
+  assert.equal(ui.answering, null);
 });
 
 // --- R123: the machine goes when the window does -----------------------------
