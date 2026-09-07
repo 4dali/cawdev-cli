@@ -81,10 +81,23 @@ without opening pull requests has none to give it.
 really can go from `CONSIDERING` straight to `SHIPPED` if that is what happened.
 The rules are about what a status *carries*, not the path it took.
 
-### The body is the decision; the comments are the argument
+### The body is what we want; the plan is how; the comments are the argument
 
-`roadmap_get` gives you both, and `task_current` gives you both for the entry
-you are working on. **Read the discussion before you propose anything about an
+`roadmap_get` gives you all three, and `task_current` gives you them for the
+entry you are working on.
+
+**The plan is the one to read before doing any of the work.** It was written by
+a plan phase and agreed by somebody, and it names the files — R124. If you are
+carrying it out and it turns out to be wrong, say so and stop rather than
+improvising a different change: what was approved was that plan, and a different
+one has not been approved.
+
+You cannot write a plan through this server, and you cannot start a plan phase
+either. The first is the platform's — it stores what a plan phase reports when
+the phase ends, so that a session which must not write is not handed a writer to
+do its own bookkeeping with. The second is refused outright: *an agent cannot
+start another agent*, which is `RunAccess.requireCanStart`'s rule and not an
+omission here. **Read the discussion before you propose anything about an
 entry.** It is where an objection was answered and where an obvious-looking
 approach was ruled out with a reason — and re-proposing what was talked out
 three months ago is precisely what it exists to stop.
@@ -140,7 +153,7 @@ what you are allowed to do.
 | `roadmap_where` | Which platform, which token, read from where, and who you are. Start here. |
 | `roadmap_statuses` | The eight statuses, what they mean, what each requires. |
 | `roadmap_list` | Entries, optionally by status. `brief` omits bodies — use it to survey. |
-| `roadmap_get` | One entry in full: its body **and the discussion on it**. |
+| `roadmap_get` | One entry in full: its body, **the plan agreed for it**, and the discussion on it. |
 | `roadmap_create` | Create an entry; the platform allocates its permanent number. |
 | `roadmap_update` | Title, body, section, related ids. |
 | `roadmap_comment` | Say something *beside* an entry rather than inside it. |

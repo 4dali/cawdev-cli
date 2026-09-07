@@ -3518,6 +3518,12 @@ already mapped this repository, and guessing at a structure you could have read
 is how a plan comes to name files that do not exist. Read the card with
 \`roadmap_get\`, and read the code itself.
 
+**If this card has been planned before, \`roadmap_get\` shows you that plan.** It
+is deliberately not put in front of you here: starting from somebody else's
+answer produces a version of it rather than a second opinion. But go and look
+before you finish, because one case matters — a person correcting a plan writes
+a NEW one, and re-planning blind to that would undo the fix they just made.
+
 **Say what you are unsure about.** A plan that hides its doubts gets carried out
 confidently and wrongly. If there is a real fork, \`ask_user\` — you are the phase
 where a question is cheap.

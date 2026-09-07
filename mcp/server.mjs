@@ -434,10 +434,11 @@ const TOOLS = [
   {
     name: 'roadmap_get',
     description:
-      'One roadmap entry in full, including its body and the discussion on it. Read the ' +
-      'comments before proposing anything about this entry: they are where an objection was ' +
-      'answered, and re-proposing what was talked out three months ago is the thing they exist ' +
-      'to stop.',
+      'One roadmap entry in full: its body, THE PLAN somebody agreed for it, and the ' +
+      'discussion on it. Read the plan before doing any of the work — it is what was decided, ' +
+      'and it names the files. Read the comments before proposing anything: they are where an ' +
+      'objection was answered, and re-proposing what was talked out three months ago is the ' +
+      'thing they exist to stop.',
     inputSchema: {
       type: 'object',
       properties: { ...PROJECT_ARGUMENT, number: { type: 'integer' } },
@@ -450,7 +451,16 @@ const TOOLS = [
         config,
         `/api/projects/${slug}/roadmap/${args.number}/comments`,
       );
-      return formatEntry(entry, { comments });
+      // R124. The plan of record is part of what this card SAYS — the body is
+      // what we want, the plan is how we mean to get it — so it comes back with
+      // the entry rather than from a tool of its own.
+      //
+      // Tolerated missing on purpose. This server talks to whatever platform it
+      // was pointed at, and one that has not run V59 has no such endpoint; a
+      // 404 here must cost the plan, not the card.
+      const plans = await api(config, `/api/projects/${slug}/roadmap/${args.number}/plans`)
+        .catch(() => []);
+      return formatEntry(entry, { comments, plan: plans?.[0] ?? null });
     },
   },
 
@@ -831,9 +841,9 @@ const TOOLS = [
   {
     name: 'task_current',
     description:
-      'What you are working on: the roadmap entry, its branch, and everything already said and ' +
-      'asked on this run. Call it first, and again whenever you are unsure where you are — a ' +
-      'resumed or confused session re-orients from this alone.',
+      'What you are working on: the roadmap entry, THE PLAN agreed for it, its branch, and ' +
+      'everything already said and asked on this run. Call it first, and again whenever you ' +
+      'are unsure where you are — a resumed or confused session re-orients from this alone.',
     inputSchema: { type: 'object', properties: {} },
     handler: async (config) => {
       const { runId, project } = await requireRun(config);
@@ -862,6 +872,18 @@ const TOOLS = [
       // ordinary answer and not a reason to fail the one call a resumed session
       // re-orients from.
       const brief = await api(config, `/api/projects/${project}/brief`).catch(() => null);
+      // R124. The plan agreed for this card, which for an implementation phase
+      // is the instruction. Its own try, like the history and the brief and for
+      // the same reason: a platform without it answers 404, and that must cost
+      // the plan rather than the one call a resumed session re-orients from.
+      //
+      // It comes here as well as on the claim on purpose. The claim's copy is
+      // in an opening prompt a long session may have scrolled past; this is the
+      // call it makes when it has lost its place.
+      const plans = await api(
+        config,
+        `/api/projects/${project}/roadmap/${run.entryNumber}/plans`,
+      ).catch(() => []);
 
       const lines = [];
 
@@ -888,7 +910,7 @@ const TOOLS = [
         `run:     ${run.state}${run.runnerName ? ` on ${run.runnerName}` : ''}`,
         `started by ${run.startedByEmail}`,
         '',
-        formatEntry(entry, { comments }),
+        formatEntry(entry, { comments, plan: plans?.[0] ?? null }),
       );
 
       // What happened the other times. A session is told the entry and the
@@ -1679,7 +1701,7 @@ function formatFileDeps(map, path) {
   return lines.join('\n');
 }
 
-function formatEntry(entry, { brief, comments }) {
+function formatEntry(entry, { brief, comments, plan }) {
   const lines = [`R${entry.number} — ${entry.title}`, `  status: ${entry.statusDisplay}`];
   if (entry.branch) lines.push(`  branch: ${entry.branch}`);
   if (entry.merge) lines.push(`  merged: ${entry.merge}`);
@@ -1699,8 +1721,34 @@ function formatEntry(entry, { brief, comments }) {
       + `under ${entry.createdBy.startedByEmail}`);
   }
   if (!brief && entry.body) lines.push('', entry.body);
+  // R124, between the body and the discussion — the order they are read in:
+  // what we want, how we mean to get it, and the argument about both.
+  if (!brief && plan?.body) lines.push('', formatPlan(plan));
   if (comments?.length) lines.push('', formatComments(comments));
   return lines.join('\n');
+}
+
+/**
+ * The plan somebody agreed for this card — R124.
+ *
+ * <p>The CURRENT one and no history, which is the same restraint
+ * {@link formatPastRun} shows about transcripts: plans are append-only and a
+ * card that was re-planned four times would fill the context of the session
+ * this is meant to orient. What was thought before is on the card's page.
+ *
+ * <p><strong>A planning session can reach this, and that is deliberate.</strong>
+ * The claim does not carry the old plan into a plan phase's prompt — leading a
+ * session with its predecessor's answer produces an echo rather than a second
+ * opinion. Being able to LOOK is a different thing, and there is a case that
+ * settles it: a person's correction is written as a new plan, and a re-planning
+ * session blind to that would rewrite the very thing somebody just fixed.
+ */
+function formatPlan(plan) {
+  const who = plan.authorEmail ? plan.authorEmail : 'a plan session';
+  const written = plan.baseCommit
+    ? `${plan.createdAt} by ${who}, against ${plan.baseCommit.slice(0, 10)}`
+    : `${plan.createdAt} by ${who}`;
+  return [`--- the plan (${written}) ---`, plan.body].join('\n');
 }
 
 /**
