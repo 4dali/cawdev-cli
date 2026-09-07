@@ -90,7 +90,11 @@ async function until(said, pattern, timeout = 20000) {
   return false;
 }
 
-test('a project at its cap still starts an ASK, a ROADMAP and an AUDIT', async (t) => {
+test('a project at its cap still starts an ASK, a ROADMAP, an AUDIT and a PLAN', async (t) => {
+  // R124 added the fourth, and it is the one the entry exists for. A plan phase
+  // that queued behind a coding run would put thinking about one card back on
+  // the critical path of building another — which is the whole thing the split
+  // was for, undone by the queue rather than by the lifecycle.
   const workspaces = [await aRepository()];
   const { platform, said } = await daemonWith(t, {
     name: 'test-caps-noncoding',
@@ -100,18 +104,19 @@ test('a project at its cap still starts an ASK, a ROADMAP and an AUDIT', async (
       asking('run-ask', 'what did R12 decide?', 'ASK'),
       asking('run-roadmap', 'file that as an entry', 'ROADMAP'),
       asking('run-audit', 'read the tools directory', 'AUDIT'),
+      asking('run-plan', 'work out what to do about R12', 'PLAN'),
     ],
   });
 
-  // All four, on one checkout. The one checkout is the coding cap and three of
-  // these four never touch it.
+  // All five, on one checkout. The one checkout is the coding cap and four of
+  // these five never touch it.
   const all = await platform.until(
-    (transitions) => transitions.filter((each) => each.state === 'RUNNING').length === 4,
+    (transitions) => transitions.filter((each) => each.state === 'RUNNING').length === 5,
   );
   assert.ok(all, `something queued behind the coding run:\n${said()}`);
 
   const started = platform.transitions.filter((each) => each.state === 'RUNNING');
-  for (const id of ['run-ask', 'run-roadmap', 'run-audit']) {
+  for (const id of ['run-ask', 'run-roadmap', 'run-audit', 'run-plan']) {
     // Took no checkout, and says so rather than claiming one it is not in.
     assert.equal(started.find((each) => each.runId === id).workspace, null);
   }

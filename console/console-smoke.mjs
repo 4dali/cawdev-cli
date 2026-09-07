@@ -345,6 +345,12 @@ try {
       body: JSON.stringify({
         title: `console smoke batch ${which} (safe to decline)`,
         body: 'Created by tools/console/console-smoke.mjs.\n\n**Build:** nothing.',
+        // PLANNED, said out loud, since R124. A card now arrives at
+        // CONSIDERING — the first of three phases — and `canStartWork` has
+        // always refused that status. This loop is about the batch, not about
+        // which statuses may be started, so it says what it needs rather than
+        // leaning on a default that has moved.
+        status: 'PLANNED',
       }),
     }));
   }

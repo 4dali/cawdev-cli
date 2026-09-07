@@ -3225,6 +3225,23 @@ const PROFILE_TOOLS = {
   ],
   ROADMAP: ROADMAP_WRITE_CAWDEV,
   AUDIT: [...READ_ONLY_CAWDEV, 'mcp__cawdev__propose_entry', ...READ_FILES],
+  // R124's plan phase. AUDIT's list without `propose_entry`: it reads the
+  // repository and the card, and writes NOTHING — not the code, not the
+  // roadmap, not even the plan.
+  //
+  // That last one is the part worth stating. The plan of record is written by
+  // the PLATFORM when this run finishes, from the stage's own artefact, rather
+  // than by the session calling a tool. R108's argument: a phase that must not
+  // write should not be handed a writer to do its own bookkeeping with, because
+  // then it has a writer.
+  //
+  // `git` is read-only for REVIEW's reason — the code as it stands is the
+  // subject, and a planner that could commit is a planner that could start.
+  PLAN: [
+    ...READ_ONLY_CAWDEV,
+    ...READ_FILES,
+    ...GIT_READS,
+  ],
   // R96. Read the whole repository, ask in rounds, write the brief, commit it.
   //
   // The narrowing is HERE and not in the prompt, which is the whole reason the
@@ -3316,12 +3333,15 @@ function stagePrompt(stage, carried) {
     PLAN: 'Work out what to do and WRITE THE PLAN. Do not change anything — you have no '
       + 'tool that can, so do not spend turns discovering that. Read what you need, then say, '
       + 'concretely: which files, what change in each, and how you will know it worked. '
-      + 'Somebody is going to read this and decide whether you may proceed.',
+      + 'What you report becomes the card\'s plan, and a DIFFERENT session — another '
+      + 'process, with none of your context — will be handed it and told to carry it out. '
+      + 'Write it for them.',
     VERIFY: 'Check the plan against what is actually there. Does every file it names exist? '
       + 'Does every interface it assumes still look like that? You cannot change anything — '
       + 'say what is wrong with the plan, or say plainly that it holds.',
-    IMPLEMENT: 'Do the work in the plan. If the plan turns out to be wrong, say so and stop '
-      + 'rather than improvising a different change — somebody approved that plan, and a '
+    IMPLEMENT: 'Do the work in the plan — it is under "The plan for this card" above, '
+      + 'written by the plan phase and agreed. If it turns out to be wrong, say so and stop '
+      + 'rather than improvising a different change: somebody approved that plan, and a '
       + 'different one has not been approved.',
     TEST: 'Run what proves the work. Report what passed and what did not, with the output. A '
       + 'failing test is a result, not a failure of this stage.',
@@ -3480,6 +3500,34 @@ less than four you can point at.
 They asked:
 
 ${run.openingPrompt}`;
+  }
+
+  if (run.profile === 'PLAN') {
+    return `You are planning **R${run.entryNumber} — ${run.entryTitle}** for the cawdev
+platform. This is the PLAN PHASE: you work out what to do, and you write it down.
+You do not build it, and you have no tool that could — so do not spend turns
+finding that out.
+${about}${briefLine(run)}
+**What you produce is an artefact somebody reads.** Not notes to yourself: a plan
+a different session, in a different process, with none of your context, has to be
+able to carry out. Name the files. Say what changes in each. Say how anybody will
+know it worked — which test, which command, what they should see.
+
+**Read before you decide.** Start with \`code_map\` and \`file_deps\`: cawdev has
+already mapped this repository, and guessing at a structure you could have read
+is how a plan comes to name files that do not exist. Read the card with
+\`roadmap_get\`, and read the code itself.
+
+**Say what you are unsure about.** A plan that hides its doubts gets carried out
+confidently and wrongly. If there is a real fork, \`ask_user\` — you are the phase
+where a question is cheap.
+
+**Do not write the plan anywhere.** Not to a file, not to the card. cawdev stores
+what you report as the card's plan of record when this phase ends, and that is
+the only copy anybody wants: two plans in two places is how one of them goes
+stale.
+
+Then \`report\` kind "done" with the plan itself.`;
   }
 
   if (run.profile === 'REVIEW') {
@@ -3882,6 +3930,7 @@ async function startRun(config, offered, workspace) {
   // lifecycle to walk, and what is guarded against.
   let instincts = [];
   let briefing = null;
+  let plan = null;
   let lifecycle = [];
   let shield = null;
 
@@ -3929,6 +3978,9 @@ async function startRun(config, offered, workspace) {
     skills = Array.isArray(claimed.skills) ? claimed.skills : [];
     instincts = Array.isArray(claimed.instincts) ? claimed.instincts : [];
     briefing = claimed.briefing ?? null;
+    // R124. The card's plan of record, when the platform says this run follows
+    // one. Read here with everything else the claim carries.
+    plan = claimed.plan ?? null;
     lifecycle = Array.isArray(claimed.workflow) ? claimed.workflow : [];
     shield = claimed.shield ?? null;
     if (instincts.length) {
@@ -3984,7 +4036,7 @@ async function startRun(config, offered, workspace) {
     });
 
     await walkLifecycle(config, run, runToken, resolve(path), baseCommit, workspace, resume,
-        mcpServers, expertAgents, skills, instincts, briefing, lifecycle, shield);
+        mcpServers, expertAgents, skills, instincts, briefing, plan, lifecycle, shield);
   } catch (failure) {
     // Anything that goes wrong before or during the spawn is the run's failure,
     // and the reason belongs on the run where someone will see it.
@@ -4074,9 +4126,9 @@ async function skipRest(config, run, lifecycle, from, why) {
 }
 
 async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, resume,
-    projectServers, expertAgents, skills, instincts, briefing, lifecycle, shield) {
+    projectServers, expertAgents, skills, instincts, briefing, plan, lifecycle, shield) {
   const spawn = (stage, carried) => spawnAgent(config, run, runToken, cwd, baseCommit, workspace,
-    resume, projectServers, expertAgents, skills, instincts, briefing, lifecycle, shield,
+    resume, projectServers, expertAgents, skills, instincts, briefing, plan, lifecycle, shield,
     stage, carried);
 
   // No lifecycle, or a resume: one process, exactly as before.
@@ -4087,7 +4139,7 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
   // person was reading when they typed it.
   if (!lifecycle?.length || resume) {
     return spawnAgent(config, run, runToken, cwd, baseCommit, workspace, resume,
-      projectServers, expertAgents, skills, instincts, briefing, lifecycle, shield);
+      projectServers, expertAgents, skills, instincts, briefing, plan, lifecycle, shield);
   }
 
   log(`  walking ${lifecycle.length} stage(s): ${lifecycle.map((s) => s.stage).join(' → ')}`);
@@ -4294,7 +4346,8 @@ function gateTimeoutSeconds() {
 }
 
 async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, resume,
-    projectServers, expertAgents, skills, instincts, briefing, lifecycle, shield, stage = null,
+    projectServers, expertAgents, skills, instincts, briefing, plan, lifecycle, shield,
+    stage = null,
     carried = null) {
   // R51: what this machine will let a STORED rule cover. The project's rules
   // are filtered through it before they go anywhere near a spawn, so the
@@ -4481,6 +4534,10 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   const harness = harnessPrompt({
     instincts,
     briefing,
+    // R124. Null on everything but an implementation phase whose card has been
+    // planned, which the PLATFORM decides — the runner does not work out which
+    // runs deserve a plan, it carries the one it was handed.
+    plan,
     lifecycle,
     repoConfig: await readRepoConfig(cwd),
   });
