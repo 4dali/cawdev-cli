@@ -307,6 +307,9 @@ test('typing a slash filters the command list as you go', () => {
 test('enter takes the highlighted command, so guessing the name stops being a step', async () => {
   // `/q` was never a command. It is now the only one it could have been.
   const { ui, quits } = client({ question: null });
+  // Nothing running: since R123 quitting takes the daemon with it and asks
+  // twice while there is work, and the subject here is the KEY.
+  ui.runs = [];
   ui.onKey('/');
   type(ui, 'q');
   ui.onKey('\r');
@@ -367,9 +370,22 @@ test('esc closes what is open without ending the session', () => {
 
 test('ctrl+c once says press again; twice leaves', () => {
   const { ui, quits } = client();
+  ui.runs = [];
   ui.onKey('\x03');
   assert.deepEqual(quits, []);
   assert.match(ui.status, /again/);
+  ui.onKey('\x03');
+  assert.deepEqual(quits, ['quit']);
+});
+
+test('and with a session running it costs one more press, because it stops it', () => {
+  // R123. Leaving takes the daemon and its sessions with it, so the last press
+  // is a decision rather than a keystroke.
+  const { ui, quits } = client();
+  ui.onKey('\x03');
+  ui.onKey('\x03');
+  assert.deepEqual(quits, [], 'this one only warns');
+  assert.match(stripAnsi(ui.status), /1 session running here/);
   ui.onKey('\x03');
   assert.deepEqual(quits, ['quit']);
 });
@@ -394,6 +410,10 @@ test('the first ctrl+c also closes whatever was open', () => {
 
 test('a status line names the run, how long it has been going, and what stops it', () => {
   const { ui } = client({ question: null });
+  // Started NOW minus four minutes rather than at import: the shared fixture is
+  // stamped when this file loads, and a suite that takes a second between the
+  // two reads the clock over a tick and fails on 4m 13s.
+  ui.runs = [{ ...RUN, startedAt: new Date(Date.now() - 252_000).toISOString() }];
   const footer = ui.footer().map(stripAnsi).join('\n');
   assert.match(footer, /R83 — answering in the CLI/);
   assert.match(footer, /4m 12s/);
@@ -437,4 +457,133 @@ test('a plain permission request asks again rather than guessing', () => {
   ui.onLine('yes please');
   assert.equal(calls.length, 0, 'a permission request has no free text to fall back on');
   assert.ok(ui.pending.length > before, 'so the list is printed again');
+});
+
+// --- R119: the console is the other door onto the same question --------------
+
+test('a question answered in the console closes the picker here', () => {
+  // The complaint, exactly: answered from the web, and the terminal was still
+  // sitting there waiting for the same answer a second time.
+  const { ui } = client();
+  ui.onKey('a');
+  assert.equal(ui.mode, 'select');
+
+  // What the next poll reads back once somebody has answered in the browser.
+  const closed = ui.answeredElsewhere(RUN.id,
+    [asked({ answered: true, answer: 'Postgres', answeredByEmail: ALICE })]);
+
+  assert.equal(closed, true);
+  assert.equal(ui.mode, 'keys', 'the picker is gone');
+  assert.equal(ui.select, null);
+});
+
+test('and the half-written line too, saying who answered it', () => {
+  const { ui } = client({ question: asked({ options: [] }) });
+  ui.onKey('a');
+  type(ui, 'Postg');
+  assert.equal(ui.mode, 'typing');
+
+  ui.answeredElsewhere(RUN.id, [asked({ options: [], answered: true, answeredByEmail: BOB })]);
+
+  assert.equal(ui.mode, 'keys');
+  assert.equal(ui.input, null);
+  assert.match(stripAnsi(ui.status ?? ''), /answered by bob@cawdev.test/);
+});
+
+test('a question still open closes nothing', () => {
+  const { ui } = client();
+  ui.onKey('a');
+  assert.equal(ui.answeredElsewhere(RUN.id, [asked()]), false);
+  assert.equal(ui.mode, 'select', 'still being answered');
+});
+
+test('and news about another run leaves this question alone', () => {
+  const { ui } = client();
+  ui.onKey('a');
+  assert.equal(ui.answeredElsewhere('run-2', [asked({ answered: true })]), false);
+  assert.equal(ui.mode, 'select');
+});
+
+test('a permission request is not closed by a question being answered', () => {
+  // Two different things stop a session, and only one of them is this poll's.
+  const { ui } = client({ question: null, pending: approval() });
+  ui.onKey('y');
+  const before = ui.mode;
+  ui.answeredElsewhere(RUN.id, [asked({ answered: true })]);
+  assert.equal(ui.mode, before);
+});
+
+// --- R123: the machine goes when the window does -----------------------------
+
+/** A client attached to a SEPARATE daemon, the way plain `cawdev` runs. */
+function detached({ leaveRunning = false, runs = [{ ...RUN, state: 'running' }] } = {}) {
+  const out = { write() {}, columns: 100, rows: 40, isTTY: true };
+  const stopped = [];
+  const session = {
+    url: 'http://localhost:8091', email: ALICE, signedIn: true,
+    async request() { return null; },
+    async signOut() {},
+  };
+  const ui = new Attached('/tmp/none.sock', session,
+    { out, leaveRunning, stopDaemon: (pid) => stopped.push(pid) });
+  ui.runner = { name: 'macbook', pid: 4242 };
+  ui.runs = runs;
+  ui.watching = runs[0]?.id;
+  // Nothing here should reach a real terminal or a real process.
+  ui.screen = { update() {}, close() {} };
+  ui.finish = () => {};
+  return { ui, stopped };
+}
+
+test('quitting stops the daemon it attached to', () => {
+  const { ui, stopped } = detached({ runs: [] });
+  const exit = process.exit;
+  process.exit = () => {};
+  try {
+    ui.quit();
+  } finally {
+    process.exit = exit;
+  }
+  assert.deepEqual(stopped, [4242]);
+});
+
+test('and asks twice first while a session is running', () => {
+  const { ui, stopped } = detached();
+  const exit = process.exit;
+  process.exit = () => {};
+  try {
+    ui.quit();
+    assert.deepEqual(stopped, [], 'the first press only warns');
+    assert.match(stripAnsi(ui.status ?? ''), /1 session running here/);
+    ui.quit();
+  } finally {
+    process.exit = exit;
+  }
+  assert.deepEqual(stopped, [4242]);
+});
+
+test('--leave-running is the old behaviour, and nothing is signalled', () => {
+  const { ui, stopped } = detached({ leaveRunning: true });
+  const exit = process.exit;
+  process.exit = () => {};
+  try {
+    ui.quit();
+  } finally {
+    process.exit = exit;
+  }
+  assert.deepEqual(stopped, []);
+  assert.match(stripAnsi(ui.goodbye().join('\n')), /keeps going/);
+});
+
+test('a daemon that never said its pid is left alone rather than guessed at', () => {
+  const { ui, stopped } = detached({ runs: [] });
+  ui.runner = { name: 'macbook' };
+  const exit = process.exit;
+  process.exit = () => {};
+  try {
+    ui.quit();
+  } finally {
+    process.exit = exit;
+  }
+  assert.deepEqual(stopped, []);
 });

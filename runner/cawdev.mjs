@@ -43,6 +43,7 @@ const USAGE = `
   cawdev --setup            set this machine up again: projects, checkouts, token
   cawdev --no-start         attach only; never launch a daemon
   cawdev --watch-only       do not sign in; watch without being able to act
+  cawdev --leave-running    leave the daemon running when you quit
   cawdev --help
 
   On a machine with no config, cawdev sets one up: it signs you in through the
@@ -50,7 +51,8 @@ const USAGE = `
   and mints its own runner token. No token is ever typed.
 
   Inside: enter prompts the session you are watching, / takes a command
-  (/help lists them), L lists the runs, q leaves — and the runner keeps going.
+  (/help lists them), L lists the runs, and q stops the machine and leaves.
+  It asks twice while sessions are running. --leave-running keeps it up.
 `;
 
 /**
@@ -352,8 +354,8 @@ async function main() {
     const alive = await liveSockets();
     if (alive.length) {
       console.log(`  ${ink.warn('!')} ${ink.muted('A runner is already running here, on the config it booted with.')}`);
-      console.log(`  ${ink.muted('Stop it to pick this up — quitting the client does not, and')}`);
-      console.log(`  ${ink.muted('the goodbye it prints names the command that does.')}`);
+      console.log(`  ${ink.muted('Attach and quit to stop it, and the next cawdev starts one')}`);
+      console.log(`  ${ink.muted('on what you just set up.')}`);
     }
   }
 

@@ -503,7 +503,10 @@ export async function attach(argv, options = {}) {
   const socket = options.socketPath ?? (await chooseSocket(valueOf(argv, '--runner')));
   const session = await openSession(argv);
 
-  const ui = new Attached(socket, session, options);
+  // Spread second so `--attach`'s own wiring wins: there the daemon IS this
+  // process and quitting has always stopped it.
+  const ui = new Attached(socket, session,
+    { leaveRunning: argv.includes('--leave-running'), ...options });
   await ui.start();
 }
 
@@ -650,6 +653,15 @@ export class Attached {
     this.select = null;
     /** The line being typed, its label, and where Esc goes back to. */
     this.input = null;
+    /**
+     * The question an open picker or line is answering — R119.
+     *
+     * Held apart from `mode` because the poll needs to know WHAT is being
+     * answered, not merely that something is: the console is the other door
+     * onto the same question, and a box waiting for an answer that has already
+     * been given is this terminal asking a person to do a thing twice.
+     */
+    this.answering = null;
     this.status = '';
     this.showLog = false;
     this.asked = new Set();
@@ -990,6 +1002,12 @@ export class Attached {
           } else {
             this.questions.delete(run.id);
           }
+          // R119. The banner going is not enough: a picker or a half-written
+          // line is a MODE, and it sits there over a question that has already
+          // been answered in the console — asking a person a second time for
+          // something they have just done, and posting it into a refusal if
+          // they oblige.
+          this.answeredElsewhere(run.id, asked);
           // A run entering WAITING_ON_USER is the moment the question becomes
           // something to look at, and this poll is where that is noticed.
           this.announce();
@@ -1005,6 +1023,53 @@ export class Attached {
 
   askingOn(run) {
     return run ? this.questions.get(run.id) ?? null : null;
+  }
+
+  /**
+   * Closes an answer being written to a question somebody has already answered
+   * — R119.
+   *
+   * <p>The console and this terminal are two doors onto one question, and until
+   * now only one of them noticed when it was closed. Answering in the browser
+   * cleared the banner here and left the PICKER up, so the session everybody
+   * could see had moved on was still, on this screen, waiting for a person who
+   * had already answered it. Pressing enter then posted into a refusal.
+   *
+   * <p>Says WHO answered it where it can. "Answered" reads as something this
+   * terminal did; a name is the difference between a thing that happened and a
+   * thing that happened to you.
+   *
+   * <p>Only ever closes an ANSWER. A permission request and a prompt are
+   * different questions with different lives, and a poll that tidied those away
+   * would be closing boxes nobody asked it to touch.
+   */
+  answeredElsewhere(runId, asked) {
+    const open = this.answering;
+    if (!open || open.runId !== runId) {
+      return false;
+    }
+    const question = (asked ?? []).find((each) => each.id === open.questionId);
+    // Still open, still worth answering. A question that has VANISHED — the run
+    // gone, the list unreadable — is treated as answered rather than left on
+    // screen for ever, because the one thing that cannot be right is a terminal
+    // insisting on an answer to something it can no longer find.
+    if (question && !question.answered) {
+      return false;
+    }
+    this.answering = null;
+    if (this.mode === 'keys' && !this.select) {
+      return false;
+    }
+    this.mode = 'keys';
+    this.select = null;
+    this.input = null;
+    this.history.reset();
+    this.dirty = true;
+    const by = question?.answeredByEmail;
+    this.note(by && by !== this.session.email
+      ? `answered by ${by} — closing this`
+      : 'answered elsewhere — closing this');
+    return true;
   }
 
   // --- keys ------------------------------------------------------------------
@@ -1127,6 +1192,7 @@ export class Attached {
     this.mode = 'keys';
     this.select = null;
     this.input = null;
+    this.answering = null;
     this.history.reset();
     this.dirty = true;
     return open;
@@ -1500,6 +1566,13 @@ export class Attached {
    * editor, which is what it has always done.
    */
   askTheQuestion(asking) {
+    // What is being answered, so that the poll can tell whether this is still
+    // worth answering — R119. The RUN as well as the question: a picker left
+    // open while the operator switches to another session is still this
+    // question's, and clearing it on somebody else's news would close a box
+    // with an answer half-written in it.
+    this.answering = { runId: asking.question.runId ?? this.current()?.id ?? null,
+      questionId: asking.question.id };
     const options = asking.question.options ?? [];
     if (!options.length) {
       return this.type('answer', 'answer ▸', '');
@@ -1737,6 +1810,7 @@ export class Attached {
         { method: 'POST', body: { answer: text } },
       );
       this.questions.delete(run.id);
+      this.answering = null;
       this.note('answered');
     } catch (failure) {
       this.note(failure.message);
@@ -1828,18 +1902,33 @@ export class Attached {
   }
 
   /**
-   * Leaving.
+   * Leaving, and taking the daemon with it — R123.
    *
-   * **The daemon keeps going, and the goodbye says so.** `cawdev` starts one
-   * for you when it finds none, and a background process somebody did not know
-   * they started is the price of that convenience — so it is paid out loud,
-   * naming the runner and how to stop it. The one exception is `--attach`,
-   * where the daemon IS this process and quitting really does take the
-   * sessions with it; that one asks twice.
+   * <p>It used to leave one running. The argument was that `cawdev` starts a
+   * daemon when it finds none, and a background process you did not know you
+   * started should be paid for out loud rather than silently — so the goodbye
+   * named the runner and the `kill` that stopped it.
+   *
+   * <p>That is the right sentence for the wrong default. Somebody who typed one
+   * word to look at their machine has one window and one mental model, and what
+   * they are told on the way out is a chore: a process still claiming work,
+   * still holding a checkout, and a command to copy. Two windows later there
+   * are two daemons and the one that answers is whichever started first.
+   *
+   * <p>So quitting stops it, both ways in: `--attach` always did, and now the
+   * detached daemon gets a SIGINT — its own shutdown, which says goodbye to the
+   * platform and takes its children down, rather than a kill that leaves the
+   * platform believing this machine is still there. `--leave-running` is the
+   * old behaviour for anybody who wants it, and the goodbye still names the
+   * runner either way.
+   *
+   * <p>It asks twice while work is live, which is the one thing that has not
+   * changed: the sessions go with it.
    */
   quit() {
-    const live = this.options.liveSessions?.() ?? 0;
-    if (this.options.onQuit && live > 0 && !this.confirmQuit) {
+    const stopping = this.stopsTheDaemon();
+    const live = this.liveHere();
+    if (stopping && live > 0 && !this.confirmQuit) {
       this.confirmQuit = true;
       return this.note(
         `${live} session${live === 1 ? '' : 's'} running here — press q again to stop the daemon too`,
@@ -1867,7 +1956,7 @@ export class Attached {
     process.stdin.setRawMode?.(false);
 
     if (!this.options.onQuit) {
-      for (const line of this.goodbye()) {
+      for (const line of this.goodbye(stopping)) {
         console.log(line);
       }
     }
@@ -1878,11 +1967,55 @@ export class Attached {
       // take the children down, then exit. Exiting here would skip all three.
       return this.options.onQuit();
     }
+    if (stopping) {
+      // SIGINT rather than SIGKILL, and the daemon's own handler does the rest:
+      // it says goodbye to the platform, so the console does not show a machine
+      // that is still there, and takes its children down with it.
+      this.stopDaemon(this.runner.pid);
+    }
     return process.exit(0);
   }
 
-  goodbye() {
-    return farewell(this.runner, this.runs, this.ink);
+  /**
+   * Whether leaving here ends the daemon — R123.
+   *
+   * <p>Three answers and they are all different questions. `--attach` means the
+   * daemon is this process. `--leave-running` is somebody saying they want it
+   * to outlive the window. Otherwise it is stopped, provided this client knows
+   * WHICH process to stop: a daemon too old to send its pid on `hello` cannot
+   * be signalled, and inventing one to kill is not a thing to guess at.
+   */
+  stopsTheDaemon() {
+    if (this.options.onQuit) {
+      return true;
+    }
+    if (this.options.leaveRunning) {
+      return false;
+    }
+    return Boolean(this.runner?.pid);
+  }
+
+  /** How much would go with it. The daemon's own count where there is one. */
+  liveHere() {
+    return this.options.liveSessions?.()
+      ?? (this.runs ?? []).filter((run) => run.state !== 'queued').length;
+  }
+
+  /** Injected so a test can watch for the signal instead of sending one. */
+  stopDaemon(pid) {
+    if (this.options.stopDaemon) {
+      return this.options.stopDaemon(pid);
+    }
+    try {
+      return process.kill(pid, 'SIGINT');
+    } catch {
+      // Already gone, which is where this was heading.
+      return undefined;
+    }
+  }
+
+  goodbye(stopping = this.stopsTheDaemon()) {
+    return farewell(this.runner, this.runs, this.ink, stopping);
   }
 
   render(line) {
@@ -1997,7 +2130,7 @@ export class Attached {
         + `${ink.muted('permission')}`);
     }
     parts.push(`${ink.text('x')} ${ink.muted('cancel')}`);
-    parts.push(`${ink.text('q')} ${ink.muted(this.options.onQuit ? 'stop' : 'quit')}`);
+    parts.push(`${ink.text('q')} ${ink.muted(this.stopsTheDaemon() ? 'stop' : 'quit')}`);
     return parts;
   }
 }
@@ -2011,9 +2144,23 @@ export class Attached {
  * and it should be paid out loud". So the goodbye names the runner, what it is
  * still driving, and the exact command that stops it.
  */
-export function farewell(runner, runs, ink = painter(3)) {
+export function farewell(runner, runs, ink = painter(3), stopping = false) {
   const name = runner?.name ?? 'the runner';
   const busy = (runs ?? []).filter((run) => run.state !== 'queued').length;
+  if (stopping) {
+    // R123. What went with it, and how to have it not: a person who wanted the
+    // machine left running finds that out here rather than from a run that is
+    // no longer there.
+    const took = busy
+      ? `stopped, and ${busy} session${busy === 1 ? '' : 's'} with it`
+      : 'stopped';
+    return [
+      '',
+      `  ${ink.bold(name)} ${ink.muted(`${took}.`)}`,
+      `  ${ink.muted('Leave it running next time with:')}  ${ink.text('cawdev --leave-running')}`,
+      '',
+    ];
+  }
   const doing = busy
     ? `still driving ${busy} session${busy === 1 ? '' : 's'}`
     : 'still claiming work';

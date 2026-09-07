@@ -213,6 +213,16 @@ test('quitting names the runner it is leaving behind and how to stop it', () => 
   assert.match(said, /kill 4242/);
 });
 
+test('and when it takes the daemon with it, it says what went — R123', () => {
+  const said = stripAnsi(farewell(runner, runs, painter(3), true).join('\n'));
+  assert.match(said, /macbook/);
+  assert.match(said, /stopped, and 1 session with it/);
+  // The way to have had it otherwise, said where somebody who wanted that
+  // will read it: after the fact is the only time they find out they did.
+  assert.match(said, /--leave-running/);
+  assert.doesNotMatch(said, /kill 4242/, 'there is nothing left to kill');
+});
+
 test('a daemon too old to say its pid still gets a sentence that works', () => {
   const said = stripAnsi(farewell({ name: 'macbook' }, [], painter(3)).join('\n'));
   assert.match(said, /macbook/);

@@ -230,8 +230,11 @@ test('--help is the whole interface on one screen', async () => {
   assert.match(said, /cawdev\s+attach to the runner here/);
   assert.match(said, /--runner/);
   assert.match(said, /L lists the runs/);
-  // The one thing somebody has to be told, because it is surprising.
-  assert.match(said, /the runner keeps going/);
+  // The one thing somebody has to be told, because it is the destructive half
+  // of one key — R123 turned "the runner keeps going" into "q stops it", and
+  // help that still promised the old one would be worse than saying nothing.
+  assert.match(said, /q stops the machine/);
+  assert.match(said, /--leave-running/);
 });
 
 // --- where a config comes from -----------------------------------------------

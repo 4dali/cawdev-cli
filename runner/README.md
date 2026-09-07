@@ -75,12 +75,18 @@ cawdev --url <url>        which cawdev to sign in to (or CAWDEV_URL)
 cawdev --config <path>    the runner config to start a daemon from
 cawdev --no-start         attach only; never launch a daemon
 cawdev --watch-only       do not sign in; watch without being able to act
+cawdev --leave-running    leave the daemon running when you quit
 ```
 
-**Quitting does not stop the daemon.** It is driving runs, and it keeps going —
-the goodbye names it and the `kill` that stops it, because a background process
-you did not know you started is the cost of one word doing all this, and it is
-not a cost to leave somebody to discover.
+**Quitting stops the daemon** — R123. One word starts the machine and the
+window; one key ends both, and it asks twice while sessions are running because
+they go with it. A background process you did not know you started is the cost
+of one word doing all this, and the earlier answer to that — naming the `kill`
+on the way out — left the chore with the person rather than doing it.
+
+`cawdev --leave-running` is the old behaviour for a machine that should keep
+claiming work after the window closes; there the goodbye names the runner and
+the command that stops it.
 
 The other two ways in still work and are not deprecated. `node runner.mjs
 --config macbook-laptop.json --attach` runs the daemon and the UI in **one
@@ -124,7 +130,7 @@ long it has been going, and the key that stops it. It is absent when nothing is.
 | `Y` | allow always, here — writes a project rule |
 | `x`, twice | cancel the session |
 | `g` | print the daemon's own log instead of the transcript |
-| `q` | leave; the runner keeps going |
+| `q` | stop the runner and leave (`--leave-running` keeps it up) |
 | `esc` | close whatever is open, without ending the session |
 | `ctrl+c`, twice | the same, and then leave |
 
