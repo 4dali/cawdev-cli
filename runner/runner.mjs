@@ -25,6 +25,7 @@ import { painter } from '../lib/ansi.mjs';
 import { bannerLines, tintLog } from './banner.mjs';
 import { codeMapOf } from '../lib/code-map.mjs';
 import { usageLimitOf } from '../lib/usage-limit.mjs';
+import { parseUsage } from '../lib/usage-report.mjs';
 import { writeRunPlugin } from '../lib/run-plugin.mjs';
 import { AI_CONFIG, harnessPrompt, readRepoConfig } from '../lib/harness-prompt.mjs';
 import { loadToken, storedUrls } from './token-store.mjs';
@@ -265,6 +266,23 @@ const DEFAULTS = {
    * says when it was taken, so nothing pretends to be live.
    */
   gitSurveySeconds: 300,
+  /**
+   * How often to ask the CLI what is left of this machine's usage windows.
+   *
+   * <p>R73 could not ask at all and reported only refusals. 2.1.263 answers
+   * `/usage` non-interactively, so the console can show the windows before a
+   * run is refused rather than after.
+   *
+   * <p><strong>Slow, and the reason is the meter itself.</strong> Asking spawns
+   * the CLI, and a meter that spends the thing it measures is a bad meter: at
+   * ten minutes this is 144 asks a day against the thousands of requests a
+   * working day makes, which is noise. At thirty seconds it would be a line
+   * item. Nothing here changes fast enough to be worth more.
+   *
+   * <p>Zero switches it off, and then the console shows what R73 showed: the
+   * last refusal, and nothing between refusals.
+   */
+  usageSeconds: 600,
 };
 
 async function readConfig() {
@@ -319,6 +337,7 @@ async function readConfig() {
     skillCache: file.skillCache ?? DEFAULTS.skillCache,
     skillPrepareSeconds: file.skillPrepareSeconds ?? DEFAULTS.skillPrepareSeconds,
     idleSeconds: file.idleSeconds ?? DEFAULTS.idleSeconds,
+    usageSeconds: file.usageSeconds ?? DEFAULTS.usageSeconds,
     sessionExitSeconds: file.sessionExitSeconds ?? DEFAULTS.sessionExitSeconds,
   };
 
@@ -660,6 +679,70 @@ async function machineRules(config) {
     log(`  could not read this machine's rules (${failure.message}); the session will ask`);
     return { patterns: [], everything: false };
   }
+}
+
+/**
+ * What is left of this machine's usage windows, as the CLI reports them.
+ *
+ * <p>`claude -p "/usage"` and nothing cleverer. There is no API for this and no
+ * file to read; the CLI is the only thing that knows, and it will answer a
+ * program now where R73 found it would only answer a person.
+ *
+ * <p><strong>Never fatal, and never a guess.</strong> A CLI that has changed
+ * its output, or is logged out, or is not this vendor's at all, yields nothing
+ * — and nothing means the console keeps showing the last reading it had rather
+ * than a zero somebody would act on. That is R20's rule and it is the whole
+ * reason `parseUsage` is tolerant in one direction only.
+ */
+async function readUsage(config) {
+  if (!config.usageSeconds || !config.runnerId) {
+    return;
+  }
+  const said = await new Promise((resolve) => {
+    let out = '';
+    const child = spawn(config.agentCommand, ['-p', '/usage', '--output-format', 'text'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    // Bounded, because this runs on a timer for the life of the daemon: a CLI
+    // that hangs here must not accumulate a process per tick.
+    const giveUp = setTimeout(() => {
+      try {
+        child.kill('SIGTERM');
+      } catch { /* already gone */ }
+      resolve('');
+    }, 60_000);
+    giveUp.unref?.();
+    child.stdout.on('data', (chunk) => (out += chunk));
+    child.stderr.on('data', (chunk) => (out += chunk));
+    child.on('error', () => {
+      clearTimeout(giveUp);
+      resolve('');
+    });
+    child.on('close', () => {
+      clearTimeout(giveUp);
+      resolve(out);
+    });
+  });
+
+  const windows = parseUsage(said);
+  if (!windows.length) {
+    return;
+  }
+  await api(config, `/api/runners/${config.runnerId}/limits`, {
+    method: 'POST',
+    body: windows.map((each) => ({
+      provider: 'claude',
+      window: each.kind,
+      model: each.model,
+      percentUsed: each.percent,
+      // The counts stay null. The CLI gives a percentage and no totals, and
+      // inventing `used: 25, limit: 100` would put units on a page that the
+      // provider never stated — R20's rule, one level down.
+      used: null,
+      limit: null,
+      resetsAt: each.resetsAt ? each.resetsAt.toISOString() : null,
+    })),
+  }).catch((failure) => log(`  could not report usage: ${failure.message}`));
 }
 
 // --- skills (R76) ------------------------------------------------------------
@@ -5470,6 +5553,18 @@ async function main() {
   readGit();
   const gitSurvey = setInterval(readGit, config.gitSurveySeconds * 1000);
   gitSurvey.unref?.();
+
+  // What is left of the usage windows. Once immediately, for `readGit`'s
+  // reason: a console showing no meter for ten minutes after a restart has
+  // told somebody this machine has no windows.
+  const readTheMeter = () => {
+    void readUsage(config).catch((failure) => log(`usage read failed: ${failure.message}`));
+  };
+  if (config.usageSeconds) {
+    readTheMeter();
+    const usage = setInterval(readTheMeter, config.usageSeconds * 1000);
+    usage.unref?.();
+  }
 
   // R57: looking at a checkout, parking what is in it, or keeping it.
   const takeWorkspaceRequests = watchWorkspaceRequests(config);
