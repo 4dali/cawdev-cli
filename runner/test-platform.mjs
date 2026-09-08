@@ -41,6 +41,8 @@ export async function fakePlatform({
   workspaceRequests = [],
   resume = null,
   runLive = false,
+  /** Overrides the state alone — see the run endpoint below. */
+  runState = null,
   mcpServers = [],
   expertAgents = [],
   skills = [],
@@ -253,7 +255,14 @@ export async function fakePlatform({
         // enough to be looked at: reaping is indistinguishable from the agent
         // never having been spawned, and a test asserting on what the child did
         // has to outlive the reaper. R69's does.
-        return response.end(JSON.stringify({ live: runLive, state: runLive ? 'RUNNING' : 'FINISHED' }));
+        // R73's states are LIVE and hold no process, so `runState` has to be
+        // sayable independently of `runLive` — a run that is USAGE_LIMITED is
+        // live and stopped at the same time, which is the whole case the walk
+        // has to tell apart from a stage that died.
+        return response.end(JSON.stringify({
+          live: runLive,
+          state: runState ?? (runLive ? 'RUNNING' : 'FINISHED'),
+        }));
       }
       response.end('{}');
     });

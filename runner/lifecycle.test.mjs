@@ -85,13 +85,22 @@ process.stdin.resume();
   return path;
 }
 
+/** Exits non-zero having said nothing — what a stopped child looks like. */
+async function anAgentThatFails(home) {
+  const path = join(home, 'failing-agent.mjs');
+  await writeFile(path, '#!/usr/bin/env node\nprocess.exit(1);\n', { mode: 0o755 });
+  return path;
+}
+
 async function daemonWith(t,
-    { name, workflow, gateDecision, agent, sessionExitSeconds, runLive = false }) {
+    { name, workflow, gateDecision, agent, sessionExitSeconds, runLive = false,
+      runState = null }) {
   const workspace = await aRepository();
   const platform = await fakePlatform({
     offers: [CODING],
     workflow,
     gateDecision,
+    runState,
     // A run the fake platform calls FINISHED is reaped, and a reaped child is
     // indistinguishable from one that left of its own accord — which is the
     // whole subject of the two tests that pass an agent. They need the run to
@@ -371,4 +380,45 @@ test('a stage stopped because the run already ended is not a failed stage', asyn
   // the daemon that stopped it.
   const failed = platform.transitions.filter((each) => each.state === 'FAILED');
   assert.deepEqual(failed, [], JSON.stringify(failed));
+});
+
+test('a run stopped by the usage limit is not then failed by the walk', async (t) => {
+  // The bug, and it needed both halves to bite. The CLI said "You've hit your
+  // session limit"; `usageLimitOf` did not know the word "session" and
+  // returned null, so nothing transitioned the run — and even once it did,
+  // this walk would have overwritten it.
+  //
+  // USAGE_LIMITED and PAUSED are LIVE states that hold no process, so R122's
+  // guard — which bails when the run is over — does not catch them. The child
+  // exiting under one is the consequence of the stop, not a stage that died,
+  // and calling it FAILED puts the word for a crash on a clock running out.
+  const home = await mkdtemp(join(tmpdir(), 'cawdev-limited-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-usage-limited',
+    // Exits non-zero having said nothing, which is what the walk reads as a
+    // dead stage unless it asks the platform first.
+    agent: await anAgentThatFails(home),
+    runLive: true,
+    runState: 'USAGE_LIMITED',
+    workflow: [
+      { stage: 'PLAN', gate: 'AUTO' },
+      { stage: 'IMPLEMENT', gate: 'AUTO' },
+    ],
+  });
+
+  assert.ok(await until(said, /was usage limited during the PLAN stage/), said());
+
+  // Nothing was failed. That is the whole assertion: R73 says a clock is not
+  // a crash, and this is the door it was arriving through.
+  await new Promise((done) => setTimeout(done, 1500));
+  assert.deepEqual(platform.transitions.filter((each) => each.state === 'FAILED'), [],
+    `the walk failed a usage-limited run:\n${said()}`);
+
+  // And the stage says SKIPPED rather than FAILED: nobody claims it finished,
+  // and nobody should record that it broke.
+  const report = platform.stageCalls.find(
+    (each) => each.stage === 'PLAN' && each.what === 'report');
+  assert.equal(report.body.state, 'SKIPPED', JSON.stringify(report.body));
 });

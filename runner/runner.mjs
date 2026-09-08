@@ -4246,6 +4246,32 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
         // the sweeper — and only one of them passes through this process.
         const ended = await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}`)
           .catch(() => null);
+        // R73's states are LIVE ones, which is why they need their own test
+        // here: `PAUSED` and `USAGE_LIMITED` hold no process, so the child
+        // exiting is expected rather than a fault — and R122's guard above asks
+        // whether the run is over, which these are not.
+        //
+        // Without this the close handler's work is undone a moment later. It
+        // classifies the exit as a usage limit and transitions the run; the
+        // walk then reads a non-zero code and calls `finish(FAILED)` on top,
+        // and the console shows a crash where a clock ran out. That is exactly
+        // what R73 exists to prevent, arriving through a door R73 predates.
+        if (ended && ended.live !== false && STOPPED_STATES.has(ended.state)) {
+          const why = `The run was ${String(ended.state).toLowerCase().replace('_', ' ')}`
+            + ` during the ${stage.stage} stage.`;
+          log(`  ${why} Not failing it: the stage did not.`);
+          await reportStage(config, run, stage.stage, 'report', {
+            // SKIPPED and not FAILED. Nobody claims this stage finished its
+            // work, and nobody should record that it broke: it stopped because
+            // the run stopped.
+            state: 'SKIPPED',
+            plan: stage.stage === 'PLAN' ? last?.text ?? null : null,
+            outcome: `${why} ${last?.text ?? ''}`.trim(),
+          });
+          await skipRest(config, run, lifecycle, at + 1, why);
+          return;
+        }
+
         if (ended && ended.live === false) {
           const why = ended.state === 'FINISHED'
             ? `The run was reported finished during the ${stage.stage} stage.`
@@ -4331,6 +4357,15 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
   }
   await settleActions(config, run, cwd);
 }
+
+/**
+ * The live states that hold no process — R73, R80.
+ *
+ * <p>A run in one of these is not over and not running: the clock stopped it,
+ * or a person did. A stage's child exiting under them is the consequence, not
+ * the cause, so {@link walkLifecycle} must not read it as a stage that died.
+ */
+const STOPPED_STATES = new Set(['PAUSED', 'USAGE_LIMITED']);
 
 /** Tells the platform a stage began, or how it ended. Never fatal. */
 async function reportStage(config, run, stage, what, body = {}) {
