@@ -29,7 +29,7 @@ import { parseUsage } from '../lib/usage-report.mjs';
 import { writeRunPlugin } from '../lib/run-plugin.mjs';
 import { AI_CONFIG, harnessPrompt, readRepoConfig } from '../lib/harness-prompt.mjs';
 import { loadToken, storedUrls } from './token-store.mjs';
-import { GIT_READS, driftedFrom, toolsForStage } from '../lib/stage-tools.mjs';
+import { CAWDEV_READS, GIT_READS, driftedFrom, toolsForStage } from '../lib/stage-tools.mjs';
 import { findSecret } from '../lib/secrets.mjs';
 
 // --- configuration -----------------------------------------------------------
@@ -140,6 +140,17 @@ const DEFAULTS = {
     'mcp__cawdev__roadmap_statuses',
     'mcp__cawdev__roadmap_list',
     'mcp__cawdev__roadmap_get',
+    // The MCP server has served this since R37, its README documents it, and
+    // the REVIEW prompt below TELLS a session to file its findings with it —
+    // and it was in no allow-list at all, so no run could call it. A non-coding
+    // profile is spawned without `--permission-prompt-tool` (argsForProfile
+    // drops it on purpose), so there was not even a question to answer: the
+    // call was refused outright and the findings died in the transcript.
+    'mcp__cawdev__roadmap_comment',
+    // R85's board, read. Served and never allowed either, which left an ASK
+    // session — whose whole job is answering questions about this project —
+    // unable to be asked what is broken in it.
+    'mcp__cawdev__issue_list',
     'mcp__cawdev__roadmap_create',
     'mcp__cawdev__roadmap_update',
     'mcp__cawdev__roadmap_set_status',
@@ -3271,8 +3282,23 @@ async function reportCommits(config, run, cwd, base) {
 /** Every cawdev MCP tool the runner knows about, from the coding defaults. */
 const CAWDEV_TOOLS = DEFAULTS.agentArgs.filter((arg) => arg.startsWith('mcp__cawdev__'));
 
+/**
+ * The cawdev tools a profile that must change nothing may hold.
+ *
+ * <p>This was a regex over the END of the name — anything not finishing in
+ * `create`, `update`, `set_status`, `decline` or `add` was a read. It was right
+ * about every tool that existed when it was written, and it fails in the one
+ * direction that matters: a writer whose name ends in a noun is silently a read.
+ * `roadmap_comment` is exactly that tool, and adding it to the defaults above
+ * would have quietly handed the roadmap's discussion to ASK, AUDIT and PLAN.
+ *
+ * <p>So the list is the READS (`CAWDEV_READS`, beside `canChangeThings` because
+ * they answer one question) and everything else is a write. A tool added above
+ * and forgotten there is missing from the read-only profiles, which is a session
+ * saying out loud that it cannot do something rather than one quietly doing it.
+ */
 const READ_ONLY_CAWDEV = CAWDEV_TOOLS.filter(
-  (tool) => !/(create|update|set_status|decline|add)$/.test(tool),
+  (tool) => CAWDEV_READS.has(tool.slice('mcp__cawdev__'.length)),
 );
 
 const ROADMAP_WRITE_CAWDEV = CAWDEV_TOOLS;
@@ -3355,11 +3381,21 @@ const PROFILE_TOOLS = {
   // with the narrowest list in the file and reports that it could not do the
   // work, which is the least legible way for this to go wrong.
   //
-  // A review reads and writes NOTHING: not the code, not the roadmap. `git` is
-  // read-only here on purpose — the diff is the subject, and a reviewer that
-  // could commit is a reviewer that could fix what it was asked to judge.
+  // A review writes ONE thing: its findings, as comments on the card. That is
+  // the profile's entire output — R117's "what it leaves behind" — and it was
+  // the one tool the list did not have, while the prompt below told the session
+  // to use it. "Writes nothing" was true of the code and the card's status and
+  // got applied to the discussion as well, which left a reviewer that could
+  // read everything and say nothing.
+  //
+  // Everything else stays shut. `git` is read-only on purpose — the diff is the
+  // subject, and a reviewer that could commit is a reviewer that could fix what
+  // it was asked to judge — and there is still no set_status here, because
+  // `DONE` is the person's word (R74) and a reviewer that could move the card
+  // would be giving the verdict it is explicitly told not to give.
   REVIEW: [
     ...READ_ONLY_CAWDEV,
+    'mcp__cawdev__roadmap_comment',
     ...READ_FILES,
     ...GIT_READS,
   ],
