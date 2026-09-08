@@ -551,21 +551,23 @@ const TOOLS = [
   {
     name: 'roadmap_create',
     description:
-      'Create a roadmap entry. The platform allocates its permanent R-number. Defaults to ' +
-      'PLANNED; a status that requires something must be given it.',
+      'Create a roadmap entry. The platform allocates its permanent R-number, and the ' +
+      'platform decides where a card starts — CONSIDERING — unless you say otherwise; ' +
+      'a status that requires something must be given it.',
     inputSchema: {
       type: 'object',
       properties: {
         ...PROJECT_ARGUMENT,
         title: { type: 'string' },
         body: { type: 'string', description: 'Markdown.' },
+        // NEW and CONFIRMED are an issue's statuses and this creates a ROADMAP
+        // card, so the API refuses both: offering an agent a value that is
+        // always a 400 is the tool lying about itself.
         status: {
           type: 'string',
           enum: [
             'CONSIDERING',
             'PLANNED',
-            'NEW',
-            'CONFIRMED',
             'IN_DEVELOPMENT',
             'MERGED',
             'SHIPPED',
