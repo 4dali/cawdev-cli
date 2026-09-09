@@ -139,3 +139,53 @@ test('on a narrow terminal M goes with Y, never instead of it', () => {
   assert.equal(hasM, hasY, `M and Y must come and go together: ${narrow}`);
   assert.match(narrow, /n refuse|refuse/);
 });
+
+// --- R135: the command that could never become a wildcard ----------------------
+
+const exact = (over = {}) => request({
+  summary: 'cd backend && ./mvnw test',
+  suggestion: null,
+  exactPattern: 'Bash(cd backend && ./mvnw test)',
+  exactWithinCeiling: true,
+  ...over,
+});
+
+test('Y writes the exact command when this machine would apply it', () => {
+  assert.deepEqual(permissionDecision(exact(), 'Y'),
+    { allow: true, scope: 'PROJECT', pattern: 'Bash(cd backend && ./mvnw test)' });
+
+  // Outside the ceiling the rule would be dropped here on every call, so the
+  // key is not offered — the same "a key that takes an answer the platform
+  // then refuses" rule `M` follows.
+  assert.equal(permissionDecision(exact({ exactWithinCeiling: false }), 'Y'), null);
+});
+
+test('M writes it even outside the ceiling, because that scope raises it', () => {
+  assert.deepEqual(
+    permissionDecision(exact({ exactWithinCeiling: false }), 'M', { acceptsConsoleRules: true }),
+    { allow: true, scope: 'RUNNER', pattern: 'Bash(cd backend && ./mvnw test)' },
+  );
+});
+
+test('an exact rule is described rather than spelled out in the key row', () => {
+  // R78: a grant is never cut short, and this pattern is as long as the command
+  // — which is already on the line above, verbatim. So `Y` says what it does
+  // and the command speaks for itself.
+  const said = banner(exact());
+  assert.match(said, /Y always allow this exact command here/);
+  assert.doesNotMatch(said, /Y always allow Bash\(cd backend/);
+  assert.match(said, /cd backend && \.\/mvnw test/, 'the command itself is still shown');
+});
+
+test('a long exact command still fits every pane it is drawn in', () => {
+  const long = exact({
+    summary: `cd backend && ./mvnw -q -DskipTests package ${'x'.repeat(60)}`,
+    exactPattern: `Bash(cd backend && ./mvnw -q -DskipTests package ${'x'.repeat(60)})`,
+  });
+  for (const width of [80, 60, 46, 30]) {
+    for (const line of permissionBanner(long, width, undefined, { acceptsConsoleRules: true })) {
+      assert.ok(visibleWidth(line) <= width,
+        `${visibleWidth(line)} > ${width}: ${stripAnsi(line)}`);
+    }
+  }
+});

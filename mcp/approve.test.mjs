@@ -331,3 +331,87 @@ test('session rules that cannot be read mean ask, not allow and not deny', async
     platform.close();
   }
 });
+
+// --- R135: the command that could never become a rule ------------------------
+
+test('a project rule that IS the command settles it, so the next run does not ask', async () => {
+  // The card, in one test. Somebody made `cd backend && ./mvnw test` durable
+  // in one run; this is the run after it, and nobody is asked.
+  const command = 'cd backend && ./mvnw test';
+  const platform = await fakePlatform({ rules: [`Bash(${command})`] });
+  try {
+    const decision = JSON.parse(
+      await callTool(
+        platform.url,
+        'approve',
+        { tool_name: 'Bash', input: { command } },
+        { CAWDEV_GRANTABLE: JSON.stringify([`Bash(${command})`]) },
+      ),
+    );
+    assert.equal(decision.behavior, 'allow');
+    assert.match(decision.reason, /covered by this project's rule/);
+    assert.deepEqual(platform.asked, [], 'the second run must not ask again');
+  } finally {
+    platform.close();
+  }
+});
+
+test('the request carries the exact rule and whether this machine would apply it', async () => {
+  const command = 'cd backend && ./mvnw test';
+  const platform = await fakePlatform({ decide: { state: 'ALLOWED' } });
+  try {
+    await callTool(
+      platform.url,
+      'approve',
+      { tool_name: 'Bash', input: { command } },
+      { CAWDEV_GRANTABLE: JSON.stringify(['Bash']) },
+    );
+    const [asked] = platform.asked;
+    // No wildcard can be written from this one — that is why it is here.
+    assert.equal(asked.suggestion, null);
+    assert.equal(asked.exactPattern, `Bash(${command})`);
+    assert.equal(asked.exactWithinCeiling, true);
+  } finally {
+    platform.close();
+  }
+});
+
+test('outside the ceiling the exact rule is still sent, marked as one this machine would drop',
+  async () => {
+    // The console still needs the pattern: the RUNNER scope RAISES the ceiling,
+    // and that button is written from this field.
+    const command = './run.sh';
+    const platform = await fakePlatform({ decide: { state: 'ALLOWED' } });
+    try {
+      await callTool(
+        platform.url,
+        'approve',
+        { tool_name: 'Bash', input: { command } },
+        { CAWDEV_GRANTABLE: '[]' },
+      );
+      assert.equal(platform.asked[0].exactPattern, 'Bash(./run.sh)');
+      assert.equal(platform.asked[0].exactWithinCeiling, false);
+    } finally {
+      platform.close();
+    }
+  });
+
+test('a call the shield stopped is offered no exact rule at all', async () => {
+  // R110 skips the stored rules on every future call after a shield hit, so a
+  // durable button here would write a rule that never applies.
+  const platform = await fakePlatform({ decide: { state: 'ALLOWED' } });
+  try {
+    await callTool(
+      platform.url,
+      'approve',
+      { tool_name: 'Bash', input: { command: 'rm -rf build' } },
+      { CAWDEV_GRANTABLE: JSON.stringify(['Bash']) },
+    );
+    const [asked] = platform.asked;
+    assert.match(asked.summary, /stopped by the shield/);
+    assert.equal(asked.exactPattern, null);
+    assert.equal(asked.exactWithinCeiling, false);
+  } finally {
+    platform.close();
+  }
+});

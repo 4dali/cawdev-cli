@@ -141,13 +141,17 @@ export function questionBanner(asking, width, ink = painter(3)) {
 }
 
 /**
- * What a key means for a permission request — R51, R60, R78.
+ * What a key means for a permission request — R51, R60, R78, R135.
  *
  * Pure, and returning null for a key that cannot be honoured, because `Y`
- * cannot always be: `suggestion` is the server's rendering of a rule, and it is
- * absent for a compound command that no pattern can settle. The caller says so
- * rather than sending a decision with nothing to write, which the server would
- * quietly turn into an allow-once.
+ * cannot always be: the caller says so rather than sending a decision with
+ * nothing to write, which the server would quietly turn into an allow-once.
+ *
+ * TWO patterns can be written now, and they are different offers. `suggestion`
+ * is the machine's reading of what somebody meant — `mvn --version` offers
+ * `Bash(mvn *)`. `exactPattern` is the command itself, verbatim, for the
+ * compound and path-shaped commands no wildcard fits; it grants nothing but
+ * itself, and before R135 those had no lasting answer at any key.
  */
 export function permissionDecision(approval, key, machine = {}) {
   switch (key) {
@@ -159,10 +163,16 @@ export function permissionDecision(approval, key, machine = {}) {
       // key. It dies with the run either way.
       return { allow: true, scope: 'SESSION',
         pattern: approval.suggestion ?? approval.toolName };
-    case 'Y':
-      return approval.suggestion
-        ? { allow: true, scope: 'PROJECT', pattern: approval.suggestion }
-        : null;
+    case 'Y': {
+      // The exact rule only when this machine said it would apply it: a
+      // project rule outside the ceiling is dropped here on every call, so the
+      // key would take an answer the next session does not keep. A suggestion
+      // is offered as it always was — the console narrows it, and the ceiling
+      // filter runs where it is enforced.
+      const pattern = approval.suggestion
+        ?? (approval.exactWithinCeiling ? approval.exactPattern : null);
+      return pattern ? { allow: true, scope: 'PROJECT', pattern } : null;
+    }
     case 'M':
       // R126, the widest of the four: every project that ever runs on this
       // machine. Null — and so not offered — for the two reasons it can be:
@@ -170,8 +180,12 @@ export function permissionDecision(approval, key, machine = {}) {
       // not accept rules from the console. A key that takes an answer the
       // platform then refuses reads as cawdev being broken, which is R58's
       // rule about the `a` key applied to this one.
-      return approval.suggestion && machine.acceptsConsoleRules
-        ? { allow: true, scope: 'RUNNER', pattern: approval.suggestion }
+      //
+      // NOT filtered by the ceiling, unlike `Y`, and that is the whole of
+      // R126: this is the scope that RAISES it.
+      return (approval.suggestion ?? approval.exactPattern) && machine.acceptsConsoleRules
+        ? { allow: true, scope: 'RUNNER',
+          pattern: approval.suggestion ?? approval.exactPattern }
         : null;
     default:
       return null;
@@ -207,17 +221,30 @@ export function permissionBanner(pending, width, ink = painter(3), machine = {})
   const approval = pending.approval ?? pending;
   const covers = approval.suggestion ?? `every ${approval.toolName}`;
 
-  // R126's key is offered only when this machine accepts rules from the
-  // console — the same test `permissionDecision` makes, asked once here so the
-  // banner and the key handler cannot disagree about what is on offer.
-  const onTheMachine = approval.suggestion && machine.acceptsConsoleRules;
+  // The two standing-rule keys, asked here exactly as `permissionDecision`
+  // asks them, so the banner and the key handler cannot disagree about what is
+  // on offer. R126's `M` is offered only when this machine accepts rules from
+  // the console; R135's exact rule reaches `Y` only inside the ceiling.
+  const here = approval.suggestion
+    ?? (approval.exactWithinCeiling ? approval.exactPattern : null);
+  const onTheMachine = (approval.suggestion ?? approval.exactPattern)
+    && machine.acceptsConsoleRules;
+
+  // R78, and the reason `Y` is not always labelled with what it writes: an
+  // exact rule is as long as the command, which is already on the line above
+  // verbatim. Ninety characters inside the key row would either wrap the
+  // banner badly or be clipped into a promise nobody made — so the wildcard
+  // pattern is named and the exact one is described.
+  const always = here
+    ? (approval.suggestion
+      ? `always allow ${approval.suggestion} here`
+      : 'always allow this exact command here')
+    : null;
 
   const long = [
     `${ink.success('y')} allow once`,
     `${ink.success('s')} allow ${covers} this session`,
-    ...(approval.suggestion
-      ? [`${ink.warn('Y')} always allow ${approval.suggestion} here`]
-      : []),
+    ...(always ? [`${ink.warn('Y')} ${always}`] : []),
     ...(onTheMachine
       ? [`${ink.warn('M')} always, on this machine`]
       : []),
@@ -226,9 +253,7 @@ export function permissionBanner(pending, width, ink = painter(3), machine = {})
   const short = [
     `${ink.success('y')} once`,
     `${ink.success('s')} session`,
-    ...(approval.suggestion
-      ? [`${ink.warn('Y')} always allow ${approval.suggestion} here`]
-      : []),
+    ...(always ? [`${ink.warn('Y')} ${always}`] : []),
     ...(onTheMachine ? [`${ink.warn('M')} this machine`] : []),
     `${ink.danger('n')} refuse`,
   ];

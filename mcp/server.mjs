@@ -16,6 +16,7 @@ import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import {
   coveredBy,
+  exactRuleFor,
   suggestionFor,
   summaryOf,
   withinCeiling,
@@ -1367,6 +1368,21 @@ async function decide(config, args) {
       return allow(input, `allowed for this session by ${granted}`);
     }
 
+    // The exact-command rule, for the calls no wildcard can be written from —
+    // R135. Two decisions in these two lines:
+    //
+    // NULL WHEN THE SHIELD STOPPED IT. A shield hit skips the stored rules on
+    // every future call by design, so a durable button here would write a rule
+    // that never applies — R126's "a button that produces a refusal should not
+    // have been drawn".
+    //
+    // THE CEILING IS MEASURED HERE, on the machine, with the same matcher that
+    // will enforce it. The platform does not know this machine's `grantable`
+    // and should not: shipping it to the console would put a third copy of
+    // this matcher in TypeScript, and the two would drift the way the runner
+    // and the server would without this file.
+    const exact = stopped ? null : exactRuleFor(toolName, input);
+
     const asked = await api(config, `/api/projects/${project}/runs/${runId}/approvals`, {
       method: 'POST',
       body: {
@@ -1376,6 +1392,8 @@ async function decide(config, args) {
           ? `${summaryOf(toolName, input)} — stopped by the shield: ${stopped.reason}`
           : summaryOf(toolName, input),
         suggestion: suggestionFor(toolName, input, { skillServers: skillServers() }),
+        exactPattern: exact,
+        exactWithinCeiling: exact ? withinCeiling(grantable(), exact) : false,
         toolUseId: args.tool_use_id,
       },
     });
