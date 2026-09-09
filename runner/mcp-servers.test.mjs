@@ -143,7 +143,8 @@ setTimeout(() => {}, 60000);
  * @param workspaces how many checkouts the project has here — R47. Two runs in
  *   two workspaces is how "share one index" is proved.
  */
-async function daemonWith(t, { name, wants, offers, workspaces = 1, experts = [] }) {
+async function daemonWith(t,
+    { name, wants, offers, workspaces = 1, experts = [], skills = [], profile = 'CODE' }) {
   const home = await mkdtemp(join(tmpdir(), 'cawdev-skillcfg-'));
   const indexer = await aFakeIndexer(home);
   const agent = await anEchoingAgent(home);
@@ -170,10 +171,11 @@ async function daemonWith(t, { name, wants, offers, workspaces = 1, experts = []
       projectSlug: 'board',
       label: 'a card',
       branch: 'r76-work',
-      profile: 'CODE',
+      profile,
     }],
     mcpServers,
     expertAgents: experts,
+    skills,
     // The child has to outlive the reaper: everything here is read off what it
     // printed, and a run the platform calls FINISHED is one the daemon stops
     // before it has said anything.
@@ -553,4 +555,54 @@ test('a run with no experts is spawned exactly as it was before', async (t) => {
   // directory offers a capability with nothing behind it, which is how a run
   // spends a turn discovering there is nobody to ask.
   assert.doesNotMatch(argvFrom(platform), /(^| )Agent( |$)/);
+});
+
+// --- R130: the same failure, for skills --------------------------------------
+//
+// R104's bug, repeated one entry later on the other capability. `skillsFor`
+// hands a project's skills to every profile that READS CODE — PLAN, REVIEW,
+// AUDIT and INTERVIEW as well as CODE — and `writeRunPlugin` writes every one
+// of them into the plugin directory. `Skill` was in no PROFILE_TOOLS list and
+// in no default, so the session was handed a plugin it could not invoke.
+//
+// PLAN is where it bites hardest and it is the profile tested here: a
+// non-CODE profile is also spawned WITHOUT `--permission-prompt-tool`
+// (`argsForProfile` strips it, deliberately), so there was not even a person to
+// ask. The skill was simply unreachable, and nothing said so.
+
+const A_SKILL = {
+  key: 'dataviz',
+  name: 'Data visualisation',
+  description: 'How to draw a chart that reads as one system',
+  body: 'Use one palette.',
+};
+
+test('a run with a skill can reach it, on a profile that cannot ask', async (t) => {
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-skill-yes',
+    skills: [A_SKILL],
+    // The profile the bug actually bit on, and the one with no fallback: a
+    // PLAN session cannot be granted anything mid-run by a person.
+    profile: 'PLAN',
+  });
+
+  assert.ok(await platform.untilSaidOnTheRun(/ARGV /), said());
+  const argv = argvFrom(platform);
+  assert.match(argv, /--plugin-dir/, 'the skill was not delivered at all');
+  assert.match(argv, /(^| )Skill( |$)/,
+    `the skill is loaded and unreachable:\n${argv}`);
+  // And the profile's own decision is untouched: a PLAN run still cannot be
+  // handed a writer by somebody clicking allow.
+  assert.doesNotMatch(argv, /--permission-prompt-tool/);
+});
+
+test('a run with no skills is spawned exactly as it was before', async (t) => {
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-skill-no',
+  });
+
+  assert.ok(await platform.untilSaidOnTheRun(/ARGV /), said());
+  // Vanilla, for the reason `Agent` is above: a tool with nothing behind it is
+  // a capability a run spends a turn discovering is empty.
+  assert.doesNotMatch(argvFrom(platform), /(^|\s)Skill(\s|$)/);
 });

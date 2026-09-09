@@ -30,6 +30,7 @@ import { writeRunPlugin } from '../lib/run-plugin.mjs';
 import { AI_CONFIG, harnessPrompt, readRepoConfig } from '../lib/harness-prompt.mjs';
 import { loadToken, storedUrls } from './token-store.mjs';
 import { CAWDEV_READS, GIT_READS, driftedFrom, toolsForStage } from '../lib/stage-tools.mjs';
+import { describeCall } from '../lib/tool-line.mjs';
 import { findSecret } from '../lib/secrets.mjs';
 
 // --- configuration -----------------------------------------------------------
@@ -2183,7 +2184,10 @@ function linesOf(event, raw) {
         } else if (part.type === 'thinking' && part.thinking?.trim()) {
           lines.push({ kind: 'THINKING', body: part.thinking.trim() });
         } else if (part.type === 'tool_use') {
-          lines.push({ kind: 'TOOL', body: `${part.name} ${describeInput(part.input)}`.trim() });
+          // R130. `describeCall` names a capability — Skill(key), Agent(key) —
+          // and writes everything else exactly as this line did before. See
+          // ../lib/tool-line.mjs: the platform parses these strings.
+          lines.push({ kind: 'TOOL', body: describeCall(part.name, part.input) });
         }
       }
       return lines;
@@ -2211,19 +2215,6 @@ function linesOf(event, raw) {
     default:
       return [];
   }
-}
-
-/** A tool's input as one short line — the arguments that identify the call. */
-function describeInput(input) {
-  if (!input || typeof input !== 'object') return '';
-  const interesting = ['file_path', 'path', 'command', 'pattern', 'url', 'query', 'number', 'kind'];
-  for (const key of interesting) {
-    if (typeof input[key] === 'string' || typeof input[key] === 'number') {
-      return String(input[key]).slice(0, 300);
-    }
-  }
-  const json = JSON.stringify(input);
-  return json.length > 200 ? `${json.slice(0, 199)}…` : json;
 }
 
 /** Tool results arrive as a string or as content parts. */
@@ -3392,6 +3383,37 @@ function withDelegation(tools, expertAgents) {
   return [...list, DELEGATE];
 }
 
+/** The tool that invokes a skill — R105, allowed by nothing until R130. */
+const INVOKE_SKILL = 'Skill';
+
+/**
+ * The same, for the skills this run was handed — R130.
+ *
+ * <p>Conditional on exactly the argument above: a project with no skills is
+ * spawned as it always was, and a project with one gets the tool that reaches
+ * it.
+ *
+ * <p><strong>This was the R104 bug, repeated.</strong> `skillsFor` hands skills
+ * to every profile that reads code — PLAN, REVIEW, AUDIT and INTERVIEW as well
+ * as CODE — and `Skill` was in no PROFILE_TOOLS list, in no default, and
+ * `argsForProfile` strips `--permission-prompt-tool` from every non-CODE
+ * profile, so there was not even a person to ask. A skill was written into the
+ * plugin directory and could not be invoked, silently: `run-plugin.mjs`'s own
+ * header names the symptom for experts, and it was true of skills too.
+ *
+ * <p>A skill is NOT a writer, and `canChangeThings('Skill')` stays false: it is
+ * a body of instructions, and a session holding `Skill` and no `Write` still
+ * cannot write. So a read-only stage keeps it, which is the point — reading and
+ * planning is most of what a skill is for.
+ */
+function withSkills(tools, skills) {
+  const list = Array.isArray(tools) ? tools : [];
+  if (!skills?.length || list.includes(INVOKE_SKILL)) {
+    return list;
+  }
+  return [...list, INVOKE_SKILL];
+}
+
 const PROFILE_TOOLS = {
   ASK: READ_ONLY_CAWDEV,
   // R104's profile, and it was MISSING from this table until R112 — so a review
@@ -3528,7 +3550,7 @@ function argsBefore(agentArgs) {
   return kept;
 }
 
-function argsForProfile(agentArgs, profile, run, expertAgents = []) {
+function argsForProfile(agentArgs, profile, run, expertAgents = [], skills = []) {
   const kept = [];
   for (let i = 0; i < agentArgs.length; i++) {
     if (agentArgs[i] === '--allowedTools') {
@@ -3550,7 +3572,9 @@ function argsForProfile(agentArgs, profile, run, expertAgents = []) {
   }
   const allowed = PROFILE_TOOLS[profile] ?? READ_ONLY_CAWDEV;
   return [...kept, '--allowedTools',
-    ...withDelegation(typeof allowed === 'function' ? allowed(run) : allowed, expertAgents)];
+    ...withSkills(
+      withDelegation(typeof allowed === 'function' ? allowed(run) : allowed, expertAgents),
+      skills)];
 }
 
 /**
@@ -4879,8 +4903,10 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   const stageArgs = stage
     ? [...argsBefore(agentArgs), '--allowedTools',
       ...toolsForStage(stage.stage,
-        withDelegation(typeof profileTools === 'function' ? profileTools(run) : profileTools,
-          expertAgents))]
+        withSkills(
+          withDelegation(typeof profileTools === 'function' ? profileTools(run) : profileTools,
+            expertAgents),
+          skills))]
     : null;
 
   const args = [
@@ -4892,8 +4918,10 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     ...(pluginRoot ? ['--plugin-dir', pluginRoot] : []),
     ...(stageArgs ?? (codesFreely
       ? [...argsBefore(agentArgs), '--allowedTools',
-        ...withDelegation(agentArgs.slice(agentArgs.indexOf('--allowedTools') + 1), expertAgents)]
-      : argsForProfile(agentArgs, run.profile, run, expertAgents))),
+        ...withSkills(
+          withDelegation(agentArgs.slice(agentArgs.indexOf('--allowedTools') + 1), expertAgents),
+          skills)]
+      : argsForProfile(agentArgs, run.profile, run, expertAgents, skills))),
   ];
   log(`  spawning: ${config.agentCommand} ${args.join(' ')} (prompt on stdin)`);
 
@@ -5039,6 +5067,39 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     // Which side refused is in the sentence, because "the project asked and
     // this machine has not allowed it" and "nobody asked" are different facts.
     for (const line of skillNotes) {
+      log(`  ${line}`);
+      transcript.push({ kind: 'SYSTEM', body: line });
+    }
+
+    // R130. The other three things the project turned on, on the same argument
+    // as the skill notes above: a person who configured an expert, a skill or a
+    // memory and cannot tell whether it was ever reached has no way to find out
+    // except by reading a daemon's log on somebody else's laptop.
+    for (const agent of expertAgents) {
+      // And the honest answer to "why did my expert never get used?" in the
+      // most common case. `canChangeThings` treats delegation as a writer — a
+      // sub-agent has its own tool list, so a PLAN stage holding `Agent` could
+      // write through a helper — and `toolsForStage` strips it. That is
+      // deliberate and it is invisible, which is what makes it worth saying.
+      const cannot = stage && ['PLAN', 'VERIFY', 'MEMORY'].includes(stage.stage)
+        ? ` The ${stage.stage} stage cannot delegate, so it will not be reached here.`
+        : '';
+      const line = `${agent.name} is available to delegate to as Agent(${agent.key}).${cannot}`;
+      log(`  ${line}`);
+      transcript.push({ kind: 'SYSTEM', body: line });
+    }
+
+    for (const skill of skills) {
+      const line = `${skill.name} is available to this session as Skill(${skill.key}).`;
+      log(`  ${line}`);
+      transcript.push({ kind: 'SYSTEM', body: line });
+    }
+
+    // R108's briefing reached the daemon's stdout and nowhere else, so the one
+    // session that was handed the last one's notes was the only party that
+    // could not see it had been.
+    if (briefing) {
+      const line = `A briefing left on ${run.branch} was handed to this session.`;
       log(`  ${line}`);
       transcript.push({ kind: 'SYSTEM', body: line });
     }
