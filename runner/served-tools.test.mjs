@@ -58,6 +58,22 @@ test('every served tool is allowed to somebody', () => {
     + 'is silent.');
 });
 
+test('the one platform write a PLAN stage may hold is actually served — R150', () => {
+  // `READ_ONLY_CAWDEV` is DERIVED from `DEFAULTS.agentArgs`, and
+  // `PROFILE_TOOLS.PLAN` appends `CARD_WRITE` to it. So a cardless plan session
+  // gets `roadmap_create` only if that string is in the coding defaults in the
+  // first place — and if it ever is not, the failure is a session that says out
+  // loud it cannot write a card and wastes the run it was started for.
+  //
+  // Asserted rather than assumed, in the file that exists because this
+  // allow-list has been caught a tool short four times.
+  assert.ok(served().includes('roadmap_create'),
+    'the MCP server no longer serves roadmap_create');
+  assert.match(runner, /^ {4}'mcp__cawdev__roadmap_create',$/m,
+    'roadmap_create is not in the daemon\'s DEFAULTS.agentArgs, so a cardless '
+    + 'PLAN run cannot write the card it was started to write');
+});
+
 test('the daemon does not allow a tool that no longer exists', () => {
   // The other direction, and a much smaller problem — a stale name allows
   // nothing. Worth saying anyway: it is how a list starts describing a server

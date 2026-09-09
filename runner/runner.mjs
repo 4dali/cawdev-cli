@@ -30,7 +30,7 @@ import { qualified, writeRunPlugin } from '../lib/run-plugin.mjs';
 import { AI_CONFIG, harnessPrompt, readRepoConfig } from '../lib/harness-prompt.mjs';
 import { loadToken, storedUrls } from './token-store.mjs';
 import {
-  CAWDEV_READS, GIT_READS, driftedFrom, readOnlyExpert, toolsForStage,
+  CARD_WRITE, CAWDEV_READS, GIT_READS, driftedFrom, readOnlyExpert, toolsForStage,
 } from '../lib/stage-tools.mjs';
 import { describeCall } from '../lib/tool-line.mjs';
 import { findSecret } from '../lib/secrets.mjs';
@@ -3564,6 +3564,9 @@ const PROFILE_TOOLS = {
     ...READ_FILES,
     ...GIT_READS,
   ],
+  // R150. Retired: nothing new starts on this profile — the platform refuses
+  // it — and it is kept here so a session interrupted before the release and
+  // resumed after it is still spawnable.
   ROADMAP: ROADMAP_WRITE_CAWDEV,
   AUDIT: [...READ_ONLY_CAWDEV, 'mcp__cawdev__propose_entry', ...READ_FILES],
   // R124's plan phase. AUDIT's list without `propose_entry`: it reads the
@@ -3578,10 +3581,25 @@ const PROFILE_TOOLS = {
   //
   // `git` is read-only for REVIEW's reason — the code as it stands is the
   // subject, and a planner that could commit is a planner that could start.
-  PLAN: [
+  //
+  // R150 corrects the "not the roadmap" above for exactly one case, and it is
+  // narrower than it sounds: a plan run started with NO CARD gets
+  // `roadmap_create` and nothing else. The thing it is planning does not exist
+  // yet, so writing it is the first step of planning it rather than a widening.
+  // Note what is still absent — `roadmap_update`, `roadmap_set_status`,
+  // `roadmap_comment`, and every tool that touches a file. The plan of record is
+  // still the PLATFORM's to write, and a plan run that HAS a card gets exactly
+  // the list it always had.
+  //
+  // A function of the run for INTERVIEW's reason: both call sites already
+  // accept one. `entryNumber` is null on the claim of a cardless plan run —
+  // `ClaimedRunView` wraps `presenter.of(run)` — so nothing new crosses the API
+  // to say this.
+  PLAN: (run) => [
     ...READ_ONLY_CAWDEV,
     ...READ_FILES,
     ...GIT_READS,
+    ...(run?.entryNumber ? [] : [CARD_WRITE]),
   ],
   // R96. Read the whole repository, ask in rounds, write the brief, commit it.
   //
@@ -3604,6 +3622,23 @@ const PROFILE_TOOLS = {
     'Bash(git *)',
   ],
 };
+
+/**
+ * Whether this run is a plan session that has to write its own card — R150.
+ *
+ * <p>Inferred from the claim rather than carried on it: a cardless plan run's
+ * `entryNumber` is null because there is no card, and that is the same fact.
+ * One reader, so `PROFILE_TOOLS.PLAN`, `toolsForStage` and R113's cross-check
+ * cannot come to three different answers.
+ *
+ * <p>It stays true after the session writes the card, because the claim was
+ * taken before it did. That is deliberate: the permission is for the whole plan
+ * stage, and a session that has to re-file a card it got wrong should not find
+ * the tool gone half way through.
+ */
+function writesItsOwnCard(run) {
+  return run?.profile === 'PLAN' && !run?.entryNumber;
+}
 
 /**
  * The spawn arguments for a session that does not write code.
@@ -3781,10 +3816,18 @@ function promptForProfile(run) {
       + `\`roadmap_get\` before you answer.\n`
     : '';
 
+  // R150. Retired: nothing new starts on this profile. Kept because a session
+  // that was interrupted before the release and resumed after it still has to be
+  // spawnable, and a resumed run whose prompt had gone missing would be worse
+  // than one on a profile nobody can pick any more.
   if (run.profile === 'ROADMAP') {
     return `You are working on a roadmap in the cawdev platform. You have the cawdev MCP
 tools and nothing else: you cannot edit files, run commands, or use git, and you
 should not offer to.
+
+This session's profile has been retired — new work of this kind is a **Plan**
+session that writes the card and then plans it. This one was already running, so
+finish what it asked for.
 ${spans}${about}
 Start with \`roadmap_where\`, then \`roadmap_list\` to see what is already recorded.
 Read two or three existing entries before writing one, and match their shape: prose
@@ -3907,11 +3950,40 @@ ${run.openingPrompt}`;
   }
 
   if (run.profile === 'PLAN') {
-    return `You are planning **${ref} — ${run.entryTitle}** for the cawdev
+    // R150. Two openings, one body. Without a card the heading would render
+    // `**undefined**`, and more to the point the first instruction is a
+    // different one: write the thing you are about to plan.
+    const noCard = !run.entryNumber;
+    const opening = noCard
+      ? `You are starting a new piece of work on the cawdev platform, in this project.
+This is the PLAN PHASE: you work out what to do, and you write it down. You do not
+build it, and you have no tool that could — so do not spend turns finding that out.
+${briefLine(run)}
+**There is no card yet, and writing it is your first job.** Start with
+\`roadmap_where\`, then \`roadmap_list\` to see what is already recorded. Read two
+or three existing entries before writing one, and match their shape: prose saying
+what and why, a **Build:** list, and a **Done when:** condition somebody could
+check. Then create it with \`roadmap_create\`.
+
+\`roadmap_create\` is the ONE thing you may write. You cannot edit a file, run a
+command, use git, or comment on a card, and you should not offer to.
+
+**The card's body is the card, not the plan.** The card says what the thing is and
+how anybody would know it works. The plan — the files, the changes, the order — is
+what you report at the end, and cawdev stores it against the card itself.
+
+**Then plan the card you just wrote**, exactly as if somebody had handed it to
+you.
+`
+      : `You are planning **${ref} — ${run.entryTitle}** for the cawdev
 platform. This is the PLAN PHASE: you work out what to do, and you write it down.
 You do not build it, and you have no tool that could — so do not spend turns
 finding that out.
-${about}${briefLine(run)}
+${about}${briefLine(run)}`;
+    const asked = run.openingPrompt
+      ? `\n\n${noCard ? 'They asked' : 'They also asked'}:\n\n${run.openingPrompt}`
+      : '';
+    return `${opening}
 **What you produce is an artefact somebody reads.** Not notes to yourself: a plan
 a different session, in a different process, with none of your context, has to be
 able to carry out. Name the files. Say what changes in each. Say how anybody will
@@ -3932,12 +4004,12 @@ a NEW one, and re-planning blind to that would undo the fix they just made.
 confidently and wrongly. If there is a real fork, \`ask_user\` — you are the phase
 where a question is cheap.
 
-**Do not write the plan anywhere.** Not to a file, not to the card. cawdev stores
-what you report as the card's plan of record when this phase ends, and that is
-the only copy anybody wants: two plans in two places is how one of them goes
-stale.
+**Do not write the plan anywhere.** Not to a file, not to the card — including a
+card you created a moment ago. cawdev stores what you report as the card's plan of
+record when this phase ends, and that is the only copy anybody wants: two plans in
+two places is how one of them goes stale.
 
-Then \`report\` kind "done" with the plan itself.`;
+Then \`report\` kind "done" with the plan itself.${asked}`;
   }
 
   if (run.profile === 'REVIEW') {
@@ -5104,7 +5176,10 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
         stage.testMode,
         // R147. A read-only stage keeps `Agent` when every expert it was
         // handed is read-only — which `stageExperts` guarantees above.
-        { delegatesReadOnly: readOnlyStage && stageExperts.length > 0 })]
+        // R150. And a PLAN stage keeps `roadmap_create` when the run has no
+        // card to plan, because writing it is the first thing it has to do.
+        { delegatesReadOnly: readOnlyStage && stageExperts.length > 0,
+          writesItsOwnCard: writesItsOwnCard(run) })]
     : null;
 
   const args = [
@@ -5465,7 +5540,8 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
           // wrongly.
           if (stage && recorded.kind === 'TOOL') {
             const drifted = driftedFrom(stage.stage, recorded.body, stage.testMode,
-              stageExperts.map((each) => qualified(each.key)));
+              stageExperts.map((each) => qualified(each.key)),
+              { writesItsOwnCard: writesItsOwnCard(run) });
             if (drifted) {
               transcript.push({ kind: 'ERROR', body: drifted });
             }

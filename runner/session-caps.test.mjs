@@ -95,6 +95,11 @@ test('a project at its cap still starts an ASK, a ROADMAP, an AUDIT and a PLAN',
   // that queued behind a coding run would put thinking about one card back on
   // the critical path of building another — which is the whole thing the split
   // was for, undone by the queue rather than by the lifecycle.
+  //
+  // R150 retired ROADMAP as something anybody can START, and this fixture is
+  // not an endorsement of starting one: it is a run handed straight to the
+  // daemon by a stub platform, which is precisely the shape of an interrupted
+  // ROADMAP session resumed after the release. It has to keep working.
   const workspaces = [await aRepository()];
   const { platform, said } = await daemonWith(t, {
     name: 'test-caps-noncoding',
