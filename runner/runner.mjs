@@ -26,10 +26,12 @@ import { bannerLines, tintLog } from './banner.mjs';
 import { codeMapOf } from '../lib/code-map.mjs';
 import { usageLimitOf } from '../lib/usage-limit.mjs';
 import { parseUsage } from '../lib/usage-report.mjs';
-import { writeRunPlugin } from '../lib/run-plugin.mjs';
+import { qualified, writeRunPlugin } from '../lib/run-plugin.mjs';
 import { AI_CONFIG, harnessPrompt, readRepoConfig } from '../lib/harness-prompt.mjs';
 import { loadToken, storedUrls } from './token-store.mjs';
-import { CAWDEV_READS, GIT_READS, driftedFrom, toolsForStage } from '../lib/stage-tools.mjs';
+import {
+  CAWDEV_READS, GIT_READS, driftedFrom, readOnlyExpert, toolsForStage,
+} from '../lib/stage-tools.mjs';
 import { describeCall } from '../lib/tool-line.mjs';
 import { findSecret } from '../lib/secrets.mjs';
 
@@ -4816,11 +4818,19 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   };
   await writeFile(mcpConfigPath, JSON.stringify({ mcpServers }, null, 2));
 
+  // R147. Which of the run's experts THIS process may reach. A read-only stage
+  // is handed only the experts that can change nothing — `readOnlyExpert`
+  // judges by the frontmatter the plugin below is written from — so the plugin
+  // it loads, the `Agent` it is allowed and the list it is told about all
+  // agree. Everything else, and every process with no lifecycle, gets them all.
+  const readOnlyStage = Boolean(stage) && ['PLAN', 'VERIFY', 'MEMORY'].includes(stage.stage);
+  const stageExperts = readOnlyStage ? expertAgents.filter(readOnlyExpert) : expertAgents;
+
   // R104/R105. The experts and skills the project turned on, as one plugin in
   // the daemon's own directory — see writeRunPlugin for why not the checkout.
-  const pluginRoot = await writeRunPlugin(mcpDirectory, expertAgents, skills);
+  const pluginRoot = await writeRunPlugin(mcpDirectory, stageExperts, skills);
   if (pluginRoot) {
-    log(`  loading ${expertAgents.length} expert(s) and ${skills.length} skill(s)`);
+    log(`  loading ${stageExperts.length} expert(s) and ${skills.length} skill(s)`);
   }
 
   // The prompt goes on stdin, NOT as an argument.
@@ -4938,6 +4948,22 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   const harness = harnessPrompt({
     instincts,
     briefing,
+    // R147. Named to the session, by the name the CLI answers to. Before this
+    // the experts reached a session only through the CLI's own listing, beside
+    // its built-in agents, and nothing chose one.
+    experts: stageExperts.map((each) => ({
+      qualified: qualified(each.key),
+      description: each.description ?? each.name ?? each.key,
+    })),
+    skills: skills.map((each) => ({
+      qualified: qualified(each.key),
+      description: each.description ?? each.name ?? each.key,
+    })),
+    cannotDelegate: readOnlyStage && expertAgents.length && !stageExperts.length
+      ? [`The ${stage.stage} stage holds nothing that can change anything, and none of this `
+        + "project's experts is read-only, so none can be reached from it. They are reached "
+        + 'from IMPLEMENT and TEST.']
+      : undefined,
     // R124. Null on everything but an implementation phase whose card has been
     // planned, which the PLATFORM decides — the runner does not work out which
     // runs deserve a plan, it carries the one it was handed.
@@ -4958,11 +4984,14 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       ...toolsForStage(stage.stage,
         withSkills(
           withDelegation(typeof profileTools === 'function' ? profileTools(run) : profileTools,
-            expertAgents),
+            stageExperts),
           skills),
         // R129. Only TEST reads it, and only when the project set it: a
         // testbook stage is spawned with nothing that can run anything.
-        stage.testMode)]
+        stage.testMode,
+        // R147. A read-only stage keeps `Agent` when every expert it was
+        // handed is read-only — which `stageExperts` guarantees above.
+        { delegatesReadOnly: readOnlyStage && stageExperts.length > 0 })]
     : null;
 
   const args = [
@@ -5132,21 +5161,28 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     // memory and cannot tell whether it was ever reached has no way to find out
     // except by reading a daemon's log on somebody else's laptop.
     for (const agent of expertAgents) {
+      // R147: the QUALIFIED name, which is the one the CLI answers to — the
+      // bare key was the honest-looking line that sent a person, and a
+      // session, to a name that did not exist.
+      //
       // And the honest answer to "why did my expert never get used?" in the
-      // most common case. `canChangeThings` treats delegation as a writer — a
-      // sub-agent has its own tool list, so a PLAN stage holding `Agent` could
-      // write through a helper — and `toolsForStage` strips it. That is
-      // deliberate and it is invisible, which is what makes it worth saying.
-      const cannot = stage && ['PLAN', 'VERIFY', 'MEMORY'].includes(stage.stage)
-        ? ` The ${stage.stage} stage cannot delegate, so it will not be reached here.`
+      // other common case. A read-only stage reaches only an expert that can
+      // change nothing (`readOnlyExpert`); one that asks for a writer is left
+      // out of the stage's plugin, and this says so where the person is
+      // looking rather than in a daemon's log.
+      const cannot = readOnlyStage && !stageExperts.includes(agent)
+        ? ` The ${stage.stage} stage cannot reach it: it asks for tools that can change `
+          + 'things, and only read-only experts are reached from here.'
         : '';
-      const line = `${agent.name} is available to delegate to as Agent(${agent.key}).${cannot}`;
+      const line = `${agent.name} is available to delegate to as `
+        + `Agent(${qualified(agent.key)}).${cannot}`;
       log(`  ${line}`);
       transcript.push({ kind: 'SYSTEM', body: line });
     }
 
     for (const skill of skills) {
-      const line = `${skill.name} is available to this session as Skill(${skill.key}).`;
+      const line = `${skill.name} is available to this session as `
+        + `Skill(${qualified(skill.key)}).`;
       log(`  ${line}`);
       transcript.push({ kind: 'SYSTEM', body: line });
     }
@@ -5315,7 +5351,8 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
           // second thing that can stop a run is a second thing that can stop it
           // wrongly.
           if (stage && recorded.kind === 'TOOL') {
-            const drifted = driftedFrom(stage.stage, recorded.body, stage.testMode);
+            const drifted = driftedFrom(stage.stage, recorded.body, stage.testMode,
+              stageExperts.map((each) => qualified(each.key)));
             if (drifted) {
               transcript.push({ kind: 'ERROR', body: drifted });
             }
