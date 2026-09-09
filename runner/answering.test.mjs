@@ -59,8 +59,15 @@ const approval = (over = {}) => ({
   },
 });
 
-/** A client with a run selected, a fake screen, and every call recorded. */
-function client({ email = ALICE, question = asked(), pending = null, tty = true } = {}) {
+/**
+ * A client with a run selected, a fake screen, and every call recorded.
+ *
+ * `replies` is what a GET reads back, by path — R137's poll asks the platform
+ * what became of a request, so a fixture that answers everything with `null`
+ * cannot express "somebody allowed it".
+ */
+function client({ email = ALICE, question = asked(), pending = null, tty = true,
+  replies = null } = {}) {
   const out = { write() {}, columns: 100, rows: 40, isTTY: tty };
   const calls = [];
   const session = {
@@ -69,7 +76,7 @@ function client({ email = ALICE, question = asked(), pending = null, tty = true 
     signedIn: Boolean(email),
     async request(path, options = {}) {
       calls.push({ path, ...options });
-      return null;
+      return replies?.[path] ?? null;
     },
     async signOut() {},
   };
@@ -558,6 +565,159 @@ test('and so does escaping a line with no options behind it', () => {
   assert.ok(ui.answering);
   ui.onKey(ESC);
   assert.equal(ui.answering, null);
+});
+
+// --- R137: a decision is the other door too ----------------------------------
+//
+// The mirror of R119, and the complaint word for word: answered in the console,
+// still there in the CLI. What is pinned is that the poll judges by the RECORD
+// the platform keeps rather than by the inbox — which is per person, so absence
+// from it is not a decision — and that it closes only the box it is about.
+
+const APPROVALS = '/api/projects/cawdev/runs/run-1/approvals';
+
+/** What the platform reads back about a request, once somebody has decided it. */
+const record = (over = {}) => [{
+  id: 'a1',
+  runId: RUN.id,
+  toolName: 'Bash',
+  summary: 'mvn -q -pl backend test',
+  state: 'ALLOWED',
+  pending: false,
+  decidedByEmail: BOB,
+  remembered: false,
+  askedAt: '2026-09-04T10:11:12Z',
+  ...over,
+}];
+
+test('a permission request decided in the console closes the picker here', async () => {
+  const { ui } = client({
+    question: null, pending: approval(), replies: { [APPROVALS]: record() },
+  });
+  ui.announce();
+  assert.equal(ui.select.kind, 'permission', 'three lengths of yes, on screen');
+
+  assert.equal(await ui.decidedElsewhere(RUN), true);
+  assert.equal(ui.select, null, 'the picker is gone');
+  assert.equal(ui.mode, 'keys');
+  assert.equal(ui.approvals.size, 0, 'and the banner with it');
+  assert.match(stripAnsi(ui.status ?? ''), /allowed by bob@cawdev.test/);
+  assert.match(said(ui), /allowed by bob@cawdev.test/,
+    'and in the scrollback, where a pipe can read it');
+});
+
+test('and the refusal half typed too', async () => {
+  const { ui } = client({
+    question: null, pending: approval(), replies: { [APPROVALS]: record() },
+  });
+  ui.onKey('n');
+  type(ui, 'too risky');
+  assert.equal(ui.mode, 'typing');
+
+  assert.equal(await ui.decidedElsewhere(RUN), true);
+  assert.equal(ui.input, null, 'nobody is posting that reason anywhere now');
+  assert.equal(ui.mode, 'keys');
+});
+
+test('a request still pending closes nothing', async () => {
+  const { ui } = client({
+    question: null,
+    pending: approval(),
+    replies: { [APPROVALS]: record({ pending: true, state: 'PENDING', decidedByEmail: null }) },
+  });
+  ui.announce();
+  assert.equal(await ui.decidedElsewhere(RUN), false);
+  assert.equal(ui.select.kind, 'permission', 'still stopped on a person');
+  assert.equal(ui.approvals.size, 1);
+});
+
+test('the banner goes even when nothing was open', async () => {
+  // The second half of the complaint: with no picker up the request still sat
+  // in the footer until the inbox next answered, which is up to twenty seconds
+  // after everybody else could see the session had moved on.
+  const { ui } = client({
+    question: null, pending: approval(), replies: { [APPROVALS]: record() },
+  });
+  assert.match(ui.footer().map(stripAnsi).join('\n'), /permission/);
+
+  assert.equal(await ui.decidedElsewhere(RUN), true);
+  assert.doesNotMatch(ui.footer().map(stripAnsi).join('\n'), /permission/);
+});
+
+test('a question being answered is not closed by a decision', async () => {
+  // R119's guard, the other way round, and the trap in 07-traps.md: `deciding`
+  // outlives its picker, so news about the request must never close the box
+  // that took the screen in the meantime.
+  const { ui } = client({ pending: approval(), replies: { [APPROVALS]: record() } });
+  ui.onKey('a');
+  assert.equal(ui.select.kind, 'question');
+
+  assert.equal(await ui.decidedElsewhere(RUN), true);
+  assert.equal(ui.approvals.size, 0, 'the banner goes');
+  assert.equal(ui.select.kind, 'question', 'and the question is still being answered');
+  assert.equal(ui.mode, 'select');
+});
+
+test('a read that failed leaves it alone', async () => {
+  const { ui } = client({ question: null, pending: approval() });
+  ui.announce();
+  ui.session.request = async () => { throw new Error('connection refused'); };
+
+  assert.equal(await ui.decidedElsewhere(RUN), false);
+  assert.equal(ui.select.kind, 'permission', 'a blip is not a decision');
+  assert.equal(ui.approvals.size, 1);
+});
+
+test('a request that has vanished is treated as decided, not asked for ever', async () => {
+  const { ui } = client({
+    question: null, pending: approval(), replies: { [APPROVALS]: [] },
+  });
+  ui.announce();
+  assert.equal(await ui.decidedElsewhere(RUN), true);
+  assert.equal(ui.select, null);
+  assert.match(stripAnsi(ui.status ?? ''), /decided elsewhere/);
+});
+
+test('the inbox cannot bring back a request already decided', async () => {
+  // The race the filter is for: the inbox answers the moment anything is
+  // pending, so a reply built before the decision landed arrives after it.
+  const { ui } = client({
+    question: null, pending: approval(), replies: { [APPROVALS]: record() },
+  });
+  await ui.decidedElsewhere(RUN);
+
+  ui.rememberInbox({ approvals: [approval()] });
+  assert.equal(ui.approvals.size, 0, 'a stale inbox is not news');
+});
+
+test('nor one decided here a moment ago', async () => {
+  const { ui } = client({ question: null, pending: approval() });
+  await ui.decide({ allow: true, scope: 'ONCE' }, 'allowed, once');
+  assert.equal(ui.approvals.size, 0);
+
+  ui.rememberInbox({ approvals: [approval()] });
+  assert.equal(ui.approvals.size, 0, 'the same race, through the same filter');
+});
+
+test('an expired request says nobody came', async () => {
+  // EXPIRED is not a tidier DENIED, and the sentence should not read as one:
+  // nobody refused this, nobody was there.
+  const { ui } = client({
+    question: null,
+    pending: approval(),
+    replies: { [APPROVALS]: record({ state: 'EXPIRED', decidedByEmail: null }) },
+  });
+  ui.announce();
+  assert.equal(await ui.decidedElsewhere(RUN), true);
+  assert.match(stripAnsi(ui.status ?? ''), /nobody came — this request expired/);
+});
+
+test('opening the picker claims the request, and escape drops it', () => {
+  const { ui } = client({ question: null, pending: approval() });
+  ui.announce();
+  assert.equal(ui.deciding?.approvalId, 'a1');
+  ui.onKey(ESC);
+  assert.equal(ui.deciding, null);
 });
 
 // --- R123: the machine goes when the window does -----------------------------

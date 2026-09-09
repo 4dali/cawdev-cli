@@ -684,6 +684,19 @@ export class Attached {
      * been given is this terminal asking a person to do a thing twice.
      */
     this.answering = null;
+    /**
+     * The permission request an open picker or refuse-line is deciding — R137.
+     *
+     * `answering`'s exact counterpart, and here for the same reason: the
+     * console is the other door onto the same request, and a picker offering
+     * three lengths of yes for something already allowed is this terminal
+     * asking a person to decide a thing twice.
+     *
+     * Carries the APPROVAL id as well as the run because a run can be asked
+     * twice: `approvals` is keyed by run, so a second request arriving would
+     * otherwise make a picker titled with the first one's command look current.
+     */
+    this.deciding = null;
     this.status = '';
     this.showLog = false;
     this.asked = new Set();
@@ -700,6 +713,15 @@ export class Attached {
     this.stdinKeys = new KeyStream();
     /** Questions and requests already printed, so they are announced once. */
     this.announced = new Set();
+    /**
+     * Approval ids this client knows are over — R137.
+     *
+     * The inbox answers the moment anything is pending, so a response built
+     * moments before a decision lands can arrive after the poll cleared it and
+     * put the banner back for another twenty seconds. Same growth and same
+     * lifetime as `announced`: one attached terminal's.
+     */
+    this.settled = new Set();
     /** Ctrl+C, armed. See {@link onInterrupt}. */
     this.interrupting = false;
   }
@@ -986,9 +1008,7 @@ export class Attached {
     while (!this.stopped) {
       try {
         const inbox = await this.session.request('/api/inbox?wait=20');
-        this.approvals = new Map(
-          (inbox.approvals ?? []).map((item) => [item.runId, item]),
-        );
+        this.rememberInbox(inbox);
         this.announce();
         this.dirty = true;
       } catch {
@@ -997,18 +1017,39 @@ export class Attached {
     }
   }
 
+  /**
+   * What the inbox says is waiting, minus what this client has already seen
+   * settled — R137.
+   *
+   * A method rather than three lines in the loop so that the filter can be
+   * tested without an infinite poll. The filter is the point: the inbox returns
+   * as soon as anything is pending, so its answer is frequently older than the
+   * decision that ended the thing it is describing, and a stale answer must not
+   * be able to raise a banner over a request this terminal watched close.
+   */
+  rememberInbox(inbox) {
+    this.approvals = new Map((inbox?.approvals ?? [])
+      .filter((item) => !this.settled.has(item.approval?.id))
+      .map((item) => [item.runId, item]));
+  }
+
   pendingOn(run) {
     return run ? this.approvals.get(run.id) ?? null : null;
   }
 
   /**
-   * What the watched session is asking — R58.
+   * What the watched session is stopped on — R58, and since R137 both shapes.
    *
    * The run's own questions rather than the inbox, and that is the point: the
    * inbox is now only what is *yours*, so a question stopping a session on this
    * machine that belongs to a colleague would simply not be there — and the one
    * thing this program exists to answer is "why is that run not moving". Here
    * the answer is a name.
+   *
+   * <p>A session stops on two things, and this poll now watches both: a
+   * question, and a permission request. The second costs one extra GET, and
+   * only while this client believes a request is pending on the run being
+   * watched — nothing the rest of the time. See {@link decidedElsewhere}.
    */
   async watchQuestions() {
     while (!this.stopped) {
@@ -1038,6 +1079,9 @@ export class Attached {
           // A run this operator cannot read is not an error worth a banner.
           this.questions.delete(run.id);
         }
+        // Outside the catch: a questions read that failed is no reason to stop
+        // noticing that a permission request was decided somewhere else.
+        await this.decidedElsewhere(run);
       }
       await new Promise((done) => setTimeout(done, 2500));
     }
@@ -1103,6 +1147,87 @@ export class Attached {
     this.note(by && by !== this.session.email
       ? `answered by ${by} — closing this`
       : 'answered elsewhere — closing this');
+    return true;
+  }
+
+  /**
+   * Closes a permission request somebody has already decided in the console —
+   * R137. {@link answeredElsewhere}'s other half.
+   *
+   * <p>A session stops on two things and until now only one of them noticed
+   * when it was let go. Deciding in the browser left the picker up here, and
+   * choosing a row under it posted into a 409 — *"that request was already
+   * settled: allowed"* — about the very request drawn on screen. The banner
+   * outlived the decision too: the inbox long-poll returns early when something
+   * <em>is</em> pending and never when something stops being, so the answer
+   * that would have cleared it was asleep for up to twenty seconds.
+   *
+   * <p>Judged by the RECORD, not by absence from the inbox. The inbox is per
+   * person and per visibility, so "not in mine" is not "decided" — it is also
+   * what a colleague being asked instead looks like. A record that has VANISHED
+   * counts as settled, for R119's reason: the one thing that cannot be right is
+   * a terminal insisting on a decision about something it can no longer find.
+   *
+   * <p>And what closes the box is the box that is OPEN, never the claim held
+   * beside it — `deciding` says WHICH request, and it outlives its picker every
+   * time somebody escapes one. Mode-independent, because through a pipe there
+   * is no mode to be in: {@link openPicker} leaves it at `keys`.
+   */
+  async decidedElsewhere(run) {
+    const pending = this.approvals.get(run.id);
+    // Nothing believed pending is not news about anything.
+    if (!pending) {
+      return false;
+    }
+    let seen;
+    try {
+      seen = await this.session.request(
+        `/api/projects/${run.projectSlug}/runs/${run.id}/approvals`,
+      );
+    } catch {
+      // A read that failed says nothing about the request, so it changes
+      // nothing about it: closing a picker on a network blip would be this
+      // terminal inventing a decision nobody made.
+      return false;
+    }
+    const record = (Array.isArray(seen) ? seen : [])
+      .find((each) => each.id === pending.approval.id);
+    // Still stopped on a person, which is exactly what the picker is for.
+    if (record?.pending) {
+      return false;
+    }
+
+    this.settled.add(pending.approval.id);
+    this.approvals.delete(run.id);
+    this.dirty = true;
+
+    const mine = this.deciding?.approvalId === pending.approval.id;
+    const onScreen = this.select?.kind === 'permission' || this.input?.kind === 'reason';
+    if (mine && onScreen) {
+      this.mode = 'keys';
+      this.select = null;
+      this.input = null;
+      this.history.reset();
+      this.deciding = null;
+    }
+
+    const by = record?.decidedByEmail;
+    const verb = record?.state === 'DENIED' ? 'refused'
+      : record?.state === 'ALLOWED' ? 'allowed'
+        : 'decided';
+    // A name where there is one: "allowed" reads as something this terminal
+    // did, and a name is the difference between a thing that happened and a
+    // thing that happened to you. Nobody at all is its own sentence — EXPIRED
+    // is not a tidier DENIED.
+    const message = record?.state === 'EXPIRED'
+      ? 'nobody came — this request expired'
+      : `${verb}${by && by !== this.session.email ? ` by ${by}` : ' elsewhere'}`
+        + ' — closing this';
+    this.note(message);
+    // And into the scrollback as well, under the request `announce` printed
+    // there: through a pipe there is no status line to read this off, so R119's
+    // half of it is invisible today.
+    this.say(this.ink.muted(message));
     return true;
   }
 
@@ -1182,6 +1307,10 @@ export class Attached {
           return this.note('nothing is waiting for permission on this one');
         }
         if (!this.requireSignIn('refuse a request')) return undefined;
+        // The other door onto the same claim: `n` opens the line without ever
+        // opening the picker — R137.
+        this.deciding = { runId: this.current()?.id ?? null,
+          approvalId: this.pendingOn(this.current()).approval.id };
         return this.type('reason', 'refuse, because ▸', '');
       }
       case 'x':
@@ -1229,6 +1358,7 @@ export class Attached {
     this.select = null;
     this.input = null;
     this.answering = null;
+    this.deciding = null;
     this.history.reset();
     this.dirty = true;
     return open;
@@ -1313,6 +1443,7 @@ export class Attached {
       }
       this.mode = 'keys';
       this.answering = null;
+      this.deciding = null;
       return this.note('cancelled');
     }
 
@@ -1487,6 +1618,7 @@ export class Attached {
       // Nothing reads it while nothing is open, but a field that says an answer
       // is being written when none is is one the next reader will believe.
       this.answering = null;
+      this.deciding = null;
       // Escape leaves without changing anything, which is the promise the key
       // makes everywhere else.
       return this.note('');
@@ -1639,6 +1771,11 @@ export class Attached {
    */
   askPermission(pending) {
     const approval = pending.approval;
+    // What is being decided, so that the poll can tell whether this is still
+    // worth deciding — R137, and the RUN as well as the request for the reason
+    // {@link askTheQuestion} carries one.
+    this.deciding = { runId: pending.runId ?? this.current()?.id ?? null,
+      approvalId: approval.id };
     const covers = approval.suggestion ?? `every ${approval.toolName}`;
     return this.openPicker(new Select({
       kind: 'permission',
@@ -1917,7 +2054,13 @@ export class Attached {
           `/approvals/${pending.approval.id}/decision`,
         { method: 'POST', body: decision },
       );
+      // Settled, and remembered as settled: the inbox answers as soon as
+      // anything is pending, so its next reply may well have been built before
+      // this POST landed — and without this it would raise the banner again
+      // over a request this terminal has just decided (R137).
+      this.settled.add(pending.approval.id);
       this.approvals.delete(run.id);
+      this.deciding = null;
       this.note(said);
     } catch (failure) {
       this.note(failure.message);
