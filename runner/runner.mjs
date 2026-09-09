@@ -3475,6 +3475,48 @@ const PROFILE_TOOLS = {
  * that still had the coding defaults on the end would be a stage with tools its
  * table never granted, and nothing would have said so.
  */
+/**
+ * Tell the platform a usage window is closed — R73, from either place that
+ * finds out.
+ *
+ * <p>Two callers and one implementation, deliberately: the turn that SAYS the
+ * window closed and the exit that follows one. They were one place and it was
+ * the wrong one — an exit that a mid-run limit never produces.
+ *
+ * <p>Both calls are best-effort and say so when they fail. A refused report is
+ * worth a line rather than a stopped run: the commonest refusal is a run whose
+ * state has moved on underneath the daemon, and failing the run over a
+ * bookkeeping call would be a worse answer than a stale label.
+ */
+async function reportUsageLimit(config, run, limit, lastText) {
+  const window = limit.window === 'WEEKLY' ? 'weekly' : 'five-hour';
+  await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/transition`, {
+    method: 'POST',
+    body: {
+      state: 'USAGE_LIMITED',
+      summary: `Usage limit reached (${window} window). ${lastText ?? ''}`.trim(),
+      limitWindow: limit.window,
+      limitResetsAt: limit.resetsAt ? limit.resetsAt.toISOString() : null,
+    },
+  }).catch((failure) => log(`  could not report the usage limit: ${failure.message}`));
+  // R73's worst case, shipped: the CLI reports its windows to a person more
+  // readily than to a program, so the one moment this daemon KNOWS a window is
+  // closed is when a run was refused. Report that — no numbers, the reset it
+  // stated — and the runners page shows the last refusal and when it opens,
+  // which is infinitely more than nothing and better than a meter cawdev
+  // computed for itself.
+  await api(config, `/api/runners/${config.runnerId}/limits`, {
+    method: 'POST',
+    body: [{
+      provider: 'claude',
+      window: limit.window,
+      used: null,
+      limit: null,
+      resetsAt: limit.resetsAt ? limit.resetsAt.toISOString() : null,
+    }],
+  }).catch((failure) => log(`  could not report the window: ${failure.message}`));
+}
+
 function argsBefore(agentArgs) {
   const kept = [];
   for (let i = 0; i < agentArgs.length; i++) {
@@ -4922,6 +4964,10 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     // The usage-limit notice is written there, and a decision made on stdout
     // alone would call every window a crash.
     let stderrTail = '';
+    // Whether a closed window has already been reported for this child. The
+    // CLI emits one `result` per turn and a run may have several, so without
+    // this a limited session reports the same window on every turn after it.
+    let limitReported = false;
     const transcript = new Transcript(config, run);
 
     // R113. Nothing watched for silence, and a session that stops producing
@@ -5031,6 +5077,51 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
           // walk is told the difference rather than left to read an exit code
           // that says nothing about it.
           turnEnded = turnEnded || event.is_error !== true;
+
+          // R73, at the moment the window is actually said.
+          //
+          // The close handler below asks `usageLimitOf` too, and asks it too
+          // late and under a condition that does not hold: only when the child
+          // EXITS, and only when it exits NON-ZERO. A session that hits its
+          // limit mid-run does neither. The CLI prints "You've hit your session
+          // limit · resets 4am", ends the turn with SUCCESS, and then — R22
+          // holds its stdin open, correctly, so a person can prompt it — sits
+          // there for ever. Observed: forty-three minutes, a run stuck RUNNING,
+          // the machine's only slot held, and three queued runs behind it.
+          //
+          // Worse, the recovery made it invisible. Carrying the run on put it
+          // back to QUEUED, and when the process was finally killed the daemon
+          // recognised the window and the platform refused the report — "a run
+          // that is QUEUED cannot move to USAGE_LIMITED" — so the one moment
+          // this daemon KNEW a window was closed was spent on a state the run
+          // had already left. Then it re-claimed and spawned a fresh session
+          // straight back into the same closed window.
+          //
+          // Same matcher, same text, same trust as the exit path — this only
+          // stops waiting for an exit that is not coming. The direction of a
+          // mistake is deliberate: a false positive parks a run and lets
+          // AutoResumer pick it up after a reset that has already passed, which
+          // costs a delay; a false negative is what the paragraph above
+          // describes.
+          if (!limitReported) {
+            const closed = usageLimitOf(lastText ?? '');
+            if (closed) {
+              limitReported = true;
+              log(`  the ${closed.window === 'WEEKLY' ? 'weekly' : 'five-hour'} usage window `
+                + `closed mid-run${closed.resetsAt ? `; resets ${closed.resetsAt.toISOString()}` : ''}`);
+              // Not awaited: this is the stream's handler, and a reader that
+              // stopped to talk to the platform would stall the transcript
+              // behind the network — the same rule the shield follows below.
+              reportUsageLimit(config, run, closed, lastText);
+              // A stage is asked to leave just below, for its own reason. A run
+              // has to be asked here: USAGE_LIMITED holds no process (R73), and
+              // leaving one behind is the forty-three minutes again.
+              if (!stage) {
+                endSession(child, 'the usage window closed', config.sessionExitSeconds);
+              }
+            }
+          }
+
           // R22's cost, paid. A stage has nobody to prompt it and one turn to
           // give, so this is where its process is asked to leave; without it
           // the walk waits on a `close` that cannot come. A run with no
@@ -5167,36 +5258,18 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
         // to its usage window is USAGE_LIMITED, with the window and the reset
         // it stated — not FAILED, which is the word for a crash. Recognised by
         // the Claude Code adapter only: a second CLI supplies its own, or none.
-        const limit = code === 0 ? null : usageLimitOf(`${lastText}\n${stderrTail}`);
+        const limit = limitReported
+          ? null
+          : (code === 0 ? null : usageLimitOf(`${lastText}\n${stderrTail}`));
         if (limit) {
           log(`  the ${limit.window === 'WEEKLY' ? 'weekly' : 'five-hour'} usage window closed`
             + (limit.resetsAt ? `; resets ${limit.resetsAt.toISOString()}` : ''));
-          await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/transition`, {
-            method: 'POST',
-            body: {
-              state: 'USAGE_LIMITED',
-              summary: `Usage limit reached (${limit.window === 'WEEKLY' ? 'weekly' : 'five-hour'}`
-                + ` window). ${lastText}`.trim(),
-              limitWindow: limit.window,
-              limitResetsAt: limit.resetsAt ? limit.resetsAt.toISOString() : null,
-            },
-          }).catch((failure) => log(`  could not report the usage limit: ${failure.message}`));
-          // R73's worst case, shipped: the CLI reports its windows to a person
-          // more readily than to a program, so the one moment this daemon
-          // KNOWS a window is closed is when a run was refused. Report that —
-          // no numbers, the reset it stated — and the runners page shows the
-          // last refusal and when it opens, which is infinitely more than
-          // nothing and better than a meter cawdev computed for itself.
-          await api(config, `/api/runners/${config.runnerId}/limits`, {
-            method: 'POST',
-            body: [{
-              provider: 'claude',
-              window: limit.window,
-              used: null,
-              limit: null,
-              resetsAt: limit.resetsAt ? limit.resetsAt.toISOString() : null,
-            }],
-          }).catch((failure) => log(`  could not report the window: ${failure.message}`));
+          await reportUsageLimit(config, run, limit, lastText);
+        } else if (limitReported) {
+          // Already reported from the turn that said it, and the run is not
+          // live in the sense this branch means: it is parked. Saying nothing
+          // is the point — the alternative is `finish(FAILED)` below undoing
+          // the parking, which is R73's whole complaint in one line.
         } else if (!stage) {
           const summary = signal
             ? `The agent was terminated (${signal}).`

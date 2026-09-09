@@ -36,6 +36,11 @@
 //   permission-then-finish       ask permission for a command, wait, then done
 //   crash                        exit non-zero without reporting
 //   hang                         never say anything, for testing cancellation
+//   usage-limit                  say the window is closed, end the turn with
+//                                SUCCESS, and then LINGER — which is what the
+//                                real CLI did, and the reason a limited run sat
+//                                RUNNING for forty-three minutes holding the
+//                                machine's only slot
 //
 // It announces a session id on `init`, like the real CLI, so R69's resume path
 // has something to record and hand back.
@@ -120,6 +125,14 @@ if (script === 'crash') {
 if (script === 'hang') {
   say('hanging around');
   // Long enough for a cancellation test, and harmless if one never comes.
+  setTimeout(() => process.exit(0), 10 * 60 * 1000);
+} else if (script === 'usage-limit') {
+  // The exact sentence, middle dot and all, because that is what made the
+  // matcher's earlier patterns miss it. And then it STAYS — no exit, no error
+  // code, nothing for a close handler to read. A stub that exited here would
+  // model away the one fact that made this a forty-three minute hang rather
+  // than a run that ended badly.
+  say("You've hit your session limit · resets 4am (Africa/Tunis)");
   setTimeout(() => process.exit(0), 10 * 60 * 1000);
 } else {
   await report('PROGRESS', `Stub agent, script "${script}", in ${process.cwd()}.`);
