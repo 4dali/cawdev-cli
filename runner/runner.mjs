@@ -2531,6 +2531,80 @@ function capped(text) {
       + 'The rest is in the checkout.]';
 }
 
+/** A patch bigger than this does not travel; commit some of it first. */
+const HANDOFF_PATCH_CAP = 4 * 1024 * 1024;
+
+/**
+ * A checkout back to what the remote has — R87's RESET, as a function since
+ * R148 because a hand-off ends the same way once the work is elsewhere.
+ */
+async function resetToOrigin(cwd, defaultBranchName) {
+  const branch = (await git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
+  const defaultBranch = defaultBranchName?.trim() || 'main';
+
+  await git(cwd, ['reset', '--hard']);
+  await git(cwd, ['clean', '-fd']);
+
+  await git(cwd, ['fetch', '--prune', 'origin']).catch(() => null);
+  const onOrigin = await git(cwd, ['rev-parse', '--verify', `origin/${branch}`])
+    .then(() => true)
+    .catch(() => false);
+
+  if (onOrigin) {
+    await git(cwd, ['reset', '--hard', `origin/${branch}`]);
+    return `${cwd} is back to origin/${branch}.`;
+  }
+  if (branch === defaultBranch) {
+    return `${cwd} is clean on ${branch}.`;
+  }
+  await git(cwd, ['checkout', defaultBranch]);
+  await git(cwd, ['reset', '--hard', `origin/${defaultBranch}`]).catch(() => null);
+  await git(cwd, ['branch', '-D', branch]).catch(() => null);
+  return `${branch} was never pushed, so it is gone; ${cwd} is on ${defaultBranch}.`;
+}
+
+/**
+ * A handed-off run's work, laid into a fresh checkout — R148.
+ *
+ * <p>The branch first: `prepareWorkingCopy` creates a branch it does not
+ * have locally from the DEFAULT branch, which is right for a new run and
+ * wrong for one whose commits are on the remote. So the checkout is put on
+ * `origin/<branch>` when that exists. Then the patch, three-way so a file the
+ * remote moved under it still lands; and if it will not apply, it is written
+ * beside the checkout and the sentence returned says where — the session
+ * reads that sentence before it reads anything else.
+ */
+async function applyHandoff(cwd, branch, handoff) {
+  const parts = [];
+  await git(cwd, ['fetch', '--prune', 'origin']).catch(() => null);
+  const onOrigin = await git(cwd, ['rev-parse', '--verify', `origin/${branch}`])
+    .then(() => true)
+    .catch(() => false);
+  if (onOrigin) {
+    await git(cwd, ['checkout', '-B', branch, `origin/${branch}`]);
+    parts.push(`Handed off: ${cwd} is on origin/${branch}`);
+  } else {
+    parts.push(`Handed off: ${branch} is not on the remote, so this checkout starts it from the `
+      + 'default branch');
+  }
+  if (!handoff?.patch) {
+    parts.push('nothing was uncommitted.');
+    return parts.join('; ');
+  }
+  const patchFile = join(tmpdir(), `cawdev-handoff-${Date.now()}.patch`);
+  await writeFile(patchFile, handoff.patch);
+  try {
+    await git(cwd, ['apply', '--3way', '--whitespace=nowarn', patchFile]);
+    parts.push(`${handoff.files ?? 'the'} uncommitted file(s) were applied on top as a patch.`);
+    await rm(patchFile, { force: true }).catch(() => null);
+  } catch (failure) {
+    parts.push(`the patch of ${handoff.files ?? 'the'} uncommitted file(s) did NOT apply cleanly `
+      + `(${failure.message.split('\n')[0]}). It is at ${patchFile} — apply it by hand with `
+      + `git apply --3way ${patchFile}, and check git status before relying on the tree.`);
+  }
+  return parts.join('; ');
+}
+
 async function performWorkspaceRequest(config, request) {
   const cwd = request.path;
   let ok = false;
@@ -2636,40 +2710,49 @@ async function performWorkspaceRequest(config, request) {
       result = failure.message;
     }
   } else if (request.kind === 'RESET') {
-    // R87's start-over. The destructive one, and the only kind on this channel
-    // that is: the platform has already discarded the run and told somebody
-    // what was about to be lost, and this is the machine making it true.
     log(`  resetting ${cwd}, as asked`);
     try {
-      const branch = (await git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
-      const defaultBranch = request.defaultBranch?.trim() || 'main';
-
-      // Uncommitted work first, tracked and untracked. A reset --hard that
-      // left untracked files behind would leave the next run in a checkout
-      // that is still dirty, which is the whole thing this is fixing.
-      await git(cwd, ['reset', '--hard']);
-      await git(cwd, ['clean', '-fd']);
-
-      // Then the branch itself. Back to what origin has, if origin has it;
-      // deleted and recut from the default branch if it was never pushed —
-      // there is nothing to go back TO, and leaving it would leave the next
-      // run's `checkout -b` refusing a name that already exists.
-      await git(cwd, ['fetch', '--prune', 'origin']).catch(() => null);
-      const onOrigin = await git(cwd, ['rev-parse', '--verify', `origin/${branch}`])
-        .then(() => true)
-        .catch(() => false);
-
-      if (onOrigin) {
-        await git(cwd, ['reset', '--hard', `origin/${branch}`]);
-        result = `${cwd} is back to origin/${branch}.`;
-      } else if (branch === defaultBranch) {
-        result = `${cwd} is clean on ${branch}.`;
-      } else {
-        await git(cwd, ['checkout', defaultBranch]);
-        await git(cwd, ['reset', '--hard', `origin/${defaultBranch}`]).catch(() => null);
-        await git(cwd, ['branch', '-D', branch]).catch(() => null);
-        result = `${branch} was never pushed, so it is gone; ${cwd} is on ${defaultBranch}.`;
+      result = await resetToOrigin(cwd, request.defaultBranch);
+      ok = true;
+    } catch (failure) {
+      result = failure.message;
+    }
+  } else if (request.kind === 'HANDOFF') {
+    // R148. Package the run's work and free the checkout: the branch goes to
+    // the remote, the uncommitted tree goes to the platform as a patch, and
+    // only THEN is the directory reset — nothing is dropped before it is
+    // somewhere else.
+    log(`  HANDING OFF ${cwd} — asked for from the console`);
+    try {
+      if (!request.runId) {
+        throw new Error('This hand-off names no run, so there is nothing to report it against.');
       }
+      const branch = (await git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
+      await git(cwd, ['add', '-A']);
+      const patch = await git(cwd, ['diff', '--cached', '--binary']).catch(() => '');
+      const files = (await git(cwd, ['diff', '--cached', '--name-only']).catch(() => ''))
+        .split('\n').filter(Boolean).length;
+      // Unstage again: the tree is untouched until the platform has the patch.
+      await git(cwd, ['reset']).catch(() => null);
+      const baseSha = (await git(cwd, ['rev-parse', 'HEAD'])).trim();
+      let pushed = false;
+      try {
+        await git(cwd, ['push', '-u', 'origin', branch]);
+        pushed = true;
+      } catch (failure) {
+        log(`  could not push ${branch}: ${failure.message.split('\n')[0]}`);
+      }
+      if (patch.length > HANDOFF_PATCH_CAP) {
+        throw new Error(`The uncommitted work is ${Math.round(patch.length / 1024)}kB as a patch, `
+          + 'which is more than a hand-off carries. Commit some of it first.');
+      }
+      await api(config, `/api/runners/${config.runnerId}/runs/${request.runId}/handoff`, {
+        method: 'POST',
+        body: { baseSha, patch: patch || null, files, pushed },
+      });
+      const freed = await resetToOrigin(cwd, request.defaultBranch);
+      result = `Handed off: ${files} uncommitted file(s) saved as a patch on ${baseSha.slice(0, 7)}, `
+        + `branch ${branch} ${pushed ? 'pushed' : 'NOT pushed — push it by hand'}. ${freed}`;
       ok = true;
     } catch (failure) {
       result = failure.message;
@@ -4123,6 +4206,16 @@ const taken = new Map();
 const noted = new Map();
 
 /**
+ * The last set of queued reasons this daemon told the platform — R148.
+ *
+ * <p>`noteQueued` above used to be the ONLY place the reason a run waits
+ * existed. It goes to the platform now, the whole current set every pass, so
+ * omission withdraws a reason; this is the guard that keeps an idle machine
+ * from posting the same body on every poll.
+ */
+let lastSentReasons = '';
+
+/**
  * The run holding a workspace, or undefined — R47.
  *
  * Read from the two places a workspace can be spoken for: a live child, and a
@@ -4245,6 +4338,7 @@ async function startRun(config, offered, workspace) {
   let baseCommit;
   // The conversation this run is continuing, when it is continuing one — R69.
   let resume = null;
+  let handoff = null;
   // What this project has turned on — R76. Asked for, never granted: the
   // platform decides, and the machine still has the veto at spawn.
   let mcpServers = [];
@@ -4286,6 +4380,14 @@ async function startRun(config, offered, workspace) {
     resume = claimed.resume ?? null;
     if (resume?.agentSessionId) {
       log(`  resuming session ${short(resume.agentSessionId)}`);
+    }
+    // R148. A run handed off from another checkout: its branch is on the
+    // remote and its uncommitted tree is a patch. Applied after the working
+    // copy is prepared, below.
+    handoff = claimed.handoff ?? null;
+    if (handoff) {
+      log(`  carrying a hand-off: ${handoff.files ?? 0} file(s) as a patch on `
+        + `${String(handoff.baseSha ?? '?').slice(0, 7)}`);
     }
     // R76. What the project turned on. Logged because a machine's operator
     // should be able to see, from the daemon's own output, that a session was
@@ -4349,6 +4451,17 @@ async function startRun(config, offered, workspace) {
         resolve(path), run.branch, defaultBranch, allowDirty);
       branch = prepared.branch;
       baseCommit = prepared.base;
+      if (handoff) {
+        // R148. The work travelled: put the checkout on the pushed branch and
+        // lay the uncommitted tree on top. A patch that does not apply is not
+        // a failed run — it is left beside the checkout and SAID, in the
+        // briefing the session reads first, so a person or the session can
+        // finish the job by hand.
+        const said = await applyHandoff(resolve(path), branch, handoff);
+        log(`  ${said}`);
+        briefing = briefing ? `${said}\n\n${briefing}` : said;
+        baseCommit = await git(resolve(path), ['rev-parse', 'HEAD']).catch(() => baseCommit);
+      }
     }
     log(`  working copy ${path} is on ${branch}`);
 
@@ -6071,6 +6184,19 @@ async function main() {
         if (!offers.some((offer) => offer.run.id === id)) {
           noted.delete(id);
         }
+      }
+
+      // R148. Say it where a person can read it. Fire-and-forget: a daemon
+      // that died because the platform was slow to take a nicety would be
+      // worse than one that said nothing.
+      const reasons = [...noted.entries()].map(([runId, note]) => ({ runId, why: note.why }));
+      const reasonsBody = JSON.stringify(reasons);
+      if (reasonsBody !== lastSentReasons) {
+        lastSentReasons = reasonsBody;
+        api(config, `/api/runners/${config.runnerId}/queued-reasons`, {
+          method: 'POST',
+          body: { reasons },
+        }).catch((failure) => log(`could not report why the queue waits: ${failure.message}`));
       }
 
       // The queue's long poll returns IMMEDIATELY when anything is waiting —
