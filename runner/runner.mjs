@@ -2406,7 +2406,9 @@ function watchWorkingCopy(config, run, cwd, baseCommit) {
       // Only when it changed: a session that thinks for a minute should not
       // generate a request a second saying the same thing.
       const fingerprint = state && `${state.files}:${state.insertions}:${state.deletions}`;
-      if (state && fingerprint !== last) {
+      // R141: CODE alone. Every other profile is standing in a checkout it did
+      // not prepare, so what `readWorkingCopy` sees there is not its work.
+      if (state && fingerprint !== last && writesAnythingProfile(run)) {
         last = fingerprint;
         await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/working-copy`, {
           method: 'POST',
