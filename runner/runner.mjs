@@ -3609,8 +3609,13 @@ function promptForProfile(run) {
   // the question carrying "About R3 —" on its front, so this is where the agent
   // is told — and `roadmap_get` is named because the title alone is not the
   // entry, and guessing from a title is how you answer about the wrong card.
+  // How that card is written — R127. The API says, in `entryRef`; the fallback
+  // is for a platform that predates it. Spelled once here, so the three prompts
+  // below cannot disagree about what to call the same card.
+  const ref = run.entryRef ?? `R${run.entryNumber}`;
+
   const about = run.entryNumber
-    ? `This is about **R${run.entryNumber} — ${run.entryTitle}**. Read it with `
+    ? `This is about **${ref} — ${run.entryTitle}**. Read it with `
       + `\`roadmap_get\` before you answer.\n`
     : '';
 
@@ -3740,7 +3745,7 @@ ${run.openingPrompt}`;
   }
 
   if (run.profile === 'PLAN') {
-    return `You are planning **R${run.entryNumber} — ${run.entryTitle}** for the cawdev
+    return `You are planning **${ref} — ${run.entryTitle}** for the cawdev
 platform. This is the PLAN PHASE: you work out what to do, and you write it down.
 You do not build it, and you have no tool that could — so do not spend turns
 finding that out.
@@ -3774,7 +3779,7 @@ Then \`report\` kind "done" with the plan itself.`;
   }
 
   if (run.profile === 'REVIEW') {
-    return `You are reviewing the work on **R${run.entryNumber} — ${run.entryTitle}**
+    return `You are reviewing the work on **${ref} — ${run.entryTitle}**
 on branch ${run.branch} for the cawdev platform.
 
 **Your job.** Read the branch's work and check it against the card's Build: and

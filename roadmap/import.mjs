@@ -14,7 +14,7 @@
 
 import { readFile } from 'node:fs/promises';
 import { call, readConfig, resolveProject } from '../lib/cawdev.mjs';
-import { parseRoadmap } from '../lib/roadmap-format.mjs';
+import { entryRef, parseRoadmap } from '../lib/roadmap-format.mjs';
 
 async function main() {
   const args = process.argv.slice(2);
@@ -38,7 +38,7 @@ async function main() {
   const known = new Map(existing.map((entry) => [entry.number, entry]));
 
   console.error(
-    `${file}: R${entries[0].number}–R${entries.at(-1).number} (${entries.length} entries). ` +
+    `${file}: ${entryRef(entries[0])}–${entryRef(entries.at(-1))} (${entries.length} entries). ` +
       `${slug} holds ${known.size}.`,
   );
 
@@ -48,8 +48,8 @@ async function main() {
   const nextExpected = known.size ? Math.max(...known.keys()) + 1 : 1;
   if (missing.length && missing[0].number !== nextExpected) {
     throw new Error(
-      `Cannot preserve ids: ${slug} holds up to R${nextExpected - 1}, but the next entry to ` +
-        `create is R${missing[0].number}. Ids are permanent — import into an empty project, ` +
+      `Cannot preserve ids: ${slug} holds up to ${nextExpected - 1}, but the next entry to ` +
+        `create is ${entryRef(missing[0])}. Ids are permanent — import into an empty project, ` +
         `or add the gap by hand first.`,
     );
   }
@@ -93,7 +93,7 @@ async function main() {
     });
     if (result.number !== entry.number) {
       throw new Error(
-        `R${entry.number} was allocated ${result.number}. Ids are permanent, so this import ` +
+        `${entryRef(entry)} was allocated ${result.number}. Ids are permanent, so this import ` +
           `cannot continue — start from an empty project.`,
       );
     }

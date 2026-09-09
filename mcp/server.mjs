@@ -544,14 +544,17 @@ const TOOLS = [
         method: 'POST',
         body: { body: args.body },
       });
-      return `Commented on R${args.number} in ${slug}. It cannot be deleted — that is the point.`;
+      // The bare number: this call is given one and never reads the card, so
+      // it has no kind and a prefix here would be a guess — R127.
+      return `Commented on card ${args.number} in ${slug}. It cannot be deleted — that is the point.`;
     },
   },
 
   {
     name: 'roadmap_create',
     description:
-      'Create a roadmap entry. The platform allocates its permanent R-number, and the ' +
+      'Create a roadmap entry. The platform allocates its permanent number — written R91 on ' +
+      'a roadmap card and i91 on an issue, one sequence across both — and the ' +
       'platform decides where a card starts — CONSIDERING — unless you say otherwise; ' +
       'a status that requires something must be given it.',
     inputSchema: {
@@ -589,15 +592,16 @@ const TOOLS = [
         method: 'POST',
         body: pick(args, ['title', 'body', 'status', 'branch', 'merge', 'version', 'reason', 'section', 'related']),
       });
-      return `Created R${entry.number} in ${slug}.\n\n${formatEntry(entry, {})}`;
+      return `Created ${refOf(entry)} in ${slug}.\n\n${formatEntry(entry, {})}`;
     },
   },
 
   {
     name: 'issue_list',
     description:
-      'What is broken in a project, and how badly — R85. The same numbering as the roadmap: ' +
-      'R91 may be an issue. Statuses are NEW, CONFIRMED, IN_DEVELOPMENT, MERGED (drawn as ' +
+      'What is broken in a project, and how badly — R85. The same numbering as the roadmap, ' +
+      'written with an i: card 91 filed as an issue is i91, and there is no R91 as well. ' +
+      'Statuses are NEW, CONFIRMED, IN_DEVELOPMENT, MERGED (drawn as ' +
       'Resolved) and DECLINED (Won\'t fix).',
     inputSchema: {
       type: 'object',
@@ -630,7 +634,8 @@ const TOOLS = [
       'File an issue: something that is broken, with how badly. Lands at NEW — filed and not ' +
       'yet triaged — unless you say CONFIRMED, which claims you have already checked it. The ' +
       'severity is required: it is how the board is ordered. Use `related` to name the card it ' +
-      'was found on.',
+      'was found on. It gets a number from the same sequence the roadmap uses, written with an ' +
+      'i — i91 — so a number addresses exactly one card whichever board it is on.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -649,7 +654,7 @@ const TOOLS = [
         method: 'POST',
         body: pick(args, ['title', 'body', 'severity', 'status', 'related']),
       });
-      return `Filed R${issue.number} in ${slug}.\n\n${formatEntry(issue, {})}`;
+      return `Filed ${refOf(issue)} in ${slug}.\n\n${formatEntry(issue, {})}`;
     },
   },
 
@@ -675,7 +680,7 @@ const TOOLS = [
         method: 'PATCH',
         body: pick(args, ['title', 'body', 'section', 'related']),
       });
-      return `Updated R${entry.number}.\n\n${formatEntry(entry, {})}`;
+      return `Updated ${refOf(entry)}.\n\n${formatEntry(entry, {})}`;
     },
   },
 
@@ -720,7 +725,7 @@ const TOOLS = [
         method: 'POST',
         body: pick(args, ['status', 'branch', 'merge', 'version', 'reason']),
       });
-      return `R${entry.number} is now ${entry.statusDisplay}.\n\n${formatEntry(entry, {})}`;
+      return `${refOf(entry)} is now ${entry.statusDisplay}.\n\n${formatEntry(entry, {})}`;
     },
   },
 
@@ -740,7 +745,7 @@ const TOOLS = [
         method: 'POST',
         body: { reason: args.reason },
       });
-      return `R${entry.number} declined.\n\n${formatEntry(entry, {})}`;
+      return `${refOf(entry)} declined.\n\n${formatEntry(entry, {})}`;
     },
   },
 
@@ -1703,14 +1708,29 @@ function formatFileDeps(map, path) {
   return lines.join('\n');
 }
 
+/**
+ * What to call a card — R127. The server says, in `ref`; this is the fallback
+ * for anything that predates it.
+ */
+function refOf(entry) {
+  return entry.ref ?? ((entry.kind === 'ISSUE' ? 'i' : 'R') + entry.number);
+}
+
 function formatEntry(entry, { brief, comments, plan }) {
-  const lines = [`R${entry.number} — ${entry.title}`, `  status: ${entry.statusDisplay}`];
+  const lines = [`${refOf(entry)} — ${entry.title}`, `  status: ${entry.statusDisplay}`];
   if (entry.branch) lines.push(`  branch: ${entry.branch}`);
   if (entry.merge) lines.push(`  merged: ${entry.merge}`);
   if (entry.version) lines.push(`  version: ${entry.version}`);
   if (entry.declinedReason) lines.push(`  declined because: ${entry.declinedReason}`);
   if (entry.section) lines.push(`  section: ${entry.section}`);
-  if (entry.related?.length) lines.push(`  related: ${entry.related.map((n) => `R${n}`).join(', ')}`);
+  if (entry.related?.length) {
+    // Each id written the way its own card is written, when the API said so.
+    lines.push(
+      `  related: ${entry.related
+        .map((n, index) => entry.relatedRefs?.[index] ?? `R${n}`)
+        .join(', ')}`,
+    );
+  }
   // Said in a survey, where the comments themselves are not fetched: an entry
   // with an argument attached should be visibly different from one without,
   // even in a list. Omitted at zero rather than written as "comments: 0".
