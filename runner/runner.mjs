@@ -179,6 +179,20 @@ const DEFAULTS = {
     'mcp__cawdev__changelog_get',
     'mcp__cawdev__changelog_add',
     'mcp__cawdev__changelog_update',
+    // R85's other half, and R37's. `issue_file` and `propose_entry` were served
+    // and allowed by nobody — the third and fourth time this list has been
+    // caught a tool short, after `roadmap_comment` and `issue_list` above. A
+    // served tool that no run may call is a tool that does not exist, and the
+    // failure is silent: a non-coding profile is spawned without
+    // `--permission-prompt-tool`, so the call is refused with no question asked.
+    'mcp__cawdev__issue_file',
+    'mcp__cawdev__propose_entry',
+    // R96's rounds. An interview is the one profile that cannot work without
+    // these, and they were missing for the same reason as the two above.
+    'mcp__cawdev__ask_group',
+    'mcp__cawdev__await_group',
+    'mcp__cawdev__interview_rounds',
+    'mcp__cawdev__await_more_rounds',
   ],
   /**
    * What this machine will let a STORED rule allow, with nobody watching.
