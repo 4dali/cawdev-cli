@@ -40,7 +40,7 @@
 // It announces a session id on `init`, like the real CLI, so R69's resume path
 // has something to record and hand back.
 
-const url = (process.env.CAWDEV_URL ?? 'http://localhost:8091').replace(/\/+$/, '');
+const url = (process.env.CAWDEV_URL ?? 'http://localhost:4200').replace(/\/+$/, '');
 const token = process.env.CAWDEV_TOKEN;
 const project = process.env.CAWDEV_PROJECT;
 const script = process.env.CAWDEV_STUB_SCRIPT ?? 'report-and-finish';

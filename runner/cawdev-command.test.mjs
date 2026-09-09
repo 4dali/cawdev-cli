@@ -333,7 +333,10 @@ test('the daemon key follows the daemon: CAWDEV_URL, then the config, then the d
   assert.equal(daemonUrl(file, { CAWDEV_URL: 'https://elsewhere.example' }),
     'https://elsewhere.example');
   assert.equal(daemonUrl(file, {}), 'http://localhost:8091');
-  assert.equal(daemonUrl(null, {}), 'http://localhost:8091', 'the default drifted');
+  // The CONSOLE's origin, not the API's — one origin is the constraint, `:8091`
+  // does not exist outside development, and both the session and the token are
+  // filed under this string. A config naming the API directly still wins.
+  assert.equal(daemonUrl(null, {}), 'http://localhost:4200', 'the default drifted');
   assert.equal(daemonUrl({ url: 'https://cawdev.example/' }, {}), 'https://cawdev.example',
     'a trailing slash would file the token under a second name for one instance');
 });

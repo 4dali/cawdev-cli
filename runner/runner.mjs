@@ -35,7 +35,26 @@ import { findSecret } from '../lib/secrets.mjs';
 // --- configuration -----------------------------------------------------------
 
 const DEFAULTS = {
-  url: 'http://localhost:8091',
+  /**
+   * The platform this machine talks to when nothing says otherwise.
+   *
+   * The CONSOLE's origin, not the API's. It was `:8091` — the API direct, on
+   * the reasoning that the daemon calls `/api` and has no use for a page — and
+   * that is true of the call and wrong about everything around it.
+   *
+   * One origin is a hard constraint here: in production nginx serves the
+   * console and proxies `/api`, and `:8091` does not exist from outside at all,
+   * so the API's own port is a development-only back door and a poor thing for
+   * a default to describe. R81's session and R93's token are both filed under
+   * the URL, so a default naming one door while a person signs in at the other
+   * files a live credential under a name the daemon never looks up.
+   *
+   * The cost is stated rather than hidden: through `:4200` the daemon's calls
+   * go via the Angular dev proxy, so `ng serve` has to be up. A machine running
+   * only the API says so in its config, which is one line and the thing configs
+   * are for.
+   */
+  url: 'http://localhost:4200',
   name: 'this-machine',
   /**
    * The agent this machine spawns.

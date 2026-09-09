@@ -538,7 +538,7 @@ export function valueOf(argv, flag) {
 }
 
 export function urlFrom(argv) {
-  return (valueOf(argv, '--url') ?? process.env.CAWDEV_URL ?? 'http://localhost:8091')
+  return (valueOf(argv, '--url') ?? process.env.CAWDEV_URL ?? 'http://localhost:4200')
     .replace(/\/+$/, '');
 }
 

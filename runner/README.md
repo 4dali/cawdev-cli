@@ -16,7 +16,7 @@ Write the config — what this machine serves, and where:
 
 ```json
 {
-  "url": "http://localhost:8091",
+  "url": "http://localhost:4200",
   "name": "my-laptop",
   "projects": {
     "cawdev": "/Users/you/code/cawdev",

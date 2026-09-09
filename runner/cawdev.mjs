@@ -233,10 +233,12 @@ export async function socketToAttach(argv, ink = painter()) {
  * A third copy of a string that already exists in `runner.mjs`'s `DEFAULTS` and
  * in `attach.mjs`'s `urlFrom`, and importing either would be worse: `DEFAULTS`
  * lives in a module whose top level starts a daemon, and `urlFrom` folds in
- * `--url`, which is the very thing this must not see. `openapi.test.mjs`'s
- * neighbour pins the three in step instead.
+ * `--url`, which is the very thing this must not see. `cawdev-command.test.mjs`
+ * pins the three in step instead — it reads the three files and fails when they
+ * hold more than one value, which is what makes moving the default a
+ * three-line change rather than a two-line bug.
  */
-const DEFAULT_URL = 'http://localhost:8091';
+const DEFAULT_URL = 'http://localhost:4200';
 
 /**
  * Two URLs, because they answer two different questions.
@@ -248,12 +250,16 @@ const DEFAULT_URL = 'http://localhost:8091';
  * a token minted at one URL, filed under it, and looked for under another. A
  * live credential on the tokens page that nothing would ever read.
  *
- * They differ for an ordinary reason rather than a broken one: in development
- * the console is on `:4200` and the API it proxies to is on `:8091`. A runner
- * config naming `:8091` is right — the daemon calls `/api` directly — and a
- * browser sent there gets no sign-in page, because the console is what serves
- * one. So `--url` is how somebody says which door *they* are going through, and
- * it has no business renaming the machine.
+ * They differ for an ordinary reason rather than a broken one: a config may
+ * name the API directly — in development it is on `:8091` while the console
+ * proxying to it is on `:4200` — and a browser sent to the API gets no sign-in
+ * page, because the console is what serves one. So `--url` is how somebody says
+ * which door *they* are going through, and it has no business renaming the
+ * machine.
+ *
+ * <p>The DEFAULT is now the console's origin, which makes the two agree when
+ * nothing has been configured — but they are still two questions, and the split
+ * is what keeps a config naming `:8091` working with a browser sent to `:4200`.
  */
 export function signInUrl(file, argv, env = process.env) {
   const typed = valueOf(argv, '--url') ?? env.CAWDEV_URL;

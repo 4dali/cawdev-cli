@@ -20,7 +20,7 @@ Then in the repository the agent works in, add `.mcp.json`:
       "command": "node",
       "args": ["/path/to/cawdev/tools/mcp/server.mjs"],
       "env": {
-        "CAWDEV_URL": "http://localhost:8091",
+        "CAWDEV_URL": "http://localhost:4200",
         "CAWDEV_TOKEN": "cawd_…"
       }
     }
@@ -230,7 +230,7 @@ Two smoke tests, both driving the server over real stdio.
 
 
 ```sh
-CAWDEV_URL=http://localhost:8091 CAWDEV_TOKEN=cawd_… node tools/mcp/smoke.mjs scratch-project
+CAWDEV_URL=http://localhost:4200 CAWDEV_TOKEN=cawd_… node tools/mcp/smoke.mjs scratch-project
 ```
 
 **Name a scratch project.** The smoke test creates a roadmap entry and declines

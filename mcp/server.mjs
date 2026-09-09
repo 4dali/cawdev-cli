@@ -46,7 +46,7 @@ async function readConfig() {
   const project = process.env.CAWDEV_PROJECT ?? fromFile.values.CAWDEV_PROJECT;
 
   return {
-    url: (url ?? 'http://localhost:8091').replace(/\/+$/, ''),
+    url: (url ?? 'http://localhost:4200').replace(/\/+$/, ''),
     token,
     project,
     // Where each value came from. roadmap_where reports this, because "which

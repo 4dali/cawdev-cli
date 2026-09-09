@@ -14,7 +14,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const BASE = process.env.CAWDEV_BASE ?? 'http://localhost:8091';
+const BASE = process.env.CAWDEV_BASE ?? 'http://localhost:4200';
 const EMAIL = process.env.CAWDEV_ADMIN_EMAIL ?? 'admin@cawdev.local';
 const PASSWORD = process.env.CAWDEV_ADMIN_PASSWORD ?? 'dev-admin-password';
 
