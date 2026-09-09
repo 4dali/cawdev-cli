@@ -3620,8 +3620,22 @@ function stagePrompt(stage, carried) {
       + 'written by the plan phase and agreed. If it turns out to be wrong, say so and stop '
       + 'rather than improvising a different change: somebody approved that plan, and a '
       + 'different one has not been approved.',
-    TEST: 'Run what proves the work. Report what passed and what did not, with the output. A '
-      + 'failing test is a result, not a failure of this stage.',
+    // R129. Two honest ways to do this stage, and the project chose one. The
+    // TESTBOOK wording says "you have no tool that could" for the PLAN
+    // prompt's reason: a session that has to discover a refusal spends turns
+    // on it, and then argues with it.
+    TEST: stage.testMode === 'TESTBOOK'
+      ? 'WRITE THE TESTBOOK — do not run anything. Write `TESTBOOK.md` at the root of the '
+        + 'checkout, creating it if it is not there, and ADD A SECTION FOR THIS CARD: do not '
+        + 'rewrite or delete what is already in the file. It is the project\'s test plan and '
+        + 'not this card\'s, and somebody else\'s section is not yours to remove. For each '
+        + 'thing worth testing, say three things: what should be tested, the exact command '
+        + 'that would prove it, and what a person should see if it passed. Do not run any of '
+        + 'them — you have no shell that could, so do not spend turns discovering that. Use '
+        + '`git diff` to find out what the work actually changed. A test you could not run is '
+        + 'a line in the testbook, not a failure of this stage.'
+      : 'Run what proves the work. Report what passed and what did not, with the output. A '
+        + 'failing test is a result, not a failure of this stage.',
     MEMORY: 'Write what the NEXT session on this branch needs to know: what was done, what was '
       + 'tried and rejected and why, and anything that turned out to matter and would not be '
       + 'obvious from the diff. Be brief and concrete. This is saved as this branch\'s '
@@ -4922,7 +4936,10 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
         withSkills(
           withDelegation(typeof profileTools === 'function' ? profileTools(run) : profileTools,
             expertAgents),
-          skills))]
+          skills),
+        // R129. Only TEST reads it, and only when the project set it: a
+        // testbook stage is spawned with nothing that can run anything.
+        stage.testMode)]
     : null;
 
   const args = [
@@ -5275,7 +5292,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
           // second thing that can stop a run is a second thing that can stop it
           // wrongly.
           if (stage && recorded.kind === 'TOOL') {
-            const drifted = driftedFrom(stage.stage, recorded.body);
+            const drifted = driftedFrom(stage.stage, recorded.body, stage.testMode);
             if (drifted) {
               transcript.push({ kind: 'ERROR', body: drifted });
             }
