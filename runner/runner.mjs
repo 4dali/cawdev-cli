@@ -2672,6 +2672,18 @@ async function performWorkspaceRequest(config, request) {
     } catch (failure) {
       result = failure.message;
     }
+  } else if (request.kind === 'MERGE') {
+    // R134's button, and the only kind on this channel whose effect is not in
+    // the checkout. `gh pr merge` is a host-side operation: it resolves the
+    // pull request from this clone's remote and touches no working tree, so
+    // several branches merge safely from one directory and nothing here moves.
+    const branch = (request.message ?? '').trim();
+    if (!branch) {
+      result = 'A merge has to name a branch. Nothing was merged.';
+    } else {
+      log(`  MERGING ${branch} — asked for from the console`);
+      ({ ok, result } = await mergePullRequest(cwd, branch));
+    }
   } else {
     result = `This runner does not know how to ${request.kind}.`;
   }
@@ -2988,6 +3000,13 @@ async function openPullRequest(cwd, run, title) {
  * `--squash` because a rule-merged branch should land as one commit somebody
  * can revert, and `--delete-branch` because a branch merged by a machine is a
  * branch nobody is coming back to.
+ *
+ * R134 reaches the same function from the development board's Merge button,
+ * unchanged in what it does: a rule-merged branch and a hand-merged one should
+ * land the same way. (Worth knowing: the release convention wants a MERGE
+ * COMMIT for a release branch, because a squash rewrites the commit a tag
+ * points at. Release branches are not worked through the development board
+ * today; if that changes, this is the line that has to change with it.)
  */
 async function mergePullRequest(cwd, branch) {
   const url = await findPullRequest(cwd, branch).catch(() => null);
@@ -2999,7 +3018,11 @@ async function mergePullRequest(cwd, branch) {
   }
   const merged = await gh(cwd, ['pr', 'merge', url, '--squash', '--delete-branch']);
   if (merged.code === 0) {
-    return { ok: true, result: `${url} — squashed and merged, branch deleted.` };
+    // The URL on its own FIRST LINE — R134. The platform reads that line as the
+    // evidence a merge happened and puts it on the card as the card's `merge`
+    // field, which `MERGED` refuses to be blank. The sentence after it is for
+    // whoever reads the result as text, which is what the run-action path does.
+    return { ok: true, result: `${url}\nsquashed and merged; the branch is deleted.` };
   }
   return { ok: false, result: merged.err || merged.out || 'gh pr merge failed without saying why.' };
 }

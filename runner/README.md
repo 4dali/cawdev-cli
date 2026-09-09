@@ -402,13 +402,16 @@ than twenty-six. A machine that wants it unattended puts that string in its own
 ### What a person can ask of a checkout
 
 R57. The daemon polls `workspace-requests/claim` every few seconds and does one
-of three things to a checkout it serves:
+of six things to a checkout it serves:
 
 | | |
 |---|---|
 | `SHOW` | `git status --porcelain`, the untracked list, and `git diff HEAD`. Reads only. |
 | `STASH` | `git stash push --include-untracked`, and reports the ref to recover it by. |
 | `COMMIT` | `git add -A` and commit. `--no-verify` is not passed — a repository's hooks are its own business. |
+| `INDEX` | R77's map button: refreshes the code map, then builds the project's skill index if one is turned on. No session, no branch. |
+| `RESET` | R87's start-over, and the destructive one: `reset --hard`, `clean -fd`, then back to `origin/<branch>` — or, for a branch never pushed, onto the default branch with the branch deleted. |
+| `MERGE` | R134's Merge button on the development board: `gh pr merge <url> --squash --delete-branch` for the branch in `message`. The only kind whose effect is **not** in the checkout — it lands a branch on the host and touches no working tree, which is why several branches merge safely from one clone. The URL is reported on the result's first line, and the platform reads that line as the evidence to put on the card. |
 
 Two guards, and they are in different places on purpose. The platform checks
 that the runner is **yours**; only this process knows which directories it was
