@@ -45,9 +45,13 @@ the branch — before the first commit; finish with a PR, which puts the entry i
 `REVIEW`; move the entry to `MERGED` when that PR lands; never push work to
 `main` directly. Every release updates both this roadmap and CHANGELOG.md.
 
-A project running `require_review` moves the card to `REVIEW` itself as the
-session ends — once, and only out of `CODING`, so somebody who moves it back to
-carry on working keeps it.
+As a session ends the platform moves the *branch* — the work item on the
+development board — and not the card, which stays in development until its PR
+lands. Where the project runs `require_review` the branch goes to `REVIEW` and
+somebody is asked to read it; where it does not, the branch goes to `DONE`
+marked as a finish nobody was asked about (R132), because no reviewer was
+coming. Either way it happens once, and only out of `CODING`, so somebody who
+moves it back to carry on working keeps it.
 
 `roadmap.mjs` validates this file's shape on every push, and `--live` also
 checks that every `SHIPPED` version is a real git tag and every `CODING` or

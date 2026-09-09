@@ -61,10 +61,11 @@ The sequence is fixed, and the second step is the one people skip:
    (`roadmap_set_status`). Not after. The roadmap should be able to answer
    "what is being worked on right now" without asking anyone.
 3. Build to the entry's "Done when" list.
-4. Finish with a PR. Never push to `main`. The card belongs in `REVIEW` from
-   then on — work that is written and waiting to be read is not work somebody is
-   doing. A project running `require_review` moves it there itself as your
-   session ends.
+4. Finish with a PR. Never push to `main`. As your session ends the platform
+   moves the *branch* on the development board, not the card: to `REVIEW` where
+   the project runs `require_review` and somebody is going to read it, and to
+   `DONE` where it does not — a finish nobody was asked about (R132), because
+   there is no reviewer coming.
 5. When the PR merges, move the entry to `MERGED` naming it. The branch may then
    be deleted — `CODING` is for work somebody is doing, not work that is done.
 
