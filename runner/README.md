@@ -402,9 +402,10 @@ than twenty-six. A machine that wants it unattended puts that string in its own
 ### What a person can ask of a checkout
 
 R57. The daemon polls `workspace-requests/claim` every few seconds and does one
-of **seven** things to a checkout it serves. It said six for two entries, and
+of **eight** things to a checkout it serves. It said six for two entries, and
 `HANDOFF` had been missing from the list since R148 — a table that quietly does
-not describe one of the things a person can ask for is worse than no table.
+not describe one of the things a person can ask for is worse than no table. So
+count the rows below against that number before you trust either.
 
 | | |
 |---|---|
@@ -415,6 +416,7 @@ not describe one of the things a person can ask for is worse than no table.
 | `RESET` | R87's start-over, and the destructive one: `reset --hard`, `clean -fd`, then back to `origin/<branch>` — or, for a branch never pushed, onto the default branch with the branch deleted. |
 | `MERGE` | R134's Merge button on the development board: `gh pr merge <url> --squash --delete-branch` for the branch in `message`. The only kind whose effect is **not** in the checkout — it lands a branch on the host and touches no working tree, which is why several branches merge safely from one clone. The URL is reported on the result's first line, and the platform reads that line as the evidence to put on the card. |
 | `HANDOFF` | R148's hand-off, and the only kind addressed to a **run** rather than to a directory alone: the branch is pushed, whatever was uncommitted is packaged as a patch on its base sha, and the checkout is put back on the default branch. The next claim can then go to any machine. |
+| `TAG` | R156's release: `git ls-remote --tags origin refs/tags/<version>` for the version in `message`. **The remote, not this clone** — a local tag nobody pushed is exactly the state a release is trying to rule out, and `git tag --list` cannot tell the two apart. A read; it fetches nothing and moves no ref. The sha is reported on the result's first line, the way `MERGE` reports its URL, because the platform will not confirm a release on `ok: true` alone. **A tag that is not there yet is `ok: false` with a sentence, and that is a normal answer** — the release procedure pushes the tag last, so the first check correctly finds nothing. Addressed to a **release** rather than to a directory alone, which is why it is asked for from the roadmap board and refused on this channel. |
 
 **A `MERGE` that fails also says which KIND of failure it was** — R155, in one
 of five words beside `gh`'s own unchanged text:

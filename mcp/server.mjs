@@ -804,6 +804,14 @@ const TOOLS = [
         text: { type: 'string', description: 'What changed.' },
         version: { type: 'string' },
         breaking: { type: 'boolean' },
+        entryNumber: {
+          type: 'integer',
+          description:
+            'The roadmap card or issue this entry describes — R156. Set it. Until R156 the only '
+            + 'link was the ref you type into the prose, which cannot be queried, so a release '
+            + 'could not tell whether a card already had an entry and would write a second one '
+            + 'beside the first. Put the ref in the text as well; that is what a reader sees.',
+        },
       },
       required: ['category', 'text'],
     },
@@ -811,7 +819,7 @@ const TOOLS = [
       const slug = await resolveProject(config, args.project);
       const entry = await api(config, `/api/projects/${slug}/changelog`, {
         method: 'POST',
-        body: pick(args, ['category', 'text', 'version', 'breaking']),
+        body: pick(args, ['category', 'text', 'version', 'breaking', 'entryNumber']),
       });
       return `Added changelog entry ${entry.number} to ${entry.version}.\n\n${formatChangelogEntry(entry)}`;
     },
@@ -831,6 +839,12 @@ const TOOLS = [
         text: { type: 'string' },
         version: { type: 'string' },
         breaking: { type: 'boolean' },
+        entryNumber: {
+          type: 'integer',
+          description:
+            'The roadmap card or issue this entry describes — R156. Set it on an older entry '
+            + 'that has never been linked; omitting it leaves whatever link is already there.',
+        },
       },
       required: ['number'],
     },
@@ -838,7 +852,7 @@ const TOOLS = [
       const slug = await resolveProject(config, args.project);
       const entry = await api(config, `/api/projects/${slug}/changelog/${args.number}`, {
         method: 'PATCH',
-        body: pick(args, ['category', 'text', 'version', 'breaking']),
+        body: pick(args, ['category', 'text', 'version', 'breaking', 'entryNumber']),
       });
       return `Updated changelog entry ${entry.number}.\n\n${formatChangelogEntry(entry)}`;
     },

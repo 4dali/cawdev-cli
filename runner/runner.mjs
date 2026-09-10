@@ -2926,6 +2926,17 @@ async function performWorkspaceRequest(config, request) {
       log(`  MERGING ${branch} — asked for from the console`);
       ({ ok, result, failure: failureKind } = await mergePullRequest(cwd, branch));
     }
+  } else if (request.kind === 'TAG') {
+    // R156's release. A read: it asks the HOST whether the tag is there, so it
+    // needs a clone of the repository rather than any particular state of this
+    // working tree, and it changes nothing in either.
+    const version = (request.message ?? '').trim();
+    if (!version) {
+      result = 'A tag check has to name a version. Nothing was checked.';
+    } else {
+      log(`  checking for tag ${version} on the remote`);
+      ({ ok, result } = await tagOnTheRemote(cwd, version));
+    }
   } else {
     result = `This runner does not know how to ${request.kind}.`;
   }
@@ -3279,6 +3290,56 @@ async function mergePullRequest(cwd, branch) {
     // word beside them, never a replacement for them.
     result: merged.err || merged.out || 'gh pr merge failed without saying why.',
   };
+}
+
+/**
+ * Whether a tag exists ON THE REMOTE — R156.
+ *
+ * <p>The remote, not this clone, and the distinction is the whole point: a
+ * local tag nobody pushed is exactly the state a release is trying to rule out,
+ * and `git tag --list` cannot tell the two apart. `git ls-remote` asks the
+ * host, which is also why any clone of the repository can answer — there is
+ * nothing about this working tree that matters.
+ *
+ * <p>A read. It fetches nothing, writes nothing, and moves no ref.
+ *
+ * <p><strong>The SHA is the FIRST LINE</strong>, because the platform refuses
+ * to believe `ok: true` without evidence it can parse — the rule
+ * `WorkItemMergeService.evidenceIn` states for a merge, in the shape a tag
+ * needs. A machine's word is not evidence; the sha is.
+ *
+ * <p>A tag that is not there comes back `ok: false` with a sentence, and that
+ * is a LEGITIMATE ANSWER rather than an error: the release procedure pushes the
+ * tag last, so the first check — queued seconds after somebody presses Release
+ * — correctly finds nothing. That sentence is what a person reads mid-release.
+ */
+async function tagOnTheRemote(cwd, version) {
+  // The fully-qualified ref, so `v0.6.1` cannot match a BRANCH called v0.6.1.
+  const ref = `refs/tags/${version}`;
+  let out;
+  try {
+    out = await git(cwd, ['ls-remote', '--tags', 'origin', ref]);
+  } catch (failure) {
+    // No remote, no network, no permission. Said as it was said: this daemon
+    // has no more idea than the platform which of those it was, and inventing
+    // a classification would be inventing one.
+    return { ok: false, result: `Could not ask the remote about ${version}: ${failure.message}` };
+  }
+
+  // `ls-remote` prints "<sha><TAB><ref>" per line, and nothing at all when the
+  // tag is absent — an empty answer with exit 0, which is why an absent tag
+  // cannot be told from a failure by the exit code.
+  const lines = out.split('\n').map((each) => each.trim()).filter(Boolean);
+  // An annotated tag also answers `refs/tags/<v>^{}` — the commit it points at.
+  // Either is proof the tag is on the remote; the plain ref is preferred, so the
+  // sha reported is the TAG's, which is what `git show <v>` resolves.
+  const line = lines.find((each) => each.endsWith(`\t${ref}`)) ?? lines[0];
+  const sha = line ? line.split(/\s+/)[0] : null;
+
+  if (!sha) {
+    return { ok: false, result: `There is no tag ${version} on the remote yet.` };
+  }
+  return { ok: true, result: `${sha}\n${version} is on the remote.` };
 }
 
 /**
