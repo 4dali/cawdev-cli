@@ -402,7 +402,9 @@ than twenty-six. A machine that wants it unattended puts that string in its own
 ### What a person can ask of a checkout
 
 R57. The daemon polls `workspace-requests/claim` every few seconds and does one
-of six things to a checkout it serves:
+of **seven** things to a checkout it serves. It said six for two entries, and
+`HANDOFF` had been missing from the list since R148 — a table that quietly does
+not describe one of the things a person can ask for is worse than no table.
 
 | | |
 |---|---|
@@ -412,6 +414,25 @@ of six things to a checkout it serves:
 | `INDEX` | R77's map button: refreshes the code map, then builds the project's skill index if one is turned on. No session, no branch. |
 | `RESET` | R87's start-over, and the destructive one: `reset --hard`, `clean -fd`, then back to `origin/<branch>` — or, for a branch never pushed, onto the default branch with the branch deleted. |
 | `MERGE` | R134's Merge button on the development board: `gh pr merge <url> --squash --delete-branch` for the branch in `message`. The only kind whose effect is **not** in the checkout — it lands a branch on the host and touches no working tree, which is why several branches merge safely from one clone. The URL is reported on the result's first line, and the platform reads that line as the evidence to put on the card. |
+| `HANDOFF` | R148's hand-off, and the only kind addressed to a **run** rather than to a directory alone: the branch is pushed, whatever was uncommitted is packaged as a patch on its base sha, and the checkout is put back on the default branch. The next claim can then go to any machine. |
+
+**A `MERGE` that fails also says which KIND of failure it was** — R155, in one
+of five words beside `gh`'s own unchanged text:
+
+| | |
+|---|---|
+| `CONFLICT` | `gh pr view --json mergeable` says `CONFLICTING`. The one an agent can do something about, and the only failure the console offers **Merge with an agent** on. |
+| `NO_PULL_REQUEST` | There is nothing on the host to merge. R134 already named this case; it now has a word. |
+| `NOT_PERMITTED` | 403, a protected branch, a required review or a required status check. The host said no, and it will say no again. |
+| `UNREACHABLE` | No `gh`, or the host could not be reached at all. Nothing is known about the pull request. |
+| `OTHER` | Anything else — **including `mergeable: UNKNOWN`**, which GitHub answers when it has not computed mergeability yet. Unknown is not "no conflict", and reading it as one is the single way this feature would disappear silently. |
+
+The classification is made **here**, on the machine, and never by the platform:
+the platform has no `gh` and parsing this text would make it a platform with an
+opinion about a git version it does not run. A daemon older than R155 sends no
+word at all, which the platform stores as null and the console reads as
+*unknown* — offering the agent merge anyway, because being wrong there costs one
+`git fetch`.
 
 Two guards, and they are in different places on purpose. The platform checks
 that the runner is **yours**; only this process knows which directories it was

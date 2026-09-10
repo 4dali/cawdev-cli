@@ -50,6 +50,14 @@ export async function fakePlatform({
   workflow = [],
   shield = null,
   gateDecision = null,
+  /**
+   * R40's finish rules, as the claim carries them — R155 needs them.
+   *
+   * Null is a platform older than R40, which the daemon handles by doing
+   * nothing. `{ agentMergeLands: true }` is the one that changes a spawn: a
+   * merge session that must not stall is not handed the tools that stall it.
+   */
+  rules = null,
   brief = {
     path: 'docs/brief',
     index: 'docs/brief/README.md',
@@ -64,6 +72,8 @@ export async function fakePlatform({
   const pending = [...workspaceRequests];
   /** What the daemon said it did, so a test can read the stash ref back. */
   const finishedRequests = [];
+  /** R155: what a merge run's machine reported, in the order it reported it. */
+  const mergeReports = [];
   /** Session ids the daemon reported off the CLI's `init` event — R69. */
   const sessionIds = [];
   /**
@@ -148,7 +158,17 @@ export async function fakePlatform({
           workflow,
           shield,
           brief,
+          rules,
         }));
+      }
+      // R155. What the machine found when it merged, and what it left behind.
+      if (url.includes('/merge/prepared') || url.includes('/merge/resolved')) {
+        mergeReports.push({
+          runId: url.split('/runs/')[1]?.split('/')[0],
+          kind: url.endsWith('/merge/prepared') ? 'prepared' : 'resolved',
+          ...JSON.parse(body),
+        });
+        return response.end('{}');
       }
       if (url.endsWith('/session') && request.method === 'POST') {
         sessionIds.push({
@@ -309,6 +329,7 @@ export async function fakePlatform({
     seen,
     transitions,
     finishedRequests,
+    mergeReports,
     sessionIds,
     outputs,
     usage,

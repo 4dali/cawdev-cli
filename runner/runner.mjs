@@ -1421,6 +1421,159 @@ async function prepareWorkingCopy(path, branch, defaultBranch, allowDirty) {
   };
 }
 
+/**
+ * Merges the default branch into this branch, before anything is spawned — R155.
+ *
+ * `prepareWorkingCopy`'s sibling, and it runs straight after it. This is the
+ * load-bearing part of the whole feature and the reason a merge session can be
+ * narrowed at all: **the daemon does the `git merge` itself.** After it, `git
+ * diff --name-only --diff-filter=U` is the conflicted set, and that set is the
+ * session's entire write scope. A session cannot edit a file git did not put a
+ * conflict marker in, so "it resolves the conflict and nothing else" is a
+ * permission rather than a hope.
+ *
+ * **A merge commit, never a rebase.** R134 lands with `--squash`, so the extra
+ * commit is collapsed away and never appears on the default branch; a
+ * force-push would detach the review comments on a pull request somebody has
+ * already approved, and branch protection can refuse it outright. And the
+ * resolution stays readable: a merge commit is a diff on the pull request that
+ * anybody can open and check, where a rebase smears it into rewritten commits
+ * that cannot be diffed. The card's own condition is that a merge nobody can
+ * read afterwards is too frightening to turn on.
+ *
+ * A clean merge is reported and NOT a failure. It is what happens whenever the
+ * action was offered on a `gh pr merge` failure that was not really a conflict
+ * — an older runner that did not say why — and it is the property that makes
+ * being wrong there cost a fetch rather than a model.
+ */
+async function prepareMerge(cwd, branch, defaultBranch) {
+  const base = defaultBranch || 'main';
+  await git(cwd, ['fetch', '--prune', 'origin']).catch((failure) => {
+    log(`  fetch skipped: ${failure.message.split('\n')[0]}`);
+  });
+
+  // `origin/<base>` or, in a checkout with no remote, the local branch. The
+  // same fallback `prepareWorkingCopy` makes, for the same reason: a repository
+  // with no remote is legitimate for local experiments.
+  const into = await git(cwd, ['rev-parse', '--verify', `origin/${base}`])
+    .then(() => `origin/${base}`)
+    .catch(() => base);
+
+  let clean = true;
+  try {
+    await git(cwd, ['merge', '--no-edit', into]);
+  } catch (failure) {
+    clean = false;
+    log(`  ${into} did not merge cleanly: ${failure.message.split('\n')[0]}`);
+  }
+
+  // Asked even on the clean path. `git merge` can exit non-zero for reasons
+  // that are not conflicts at all — an unrelated history, a hook — and a run
+  // spawned with an EMPTY write scope on the strength of a non-zero exit would
+  // be a session that can do nothing and cannot say why.
+  const conflicted = await git(cwd, ['diff', '--name-only', '--diff-filter=U'])
+    .then((said) => said.split('\n').map((line) => line.trim()).filter(Boolean))
+    .catch(() => []);
+
+  if (!clean && !conflicted.length) {
+    // Nothing to resolve and the merge did not go through. Left for the run's
+    // own failure path to report — inventing a resolution scope here would be
+    // spawning a session to fix something it has no tool for.
+    throw new Error(
+      `${into} could not be merged into ${branch}, and git reported no conflicted files. `
+      + 'This is not something a session can resolve; look at the checkout by hand.');
+  }
+
+  return {
+    clean: clean && !conflicted.length,
+    conflicted,
+    into,
+    head: await git(cwd, ['rev-parse', 'HEAD']).catch(() => null),
+  };
+}
+
+/**
+ * What the session left behind — R155, and it is judged strictly.
+ *
+ * `pushed` is false unless the tree has no conflict markers left AND the push
+ * succeeded. A session that gave up is a FINISHED run with an unresolved tree,
+ * and giving up is what the prompt asks for when the right side is not
+ * knowable; reporting it as success would land conflict markers, which is the
+ * one way this feature could do real damage.
+ */
+async function finishMerge(cwd, branch) {
+  const stillConflicted = await git(cwd, ['diff', '--name-only', '--diff-filter=U'])
+    .then((said) => said.split('\n').map((line) => line.trim()).filter(Boolean))
+    .catch(() => []);
+  if (stillConflicted.length) {
+    log(`  the tree still has conflict markers in ${stillConflicted.length} file(s)`);
+    return { pushed: false, mergeCommit: null, files: stillConflicted };
+  }
+
+  // Anything left staged or unstaged is the resolution not committed. Committed
+  // here rather than refused: the session was told to commit, and a resolution
+  // that exists on disk and not in a commit is work about to be thrown away by
+  // the next `resetWorkspace`.
+  const dirty = await git(cwd, ['status', '--porcelain']).catch(() => '');
+  if (dirty) {
+    await git(cwd, ['add', '-A']).catch(() => null);
+    await git(cwd, ['commit', '--no-edit'])
+      .catch(() => git(cwd, ['commit', '-m', `Merge into ${branch}`]))
+      .catch((failure) => log(`  could not commit the resolution: ${failure.message.split('\n')[0]}`));
+  }
+
+  const pushed = await pushBranch(cwd, branch);
+  if (!pushed.ok) {
+    log(`  could not push ${branch}: ${pushed.result.split('\n')[0]}`);
+  }
+  return {
+    pushed: pushed.ok,
+    mergeCommit: await git(cwd, ['rev-parse', 'HEAD']).catch(() => null),
+    files: [],
+  };
+}
+
+/**
+ * Reports what became of a merge run's branch, and ends the run — R155.
+ *
+ * <p>Both spawned and unspawned merges come through here, which is the point:
+ * a clean merge and a resolved one leave the same two facts behind — did
+ * something reach the remote, and what is the commit — and the platform reads
+ * them the same way. The only difference is that one of them had a session and
+ * a summary to quote.
+ *
+ * <p>Reported BEFORE the run is finished where the daemon controls the ending,
+ * and after where the session ended itself. The platform waits for whichever
+ * arrives second; see `RunService.settleAgentMerge`.
+ */
+async function finishTheMerge(config, run, cwd, branch, said) {
+  const left = await finishMerge(cwd, branch);
+  log(left.pushed
+    ? `  ${branch} pushed at ${String(left.mergeCommit ?? '').slice(0, 7)}`
+    : `  nothing was pushed: the conflict on ${branch} is still there`);
+
+  await api(config, `/api/runners/${config.runnerId}/runs/${run.id}/merge/resolved`, {
+    method: 'POST',
+    body: {
+      pushed: left.pushed,
+      mergeCommit: left.mergeCommit,
+      files: left.files,
+      resolution: said ? capped(said) : null,
+    },
+  }).catch((failure) => log(`  could not report the resolution: ${failure.message}`));
+
+  // Only where nothing else will. A session that ended itself with `report
+  // done` has already moved the run, and finishing it again would be refused by
+  // the state machine and logged as a failure that did not happen.
+  const current = await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}`)
+    .catch(() => null);
+  if (current?.live) {
+    await finish(config, run, left.pushed ? 'FINISHED' : 'FAILED', left.pushed
+      ? `Merged and pushed ${branch}.`
+      : `The conflict on ${branch} was not resolved; nothing was pushed.`);
+  }
+}
+
 /** At most this many paths travel in a heartbeat; the count still tells the truth. */
 const SURVEY_FILE_CAP = 20;
 
@@ -2609,6 +2762,10 @@ async function performWorkspaceRequest(config, request) {
   const cwd = request.path;
   let ok = false;
   let result;
+  // R155. Which KIND of failure, on a MERGE. Named apart from the `failure`
+  // that every `catch` in this function binds — the shadowing would compile and
+  // report the wrong thing.
+  let failureKind = null;
 
   try {
     await access(join(cwd, '.git'));
@@ -2767,21 +2924,24 @@ async function performWorkspaceRequest(config, request) {
       result = 'A merge has to name a branch. Nothing was merged.';
     } else {
       log(`  MERGING ${branch} — asked for from the console`);
-      ({ ok, result } = await mergePullRequest(cwd, branch));
+      ({ ok, result, failure: failureKind } = await mergePullRequest(cwd, branch));
     }
   } else {
     result = `This runner does not know how to ${request.kind}.`;
   }
 
-  await reportWorkspaceRequest(config, request, ok, result);
+  await reportWorkspaceRequest(config, request, ok, result, failureKind);
 }
 
-function reportWorkspaceRequest(config, request, ok, result) {
+function reportWorkspaceRequest(config, request, ok, result, failure = null) {
   return api(
     config,
     `/api/runners/${config.runnerId}/workspace-requests/${request.id}/finished`,
-    { method: 'POST', body: { ok, result: capped(result) } },
-  ).catch((failure) => log(`  could not report the workspace request: ${failure.message}`));
+    // `failure` is R155's and is only ever sent beside a refusal. A platform
+    // older than R155 ignores the extra field, which is how every other widening
+    // on this channel has been done.
+    { method: 'POST', body: { ok, result: capped(result), failure: ok ? null : failure } },
+  ).catch((problem) => log(`  could not report the workspace request: ${problem.message}`));
 }
 
 /**
@@ -3098,6 +3258,7 @@ async function mergePullRequest(cwd, branch) {
   if (!url || url.includes('/compare/')) {
     return {
       ok: false,
+      failure: 'NO_PULL_REQUEST',
       result: 'There is no pull request for this branch to merge. Nothing was merged.',
     };
   }
@@ -3107,9 +3268,65 @@ async function mergePullRequest(cwd, branch) {
     // evidence a merge happened and puts it on the card as the card's `merge`
     // field, which `MERGED` refuses to be blank. The sentence after it is for
     // whoever reads the result as text, which is what the run-action path does.
-    return { ok: true, result: `${url}\nsquashed and merged; the branch is deleted.` };
+    return { ok: true, failure: null, result: `${url}\nsquashed and merged; the branch is deleted.` };
   }
-  return { ok: false, result: merged.err || merged.out || 'gh pr merge failed without saying why.' };
+  return {
+    ok: false,
+    // R155. WHICH kind of failure, so the console can offer Merge with an agent
+    // on the one an agent can fix and stay quiet on the three it cannot.
+    failure: await classifyMergeFailure(cwd, url, merged),
+    // Unchanged: `gh`'s own words still reach the card. The classification is a
+    // word beside them, never a replacement for them.
+    result: merged.err || merged.out || 'gh pr merge failed without saying why.',
+  };
+}
+
+/**
+ * Why `gh pr merge` said no — R155, in one of five words.
+ *
+ * <p>**On the runner, deliberately.** `WorkspaceRequestService`'s javadoc
+ * already argues that a platform parsing this text would be a platform with an
+ * opinion about a git version it does not run. This machine has `gh`, so it can
+ * simply ask it rather than reading its prose.
+ *
+ * <p>`mergeable: CONFLICTING` is the documented field and is what decides it.
+ * **`UNKNOWN` is treated as unknown and not as "no conflict"**, which matters
+ * more than it looks: GitHub computes mergeability lazily, so a pull request
+ * nobody has looked at recently answers UNKNOWN, and reading that as "not a
+ * conflict" is the one way this feature disappears silently. Unknown comes back
+ * as OTHER, and the console offers the action for OTHER for the same reason it
+ * offers it for a null — the cost of being wrong is one `git fetch`.
+ */
+async function classifyMergeFailure(cwd, url, merged) {
+  // No process at all, or the host was unreachable. `gh()` reports a spawn
+  // error as code -1, which covers "gh is not installed" as well.
+  if (merged.code === -1 || /ENOTFOUND|ECONNREFUSED|ETIMEDOUT|could not resolve host|network is unreachable/i
+      .test(`${merged.err} ${merged.out}`)) {
+    return 'UNREACHABLE';
+  }
+  if (/\b403\b|not authorized|permission|protected branch|required status check|review required/i
+      .test(`${merged.err} ${merged.out}`)) {
+    return 'NOT_PERMITTED';
+  }
+
+  // The house style for asking gh a question — the same `--json` shape the merge
+  // pass already parses. A failure to answer is not an answer, so it falls
+  // through to OTHER rather than inventing one.
+  const asked = await gh(cwd, ['pr', 'view', url, '--json', 'mergeable,mergeStateStatus']);
+  if (asked.code === 0) {
+    try {
+      const view = JSON.parse(asked.out || '{}');
+      if (view.mergeable === 'CONFLICTING' || view.mergeStateStatus === 'DIRTY') {
+        return 'CONFLICT';
+      }
+      if (view.mergeStateStatus === 'BLOCKED') {
+        return 'NOT_PERMITTED';
+      }
+    } catch {
+      // gh answered with something that is not JSON. Nothing to read.
+    }
+  }
+  return 'OTHER';
 }
 
 /**
@@ -3468,6 +3685,65 @@ function briefWrites(run) {
 }
 
 /**
+ * What a MERGE session may write, and nothing else — R155.
+ *
+ * `briefWrites`' shape, narrowed per RUN rather than per profile, and that is
+ * the whole idea: the daemon has already done the `git merge` by the time this
+ * is called, so the list is the files git actually put conflict markers in on
+ * THIS branch on THIS attempt. A session cannot edit a file git did not
+ * conflict on, and "the agent resolves the conflict and nothing else" is a
+ * permission rather than a sentence in a prompt.
+ *
+ * Both verbs for `briefWrites`' stated reason. A conflicted file always exists,
+ * so `Edit` is the one that matters — `Write` is here because a resolution that
+ * rewrites a file whole is a legitimate resolution and discovering it cannot
+ * costs the session a turn and a refusal.
+ *
+ * An empty list is not a fallback to "anything": a run with nothing conflicted
+ * never gets here, because the daemon finishes it without spawning.
+ */
+function conflictedWrites(run) {
+  const files = Array.isArray(run?.conflictedFiles) ? run.conflictedFiles : [];
+  return files.flatMap((path) => [`Write(${path})`, `Edit(${path})`]);
+}
+
+/**
+ * Everything under `mcp__cawdev__` that WAITS ON A PERSON.
+ *
+ * `CAWDEV_READS` holds all five, correctly — asking somebody something changes
+ * nothing, so they are reads. This is a second, narrower question asked of the
+ * same names: which of them park the run until somebody answers.
+ */
+const CAWDEV_WAITS_ON_A_PERSON = [
+  'mcp__cawdev__ask_user',
+  'mcp__cawdev__await_answer',
+  'mcp__cawdev__ask_group',
+  'mcp__cawdev__await_group',
+  'mcp__cawdev__await_more_rounds',
+];
+
+/**
+ * The cawdev tools a merge session gets — R155.
+ *
+ * The read-only set, minus the ones that wait on a person **when the project's
+ * rule says the resolution lands by itself**. A session that must not stall
+ * should not be handed the tools that stall it, and one that must ask should not
+ * be relied on to remember to — so the prompt says which of the two it is and
+ * the permissions agree with the prompt.
+ *
+ * A subtraction rather than an addition, and that is not a detail: `ask_user`
+ * and `await_answer` are already IN `READ_ONLY_CAWDEV`, so adding them would be
+ * a no-op and the "absent when it lands" half would silently never hold. Which
+ * is exactly what the first draft of this did, and what
+ * `agent-merge.test.mjs` caught.
+ */
+function mergeCawdevTools(run) {
+  return run?.rules?.agentMergeLands
+    ? READ_ONLY_CAWDEV.filter((tool) => !CAWDEV_WAITS_ON_A_PERSON.includes(tool))
+    : READ_ONLY_CAWDEV;
+}
+
+/**
  * The tool a session delegates with — R104, and the reason its experts were
  * never reached.
  *
@@ -3608,6 +3884,29 @@ const PROFILE_TOOLS = {
   // not to is one refusal away from rewriting it. `Bash(git *)` is on the same
   // grounds as CODE's — the prompt tells it to commit, so the permissions must
   // let it — and it is git and nothing else.
+  // R155. The narrowest list in this file, and the only one computed from what
+  // happened on THIS run rather than from what the profile is.
+  //
+  // Read everything, `git` in full — the prompt tells it to commit and push, so
+  // the permissions must let it — and `Write`/`Edit` for the conflicted files
+  // and NOTHING ELSE. There is no `gh`, in any form: `Bash(git *)` cannot reach
+  // it, and that is what makes "it cannot land its own resolution" true rather
+  // than merely asked for. Whether the resolution lands is the PLATFORM's, from
+  // the project's rule, through R134's existing merge request.
+  //
+  // `roadmap_comment` is absent too, and deliberately: what the session chose is
+  // written onto the card by the platform from the run's own summary, which is
+  // R108's argument — a session that should not be doing its own bookkeeping
+  // should not be handed a writer to do it with.
+  //
+  // And whether it may ASK a person is the project's `agent_merge_lands` rule,
+  // applied by subtraction in `mergeCawdevTools`.
+  MERGE: (run) => [
+    ...mergeCawdevTools(run),
+    ...READ_FILES,
+    'Bash(git *)',
+    ...conflictedWrites(run),
+  ],
   INTERVIEW: (run) => [
     ...READ_ONLY_CAWDEV,
     'mcp__cawdev__ask_group',
@@ -3840,6 +4139,65 @@ did with \`report\` kind "done".
 They asked:
 
 ${run.openingPrompt}`;
+  }
+
+  if (run.profile === 'MERGE') {
+    const files = Array.isArray(run.conflictedFiles) ? run.conflictedFiles : [];
+    const list = files.map((path) => `- \`${path}\``).join('\n');
+    // Whether it may ask. The same fact `PROFILE_TOOLS.MERGE` reads, said out
+    // loud here — a session handed `ask_user` and not told it exists will not
+    // use it, and one told to ask that has not got it will spend a turn finding
+    // out.
+    const waits = !run.rules?.agentMergeLands;
+
+    return `You are resolving a **merge conflict** on branch \`${run.branch}\`, in the cawdev
+platform. The default branch has been merged into it and git could not reconcile
+${files.length === 1 ? 'one file' : `${files.length} files`}:
+
+${list}
+
+**Resolve those files and nothing else.** They are the only files you can write
+to — that is a permission, not a request, so do not spend turns discovering it.
+You have no \`gh\`: you cannot open, merge or close a pull request, and you are
+not supposed to. Pushing the branch is the whole of your job.
+
+**What this is.** Two versions of lines somebody has ALREADY REVIEWED. This card
+is DONE: a person read the work and accepted it, and so did whoever wrote what is
+on the default branch. Your job is to say what both of them meant, together.
+
+**What this is not.** Do not improve the code. Do not take the opportunity to
+refactor. Do not write the feature the conflict revealed was missing. Do not
+touch a file that is not in the list above. Every one of those turns a merge
+somebody can read into a change somebody has to review, which is the thing this
+session exists to avoid.
+
+**How to work.** Read both sides of each conflict and read enough around them to
+know what each was for — \`git log\`, \`git diff\` and the cards are all yours.
+Then remove the markers and leave the file saying what both changes meant. When
+every file is done: \`git add\` them, \`git commit\`, and \`git push\`. An
+ordinary push — never \`--force\`, which would detach the review comments on a
+pull request somebody has already approved.
+
+**If you cannot tell which side is right, stop.** Call \`report\` with kind
+"blocked" and say exactly which file, which hunk, and what the two sides disagree
+about. **That is the preferred outcome, not a failure.** A conflict a person
+spends five minutes on is cheap; a resolution that compiles and is wrong reaches
+the default branch and is not. Nothing is re-run here and nothing tests what you
+merged, so guessing is not a risk you are entitled to take on somebody else's
+behalf.
+${waits ? `
+**Your resolution will not land by itself.** This project's rule says a resolved
+conflict waits to be read. When you are done, use \`ask_user\` to show what you
+chose — name each file and say in a sentence what you did with it — and
+\`await_answer\` to wait. Answering is what lands the branch.
+` : `
+**Your resolution will land.** This project's rule says a resolved conflict
+merges by itself once you have pushed it. Nobody will read it first. Hold
+yourself to that: if you are not sure, stop and say so instead.
+`}
+Report what you did with \`report\` kind "done" — name every file and say what you
+chose in each. That text goes on the card, and it is how anybody finds out how
+this was resolved without opening your transcript.`;
   }
 
   if (run.profile === 'INTERVIEW') {
@@ -4426,6 +4784,8 @@ async function startRun(config, offered, workspace) {
   let plan = null;
   let lifecycle = [];
   let shield = null;
+  // R155. What `git merge` did before anything was spawned, on a MERGE run.
+  let merge = null;
 
   try {
     log(`claiming ${run.projectSlug} ${run.label} on ${run.branch}`);
@@ -4447,6 +4807,11 @@ async function startRun(config, offered, workspace) {
     // said out loud here so that whoever is watching this log finds out BEFORE
     // the surprise rather than after it — particularly the last one.
     announceRules(claimed.rules);
+    // R155. `PROFILE_TOOLS.MERGE` reads `agentMergeLands` off the run to decide
+    // whether the session is handed the tools that let it ask a person. A
+    // session that must not stall should not have the tool that stalls it, and
+    // one that must ask should not be relied on to remember to.
+    run.rules = claimed.rules ?? null;
     // R69. Whether this is the same conversation picked back up, and which one.
     // Null on an ordinary claim, which is nearly all of them.
     resume = claimed.resume ?? null;
@@ -4534,6 +4899,20 @@ async function startRun(config, offered, workspace) {
         briefing = briefing ? `${said}\n\n${briefing}` : said;
         baseCommit = await git(resolve(path), ['rev-parse', 'HEAD']).catch(() => baseCommit);
       }
+      if (run.profile === 'MERGE') {
+        // R155. The daemon does the merge, BEFORE anything is spawned, and what
+        // git conflicts on becomes the session's whole write scope. A clean
+        // merge needs no session at all and gets none.
+        merge = await prepareMerge(resolve(path), branch, defaultBranch);
+        run.conflictedFiles = merge.conflicted;
+        log(merge.clean
+          ? `  ${merge.into} merged into ${branch} with no conflict — nothing to resolve`
+          : `  ${merge.conflicted.length} file(s) conflicted: ${merge.conflicted.join(', ')}`);
+        await api(config, `/api/runners/${config.runnerId}/runs/${run.id}/merge/prepared`, {
+          method: 'POST',
+          body: { clean: merge.clean, conflictedFiles: merge.conflicted, base: merge.head },
+        }).catch((failure) => log(`  could not report the merge: ${failure.message}`));
+      }
     }
     log(`  working copy ${path} is on ${branch}`);
 
@@ -4547,8 +4926,26 @@ async function startRun(config, offered, workspace) {
       body: { state: 'RUNNING', workspace: workspace ?? null },
     });
 
-    await walkLifecycle(config, run, runToken, resolve(path), baseCommit, workspace, resume,
-        mcpServers, expertAgents, skills, instincts, briefing, plan, lifecycle, shield);
+    if (merge?.clean) {
+      // R155. Nothing conflicted, so there is nothing for a session to decide
+      // and none is spawned. The merge commit still has to reach the remote —
+      // it is what the pull request will show and what the platform reads as
+      // evidence there is a resolution to land — so it is pushed and reported
+      // exactly as a resolved one is, and the run ends here.
+      await finishTheMerge(config, run, resolve(path), branch, null);
+      return;
+    }
+
+    const said = await walkLifecycle(config, run, runToken, resolve(path), baseCommit, workspace,
+        resume, mcpServers, expertAgents, skills, instincts, briefing, plan, lifecycle, shield);
+
+    if (merge) {
+      // R155. The session has gone. Whether it resolved anything is a question
+      // about the TREE and the REMOTE, not about how the process exited or what
+      // it said — a session that reports done over a tree full of conflict
+      // markers is exactly the case this must not believe.
+      await finishTheMerge(config, run, resolve(path), branch, said?.text ?? null);
+    }
   } catch (failure) {
     // Anything that goes wrong before or during the spawn is the run's failure,
     // and the reason belongs on the run where someone will see it.
@@ -4576,7 +4973,11 @@ async function startRun(config, offered, workspace) {
  * that is decided in PROFILE_TOOLS rather than here.
  */
 function writesCodeProfile(run) {
-  return !run.profile || run.profile === 'CODE' || run.profile === 'INTERVIEW';
+  // R155: a MERGE does too, and needs it more literally than any of them — the
+  // conflict is IN a working copy and there is nowhere else to resolve one. The
+  // platform draws the same line in `RunProfile.writesCode()`.
+  return !run.profile || run.profile === 'CODE' || run.profile === 'INTERVIEW'
+    || run.profile === 'MERGE';
 }
 
 /**
