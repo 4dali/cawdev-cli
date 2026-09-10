@@ -247,38 +247,32 @@ test('a merge that comes out clean spawns nothing at all', async (t) => {
   assert.ok(resolved.mergeCommit, 'a clean merge reported no commit');
 });
 
-test('the tools that let a session ask a person are there when the rule says wait', async (t) => {
-  const path = await aRepositoryThatConflicts();
-  const { said } = await daemonWith(t, {
-    path, name: 'agent-merge-waits', rules: { agentMergeLands: false },
+test('a merge session is never handed the tools that ask a person, whatever the rule says',
+  async (t) => {
+    // i167. R155 handed `ask_user` to a session whose resolution waited to be
+    // read, and told it to ask. The person answered "land it" and nothing read
+    // the answer: the platform had not asked the question, so it could not
+    // recognise the reply. The platform asks now, on the run, once the session
+    // has pushed and ended — so a session that could still ask would put a
+    // SECOND question in the inbox whose answer lands nothing.
+    for (const agentMergeLands of [false, true]) {
+      const path = await aRepositoryThatConflicts();
+      const { said } = await daemonWith(t, {
+        path, name: `agent-merge-${agentMergeLands ? 'lands' : 'waits'}`,
+        rules: { agentMergeLands },
+      });
+
+      assert.ok(await until(said, /spawning:/), said());
+      const tools = spawnedTools(said());
+      assert.ok(!tools.includes('mcp__cawdev__ask_user'),
+        `a merge session (lands=${agentMergeLands}) was given ask_user:\n${tools.join(' ')}`);
+      assert.ok(!tools.includes('mcp__cawdev__await_answer'),
+        `a merge session (lands=${agentMergeLands}) was given await_answer:\n${tools.join(' ')}`);
+      // Still a reader of the platform: the cards and the task are its context.
+      assert.ok(tools.includes('mcp__cawdev__roadmap_get'),
+        `a merge session lost its read-only cawdev tools:\n${tools.join(' ')}`);
+    }
   });
-
-  assert.ok(await until(said, /spawning:/), said());
-  const tools = spawnedTools(said());
-  // A session that MUST ask should not be relied on to remember to, so it is
-  // handed the tools and told about them.
-  assert.ok(tools.includes('mcp__cawdev__ask_user'),
-    `a waiting merge session could not ask:\n${tools.join(' ')}`);
-  assert.ok(tools.includes('mcp__cawdev__await_answer'),
-    `a waiting merge session could not wait for the answer:\n${tools.join(' ')}`);
-});
-
-test('and absent when the rule says the resolution lands by itself', async (t) => {
-  const path = await aRepositoryThatConflicts();
-  const { said } = await daemonWith(t, {
-    path, name: 'agent-merge-lands', rules: { agentMergeLands: true },
-  });
-
-  assert.ok(await until(said, /spawning:/), said());
-  const tools = spawnedTools(said());
-  // A session that must NOT stall should not be handed the tool that stalls it.
-  // With the rule on there is nobody waiting to be asked, and a question in an
-  // inbox nobody is watching is a run parked for ever.
-  assert.ok(!tools.includes('mcp__cawdev__ask_user'),
-    `a landing merge session was given the tool that stalls it:\n${tools.join(' ')}`);
-  assert.ok(!tools.includes('mcp__cawdev__await_answer'),
-    `a landing merge session was given await_answer:\n${tools.join(' ')}`);
-});
 
 // --- the classification: why a merge failed ----------------------------------
 

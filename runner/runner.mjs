@@ -3784,24 +3784,28 @@ const CAWDEV_WAITS_ON_A_PERSON = [
 ];
 
 /**
- * The cawdev tools a merge session gets — R155.
+ * The cawdev tools a merge session gets — R155, narrowed by i167.
  *
- * The read-only set, minus the ones that wait on a person **when the project's
- * rule says the resolution lands by itself**. A session that must not stall
- * should not be handed the tools that stall it, and one that must ask should not
- * be relied on to remember to — so the prompt says which of the two it is and
- * the permissions agree with the prompt.
+ * The read-only set, minus the ones that wait on a person — WHATEVER the
+ * project's rule says. R155 handed `ask_user` to a session whose resolution
+ * waited to be read, and told it to ask; the person answered "land it" and
+ * nothing read the answer, because the platform had not asked the question. The
+ * platform asks now, on the run, once the session has pushed and ended, and
+ * recognises its own question's answer. A session that could still ask would
+ * produce a second question beside that one, in an inbox, with an answer that
+ * lands nothing — which is the bug wearing a different sentence.
  *
  * A subtraction rather than an addition, and that is not a detail: `ask_user`
  * and `await_answer` are already IN `READ_ONLY_CAWDEV`, so adding them would be
- * a no-op and the "absent when it lands" half would silently never hold. Which
- * is exactly what the first draft of this did, and what
- * `agent-merge.test.mjs` caught.
+ * a no-op and the absence would silently never hold. Which is exactly what the
+ * first draft of this did, and what `agent-merge.test.mjs` caught.
+ *
+ * Takes the run for the same reason `PROFILE_TOOLS.MERGE` passes it: the
+ * signature is the seam the test exercises, and a rule that stops mattering
+ * here is not a rule that stops being sent.
  */
 function mergeCawdevTools(run) {
-  return run?.rules?.agentMergeLands
-    ? READ_ONLY_CAWDEV.filter((tool) => !CAWDEV_WAITS_ON_A_PERSON.includes(tool))
-    : READ_ONLY_CAWDEV;
+  return READ_ONLY_CAWDEV.filter((tool) => !CAWDEV_WAITS_ON_A_PERSON.includes(tool));
 }
 
 /**
@@ -4205,10 +4209,12 @@ ${run.openingPrompt}`;
   if (run.profile === 'MERGE') {
     const files = Array.isArray(run.conflictedFiles) ? run.conflictedFiles : [];
     const list = files.map((path) => `- \`${path}\``).join('\n');
-    // Whether it may ask. The same fact `PROFILE_TOOLS.MERGE` reads, said out
-    // loud here — a session handed `ask_user` and not told it exists will not
-    // use it, and one told to ask that has not got it will spend a turn finding
-    // out.
+    // Whether the resolution waits to be read. Said so the session knows what
+    // happens after it pushes — and ONLY that. i167: the session used to be
+    // told to `ask_user` here and wait for the answer, and the answer landed
+    // nothing, because a question the platform did not ask is a question it
+    // cannot recognise the answer to. The platform asks now, once the run has
+    // ended and the machine has reported; the session pushes and reports.
     const waits = !run.rules?.agentMergeLands;
 
     return `You are resolving a **merge conflict** on branch \`${run.branch}\`, in the cawdev
@@ -4248,9 +4254,10 @@ merged, so guessing is not a risk you are entitled to take on somebody else's
 behalf.
 ${waits ? `
 **Your resolution will not land by itself.** This project's rule says a resolved
-conflict waits to be read. When you are done, use \`ask_user\` to show what you
-chose — name each file and say in a sentence what you did with it — and
-\`await_answer\` to wait. Answering is what lands the branch.
+conflict waits to be read. Once you have pushed and reported, the platform puts
+what you chose in front of the person who started this, in their inbox, and
+their answer is what lands the branch. Do not ask them yourself — you have no
+tool for it, and the report is the asking.
 ` : `
 **Your resolution will land.** This project's rule says a resolved conflict
 merges by itself once you have pushed it. Nobody will read it first. Hold
