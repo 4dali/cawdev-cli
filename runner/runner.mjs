@@ -538,6 +538,39 @@ const SKILLS_HERE = {
   },
 };
 
+/**
+ * A project this machine serves but its token cannot reach — R173.
+ *
+ * The config names the projects a machine serves; the token names the
+ * projects it may reach; and the two are set at different times. A slug added
+ * to the config of a machine whose token was minted for another project gets
+ * "No such project" once per poll — the platform's deliberate 404, which does
+ * not admit the project exists — and a run queued there waits for ever with
+ * nothing saying why. So the token's own account of itself (`whoami`, which is
+ * the one thing a token may ask about projects) is compared with the config
+ * ONCE, at startup, and the sentence names the way out: change the token's
+ * access in the console, which R173 made possible, or mint one that covers it.
+ *
+ * Said, never acted on. A platform without `whoami` (or a fake one in a test)
+ * answers with nothing, and nothing is the honest answer to compare against.
+ */
+async function sayWhichServedProjectsTheTokenCannotReach(config) {
+  const served = Object.keys(config.projects ?? {});
+  if (!served.length) return;
+  const identity = await api(config, '/api/agent/whoami').catch(() => null);
+  const reachable = new Set((identity?.projects ?? []).map((project) => project.slug));
+  if (!identity || !Array.isArray(identity.projects)) return;
+  for (const slug of served) {
+    if (!reachable.has(slug)) {
+      log(
+        `this machine serves ${slug} but its token cannot reach it — nothing queued there ` +
+          `will be claimed. In the console, under Agent tokens, change this token's access ` +
+          `to include ${slug}, or mint one that does and put it in the config.`,
+      );
+    }
+  }
+}
+
 // --- talking to cawdev -------------------------------------------------------
 
 async function api(config, path, { method = 'GET', body, token } = {}) {
@@ -6440,6 +6473,7 @@ async function main() {
     // which, and "which" is what you need when one of them is wrong.
     log(`serving ${slug}: ${project.workspaces.join(', ')}`);
   }
+  await sayWhichServedProjectsTheTokenCannotReach(config);
 
   // Frozen here, before anything can be claimed. A run that checks this very
   // directory out onto another branch — which every run on cawdev does — must
