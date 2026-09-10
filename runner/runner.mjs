@@ -32,7 +32,7 @@ import { loadToken, storedUrls } from './token-store.mjs';
 import {
   CARD_WRITE, CAWDEV_READS, GIT_READS, driftedFrom, readOnlyExpert, toolsForStage,
 } from '../lib/stage-tools.mjs';
-import { describeCall } from '../lib/tool-line.mjs';
+import { capabilityIn, describeCall } from '../lib/tool-line.mjs';
 import { findSecret } from '../lib/secrets.mjs';
 
 // --- configuration -----------------------------------------------------------
@@ -4527,6 +4527,30 @@ function writeUserMessage(child, text) {
 }
 
 /**
+ * The one message a REQUIRED capability buys — R161.
+ *
+ * <p>Said once, plainly, WITH THE WAY OUT. The last line is what makes this a
+ * nudge and not an argument: a session that has genuinely read the description
+ * and found it does not apply is right, and a message that left it no way to
+ * say so would be asking it to use a skill for the sake of using one — which is
+ * worse than the thing this entry exists to fix.
+ *
+ * <p>Both invocations are spelled out because the two are reached differently
+ * and the qualified name is the one thing that must be exact. R147 was five
+ * bugs' worth of evidence that a name a session cannot use is a capability it
+ * does not have.
+ */
+function nudgeText(stage, missing) {
+  const names = missing.map((each) => `\`${each}\``).join(', ');
+  return `cawdev: this project requires ${names}, and this ${stage.stage} stage has not `
+    + 'used it.\n\n'
+    + 'Use it now — `Skill` with `skill: "<name>"`, or `Agent` with `subagent_type: "<name>"` '
+    + '— and then say what it changed about your answer.\n\n'
+    + 'If it genuinely does not apply to this work, say so in one sentence and stop. '
+    + '**You will not be asked again.**';
+}
+
+/**
  * Ends the session — the function `agentArgs`'s comment has promised since R22
  * and which, until now, did not exist.
  *
@@ -5480,6 +5504,19 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   const readOnlyStage = Boolean(stage) && ['PLAN', 'VERIFY', 'MEMORY'].includes(stage.stage);
   const stageExperts = readOnlyStage ? expertAgents.filter(readOnlyExpert) : expertAgents;
 
+  // R161. What this project said had to be used, by the name a transcript line
+  // carries.
+  //
+  // From `stageExperts` and NEVER from `expertAgents`. An expert a read-only
+  // stage cannot reach — dropped by `readOnlyExpert` just above — must not be
+  // required HERE: requiring what the stage was deliberately not given is how
+  // this would come to widen what a run may do, which is the one thing it must
+  // not do. The mode is read after the narrowing, always.
+  const mustUse = new Set([
+    ...stageExperts.filter((each) => each.mode === 'REQUIRED').map((each) => qualified(each.key)),
+    ...skills.filter((each) => each.mode === 'REQUIRED').map((each) => qualified(each.key)),
+  ]);
+
   // R104/R105. The experts and skills the project turned on, as one plugin in
   // the daemon's own directory — see writeRunPlugin for why not the checkout.
   const pluginRoot = await writeRunPlugin(mcpDirectory, stageExperts, skills);
@@ -5608,10 +5645,13 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     experts: stageExperts.map((each) => ({
       qualified: qualified(each.key),
       description: each.description ?? each.name ?? each.key,
+      // R161: named under its own MUST heading rather than in the list.
+      required: each.mode === 'REQUIRED',
     })),
     skills: skills.map((each) => ({
       qualified: qualified(each.key),
       description: each.description ?? each.name ?? each.key,
+      required: each.mode === 'REQUIRED',
     })),
     cannotDelegate: readOnlyStage && expertAgents.length && !stageExperts.length
       ? [`The ${stage.stage} stage holds nothing that can change anything, and none of this `
@@ -5735,6 +5775,11 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     // is what says a STAGE did its work — see the failure branch in
     // walkLifecycle, and endSession above for why the two came apart.
     let turnEnded = false;
+    // R161. Every capability this child has been seen to call, by qualified
+    // name. Read off the transcript lines the daemon already writes rather than
+    // asked of the platform: the answer is needed at the `result` event, and a
+    // question that has to cross the network cannot be answered in time.
+    const used = new Set();
     // The last of what the CLI said on stderr, for the exit decision below.
     // The usage-limit notice is written there, and a decision made on stdout
     // alone would call every window a crash.
@@ -5831,15 +5876,26 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
         ? ` The ${stage.stage} stage cannot reach it: it asks for tools that can change `
           + 'things, and only read-only experts are reached from here.'
         : '';
+      // R161. A required one says so where the person is looking. Only when the
+      // stage can actually reach it: `cannot` and this are mutually exclusive
+      // by construction, because `mustUse` is built from `stageExperts`.
+      const must = mustUse.has(qualified(agent.key))
+        ? ' This project REQUIRES it: if this stage finishes without using it, the session '
+          + 'will be told.'
+        : '';
       const line = `${agent.name} is available to delegate to as `
-        + `Agent(${qualified(agent.key)}).${cannot}`;
+        + `Agent(${qualified(agent.key)}).${cannot}${must}`;
       log(`  ${line}`);
       transcript.push({ kind: 'SYSTEM', body: line });
     }
 
     for (const skill of skills) {
+      const must = mustUse.has(qualified(skill.key))
+        ? ' This project REQUIRES it: if this stage finishes without using it, the session '
+          + 'will be told.'
+        : '';
       const line = `${skill.name} is available to this session as `
-        + `Skill(${qualified(skill.key)}).`;
+        + `Skill(${qualified(skill.key)}).${must}`;
       log(`  ${line}`);
       transcript.push({ kind: 'SYSTEM', body: line });
     }
@@ -5942,7 +5998,47 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
           // the walk waits on a `close` that cannot come. A run with no
           // lifecycle keeps its input open, exactly as R22 intends.
           if (stage) {
-            endSession(child, `the ${stage.stage} stage`, config.sessionExitSeconds);
+            // R161. The one moment the daemon owns: between "the turn ended"
+            // and "close the input" there is room for exactly one more turn, in
+            // the same session, with all of its context. A run with no
+            // lifecycle never reaches here — `endSession` is deliberately not
+            // called for one — so REQUIRED is prompt wording and a console row
+            // on ASK, ROADMAP and AUDIT, and nothing more.
+            const missing = [...mustUse].filter((name) => !used.has(name));
+            // Whether the input stays open for one more turn. NOT an early
+            // return out of this handler, which the obvious shape would be:
+            // this is the stdout reader's `while`, and returning from it would
+            // drop the rest of an already-buffered chunk along with this turn's
+            // own usage report and its transcript line.
+            let nudged = false;
+            if (missing.length && !child.cawdevNudged) {
+              // Once per process. A model that has decided cannot be looped:
+              // this is a nudge, not an argument.
+              child.cawdevNudged = true;
+              const line = `cawdev: this stage has not used ${missing.join(', ')}, `
+                + 'which this project requires. Asking it once.';
+              log(`  ${line}`);
+              transcript.push({ kind: 'SYSTEM', body: line });
+              // The return value is load-bearing. It is false when stdin is
+              // already gone — a crashed or finished session — and falling
+              // through to `endSession` is what stops a dead session from never
+              // being dismissed. That is R22's forty-three minutes arriving
+              // through a new door.
+              nudged = writeUserMessage(child, nudgeText(stage, missing));
+              if (nudged) {
+                // The turn runs again and the next `result` closes the input.
+                // This timer is the whole defence against the one deadlock this
+                // could introduce: if that second `result` never comes, the
+                // stage still leaves. Unref'd, so it cannot hold the daemon
+                // open — `endSession`'s own timers are unref'd for the same
+                // reason, one level down.
+                setTimeout(() => endSession(child, `the ${stage.stage} stage`,
+                  config.sessionExitSeconds), config.sessionExitSeconds * 2000).unref?.();
+              }
+            }
+            if (!nudged) {
+              endSession(child, `the ${stage.stage} stage`, config.sessionExitSeconds);
+            }
           }
         }
         // R69. The handle this conversation can be continued with. The CLI
@@ -6007,6 +6103,14 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
           // blocked: R112 does the blocking by not handing over the tool, and a
           // second thing that can stop a run is a second thing that can stop it
           // wrongly.
+          if (recorded.kind === 'TOOL') {
+            // R161, and cheap: one regex per TOOL line, on lines that are
+            // already being walked. See ../lib/tool-line.mjs.
+            const reached = capabilityIn(recorded.body);
+            if (reached) {
+              used.add(reached.key);
+            }
+          }
           if (stage && recorded.kind === 'TOOL') {
             const drifted = driftedFrom(stage.stage, recorded.body, stage.testMode,
               stageExperts.map((each) => qualified(each.key)),
