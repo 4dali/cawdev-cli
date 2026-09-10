@@ -671,6 +671,13 @@ and only a person starts it. The runner has no say in any of this beyond
 obeying its heartbeat — `paused` and `heldWorkspaces` come from the platform,
 and `runner.mjs` reads them rather than deciding them.
 
+**The thresholds (R158) are set in the console, on the runners page, not in
+`runner.config.json`.** *Stop claiming at %* pauses this machine when one of its
+whole windows crosses the line, and *Ask before starting at %* makes a start
+bound to it state the numbers first. There is nothing to configure here and
+nothing to upgrade: the platform sets the same `paused` flag a person's click
+sets, and this daemon already obeys it on the next beat.
+
 ## Trying it without spending Claude usage
 
 `stub-agent.mjs` stands in for `claude`. It is spawned the same way, talks to
