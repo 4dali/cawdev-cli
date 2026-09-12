@@ -58,6 +58,12 @@ export async function fakePlatform({
    * merge session that must not stall is not handed the tools that stall it.
    */
   rules = null,
+  /**
+   * R187: the version files a RELEASE session may write, as the claim carries
+   * them. Null is a platform older than R187, and the daemon's answer to that
+   * is a release session with no writer at all — not one with every writer.
+   */
+  releaseWrites = null,
   brief = {
     path: 'docs/brief',
     index: 'docs/brief/README.md',
@@ -159,6 +165,7 @@ export async function fakePlatform({
           shield,
           brief,
           rules,
+          releaseWrites,
         }));
       }
       // R155. What the machine found when it merged, and what it left behind.

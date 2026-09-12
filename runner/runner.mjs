@@ -3802,6 +3802,24 @@ function conflictedWrites(run) {
 }
 
 /**
+ * `Write`/`Edit` for the version files a RELEASE session may touch — R187.
+ *
+ * `conflictedWrites`' shape, with the list decided by the PLATFORM rather than
+ * by git: the claim carries the paths the release procedure bumps a version in,
+ * and the prompt's step 4 is built from the same list, so the instruction and
+ * the permission cannot name different files.
+ *
+ * An empty list is not a fallback to "anything". A platform too old to send it
+ * yields a session that cannot bump the version and says so in its report —
+ * which is the legible failure, and a far better one than a release session
+ * that could write wherever it liked because the list was missing.
+ */
+function releaseWrites(run) {
+  const files = Array.isArray(run?.releaseWrites) ? run.releaseWrites : [];
+  return files.flatMap((path) => [`Write(${path})`, `Edit(${path})`]);
+}
+
+/**
  * Everything under `mcp__cawdev__` that WAITS ON A PERSON.
  *
  * `CAWDEV_READS` holds all five, correctly — asking somebody something changes
@@ -4004,6 +4022,40 @@ const PROFILE_TOOLS = {
     ...READ_FILES,
     'Bash(git *)',
     ...conflictedWrites(run),
+  ],
+  // R187. Cut a release: write the changelog, ship the cards, bump the
+  // version, tag, push, open the pull request. Until R187 this was a CODE run
+  // with a careful prompt, which meant the project's build tools, the
+  // permission prompt and `bypassPermissions` where a machine had granted it —
+  // for a session asked to touch three files.
+  //
+  // The cawdev half is the reads plus exactly the three writers the procedure
+  // uses: an entry, an entry's version, a card's status. `ask_user` stays with
+  // the reads because the OWNER who pressed the button is watching and a
+  // release may genuinely need to ask. Nothing that creates a card, proposes
+  // one, or comments.
+  //
+  // The shell is `git` in full — it commits, tags and pushes — `gh pr create`
+  // and `gh pr view`, and `node` for the export scripts. NOT `Bash(gh *)`: it
+  // can open the release's pull request and it cannot merge it, and that is a
+  // permission rather than a sentence in the prompt. A release is merged by a
+  // person, with a merge commit, because a squash orphans the tag.
+  //
+  // And `Write`/`Edit` on the version files the platform named on the claim,
+  // and nothing else. `ROADMAP.md`, `ISSUES.md` and `CHANGELOG.md` are
+  // unwritable by hand as a permission, which is what "never hand-edit the
+  // exports" means from here on.
+  RELEASE: (run) => [
+    ...READ_ONLY_CAWDEV,
+    'mcp__cawdev__changelog_add',
+    'mcp__cawdev__changelog_update',
+    'mcp__cawdev__roadmap_set_status',
+    ...READ_FILES,
+    'Bash(git *)',
+    'Bash(gh pr create *)',
+    'Bash(gh pr view *)',
+    'Bash(node *)',
+    ...releaseWrites(run),
   ],
   INTERVIEW: (run) => [
     ...READ_ONLY_CAWDEV,
@@ -4299,6 +4351,31 @@ yourself to that: if you are not sure, stop and say so instead.
 Report what you did with \`report\` kind "done" — name every file and say what you
 chose in each. That text goes on the card, and it is how anybody finds out how
 this was resolved without opening your transcript.`;
+  }
+
+  if (run.profile === 'RELEASE') {
+    // R187. The procedure itself is the platform's — ReleasePrompt composes it
+    // with the version and the cards — so this only says what the session is
+    // standing in and what it has been allowed, in the terms the permission
+    // list uses, so it does not spend turns discovering either.
+    const files = Array.isArray(run.releaseWrites) ? run.releaseWrites : [];
+    const list = files.length
+      ? files.map((path) => `\`${path}\``).join(', ')
+      : 'none — this platform named no version files, so say so in your report '
+        + 'rather than looking for a way round it';
+
+    return `You are cutting a release in a working copy on branch \`${run.branch}\`, for the
+cawdev platform.
+
+Your permissions, so you do not spend turns discovering them: \`git\` in full;
+\`gh pr create\` and \`gh pr view\`; \`node\`; and Write/Edit on exactly these files —
+${list} — and nothing else. There is no permission prompt in this session: a
+command outside those is refused and nobody is asked. You cannot merge a pull
+request, run a build, or run tests.
+
+If a decision is genuinely the person's, use \`ask_user\` and wait.
+
+${run.openingPrompt}`;
   }
 
   if (run.profile === 'INTERVIEW') {
@@ -4959,6 +5036,14 @@ async function startRun(config, offered, workspace) {
     // might be wrong is a brief written in the wrong place — and this is the
     // one thing every profile's prompt is given about it.
     run.brief = claimed.brief ?? null;
+    // R187. The version files a release session may write — its whole write
+    // scope, decided by the platform. Logged for the reason the rules are: the
+    // operator should see from the daemon's own output what a session was
+    // allowed to touch.
+    run.releaseWrites = Array.isArray(claimed.releaseWrites) ? claimed.releaseWrites : [];
+    if (run.releaseWrites.length) {
+      log(`  a release session may write: ${run.releaseWrites.join(', ')}`);
+    }
     mcpServers = Array.isArray(claimed.mcpServers) ? claimed.mcpServers : [];
     if (mcpServers.length) {
       log(`  the project asks for: ${mcpServers.map((each) => each.key).join(', ')}`);
@@ -5101,8 +5186,12 @@ function writesCodeProfile(run) {
   // R155: a MERGE does too, and needs it more literally than any of them — the
   // conflict is IN a working copy and there is nowhere else to resolve one. The
   // platform draws the same line in `RunProfile.writesCode()`.
+  // R187: a RELEASE commits, tags and pushes, so it holds a checkout and counts
+  // against the coding cap. `writesAnythingProfile` stays false for it, which
+  // is what sends it through `argsForProfile` — no permission prompt, no
+  // `bypassPermissions`, none of the project's extras.
   return !run.profile || run.profile === 'CODE' || run.profile === 'INTERVIEW'
-    || run.profile === 'MERGE';
+    || run.profile === 'MERGE' || run.profile === 'RELEASE';
 }
 
 /**

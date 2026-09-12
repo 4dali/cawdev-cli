@@ -300,7 +300,14 @@ waits now says **"no free workspace in cawdev (2 here, all busy)"** instead of
 
 **This number caps coding and nothing else** (R70). `ASK`, `ROADMAP` and `AUDIT`
 runs take no workspace, so a project whose checkouts are all busy still starts a
-question, an entry-writing session and an audit at once. What holds those back
+question, an entry-writing session and an audit at once. `INTERVIEW`, `MERGE`
+and `RELEASE` do take one — each commits something — and count against this
+number; what each may *write* in it is far narrower than a coding run's and is
+decided by the profile, not by the prompt: an interview writes `docs/brief/`,
+a merge writes the files git put conflict markers in, and a release (R187)
+writes exactly the version files the platform names on the claim, with `git`,
+`gh pr create`, `gh pr view` and `node` for the exports — no build tools, no
+permission prompt, no `gh pr merge`. What holds the rest back
 is `maxSessions`, which counts every profile — **"at 4 sessions on this machine
 (every profile counts)"** is the other thing a waiting run can say, and the log
 always says which of the two it was.
