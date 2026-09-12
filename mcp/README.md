@@ -156,7 +156,7 @@ what you are allowed to do.
 | `roadmap_list` | Entries, optionally by status. `brief` omits bodies — use it to survey. |
 | `roadmap_get` | One entry in full: its body, **the plan agreed for it**, and the discussion on it. |
 | `roadmap_create` | Create an entry; the platform allocates its permanent number. |
-| `roadmap_update` | Title, body, section, related ids. |
+| `roadmap_update` | Title, body, section, related ids, and the cards it starts coding after (`after` — R181). |
 | `roadmap_comment` | Say something *beside* an entry rather than inside it. |
 | `roadmap_set_status` | Move an entry, carrying whatever the status requires. |
 | `roadmap_decline` | Decline with a reason. The only exit. |

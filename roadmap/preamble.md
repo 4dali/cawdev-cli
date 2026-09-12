@@ -23,7 +23,9 @@ on the things reviews forget.
 ## Format
 
 Every entry is a level-3 heading carrying a stable id, then a `Status:` line.
-An entry may also carry `Related: R4, R7` and — depending on status — a
+An entry may also carry `Related: R4, R7`, an `After: R12` line naming the
+cards it starts coding after — a coding session on it waits in the queue until
+each of those is MERGED or SHIPPED (R181) — and, depending on status, a
 `Branch:` or `Merged:` line. Ids are permanent: renaming an entry is fine;
 reusing or renumbering an id is not, because commits and code comments point at
 it.

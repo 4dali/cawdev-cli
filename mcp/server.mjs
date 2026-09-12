@@ -584,6 +584,13 @@ const TOOLS = [
         reason: { type: 'string' },
         section: { type: 'string', description: 'Which part of the roadmap, e.g. "Phase 2 — …".' },
         related: { type: 'array', items: { type: 'integer' } },
+        after: {
+          type: 'array',
+          items: { type: 'integer' },
+          description:
+            'Cards this one starts coding after — it waits in the queue until every one of ' +
+            'them is MERGED or SHIPPED. Same project, must exist, never itself.',
+        },
       },
       required: ['title'],
     },
@@ -591,7 +598,10 @@ const TOOLS = [
       const slug = await resolveProject(config, args.project);
       const entry = await api(config, `/api/projects/${slug}/roadmap`, {
         method: 'POST',
-        body: pick(args, ['title', 'body', 'status', 'branch', 'merge', 'version', 'reason', 'section', 'related']),
+        body: pick(args, [
+          'title', 'body', 'status', 'branch', 'merge', 'version', 'reason', 'section', 'related',
+          'after',
+        ]),
       });
       return `Created ${refOf(entry)} in ${slug}.\n\n${formatEntry(entry, {})}`;
     },
@@ -662,7 +672,8 @@ const TOOLS = [
   {
     name: 'roadmap_update',
     description:
-      'Edit an entry\'s title, body, section or related ids. Use roadmap_set_status to move it.',
+      'Edit an entry\'s title, body, section, related ids or the cards it starts after. ' +
+      'Use roadmap_set_status to move it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -672,6 +683,13 @@ const TOOLS = [
         body: { type: 'string' },
         section: { type: 'string' },
         related: { type: 'array', items: { type: 'integer' } },
+        after: {
+          type: 'array',
+          items: { type: 'integer' },
+          description:
+            'Cards this one starts coding after — it waits in the queue until every one of ' +
+            'them is MERGED or SHIPPED. Same project, must exist, never itself. [] clears it.',
+        },
       },
       required: ['number'],
     },
@@ -679,7 +697,7 @@ const TOOLS = [
       const slug = await resolveProject(config, args.project);
       const entry = await api(config, `/api/projects/${slug}/roadmap/${args.number}`, {
         method: 'PATCH',
-        body: pick(args, ['title', 'body', 'section', 'related']),
+        body: pick(args, ['title', 'body', 'section', 'related', 'after']),
       });
       return `Updated ${refOf(entry)}.\n\n${formatEntry(entry, {})}`;
     },
@@ -1760,6 +1778,16 @@ function formatEntry(entry, { brief, comments, plan }) {
     lines.push(
       `  related: ${entry.related
         .map((n, index) => entry.relatedRefs?.[index] ?? `R${n}`)
+        .join(', ')}`,
+    );
+  }
+  if (entry.after?.length) {
+    // R181. A coding run on this card is held until each of these lands; the
+    // ones still holding it are marked, so a session reading the card knows
+    // why its own start would wait.
+    lines.push(
+      `  after: ${entry.after
+        .map((card) => (card.landed ? card.ref : `${card.ref} (waiting)`))
         .join(', ')}`,
     );
   }

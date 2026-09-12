@@ -100,13 +100,13 @@ async function main() {
     created += 1;
   }
 
-  // Pass 2: related ids, now that every entry exists.
+  // Pass 2: related and starts-after ids, now that every entry exists.
   let linked = 0;
   for (const entry of entries) {
-    if (!entry.related.length) continue;
+    if (!entry.related.length && !entry.after?.length) continue;
     await call(config, `/api/projects/${slug}/roadmap/${entry.number}`, {
       method: 'PATCH',
-      body: { related: entry.related },
+      body: { related: entry.related, after: entry.after ?? [] },
     });
     linked += 1;
   }
