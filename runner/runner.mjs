@@ -2795,7 +2795,12 @@ async function applyHandoff(cwd, branch, handoff) {
   return parts.join('; ');
 }
 
-async function performWorkspaceRequest(config, request) {
+// R218. The requests that leave the working tree different from how the last
+// survey described it. `SHOW`, `INDEX`, `MERGE` and `TAG` are not here: a look,
+// a map, a merge of a branch that is somewhere else, a question to the host.
+const TOUCHES_THE_TREE = new Set(['STASH', 'COMMIT', 'RESET', 'HANDOFF']);
+
+async function performWorkspaceRequest(config, request, afterTheTreeMoved = null) {
   const cwd = request.path;
   let ok = false;
   let result;
@@ -2978,6 +2983,14 @@ async function performWorkspaceRequest(config, request) {
     result = `This runner does not know how to ${request.kind}.`;
   }
 
+  // R218. The console's row draws the survey, not this answer: report the
+  // tree as it is NOW, before saying the request is done, so the row is
+  // right the moment the spinner stops. Done or failed — a reset that
+  // half-happened has moved the tree too.
+  if (afterTheTreeMoved && TOUCHES_THE_TREE.has(request.kind)) {
+    await afterTheTreeMoved().catch((failure) => log(`  could not re-read the checkouts: ${failure.message}`));
+  }
+
   await reportWorkspaceRequest(config, request, ok, result, failureKind);
 }
 
@@ -3005,8 +3018,12 @@ function reportWorkspaceRequest(config, request, ok, result, failure = null) {
  * checked that the runner is yours; only this process knows which directories
  * it was actually given, and a request naming some other directory is one to
  * say no to rather than to run `git stash` in.
+ *
+ * `afterTheTreeMoved` (R218) is the daemon's own beat: awaited after a request
+ * that changed a tree, before that request is reported finished, so the
+ * platform holds the tree as it now is by the time the console hears "done".
  */
-function watchWorkspaceRequests(config) {
+function watchWorkspaceRequests(config, { afterTheTreeMoved = null } = {}) {
   const served = new Set(
     Object.values(config.projects).flatMap((project) => project.workspaces),
   );
@@ -3029,7 +3046,7 @@ function watchWorkspaceRequests(config) {
           `This runner does not serve ${request.path}.`);
         continue;
       }
-      await performWorkspaceRequest(config, request);
+      await performWorkspaceRequest(config, request, afterTheTreeMoved);
     }
   };
 
@@ -6673,6 +6690,10 @@ async function main() {
   // One beat straight away. Waiting a full interval would leave the composer
   // with no picture of this machine's checkouts for the first thirty seconds
   // after a restart — and warning nobody is exactly the failure this fixes.
+  //
+  // Awaitable, and awaited by `performWorkspaceRequest` since R218: a request
+  // that changed a tree answers only after the platform holds the tree as it
+  // now is. It never rejects — each of its two POSTs keeps its own catch.
   const beat = async () => {
     // What we are actually driving, not merely that we are alive. A restarted
     // daemon is alive and drives nothing, and the runs it abandoned used to sit
@@ -6698,7 +6719,7 @@ async function main() {
     // nothing reported. A daemon that has just come back from a crash is the
     // one thing that knows there are five commits and seven changed files in
     // cawdev-2, and R80 kept that silently.
-    surveyWorkspaces(config)
+    const workspacesReported = surveyWorkspaces(config)
       .then((workspaces) => api(config, `/api/runners/${config.runnerId}/workspaces`, {
         method: 'POST',
         body: { workspaces },
@@ -6709,7 +6730,7 @@ async function main() {
         }
       })
       .catch((failure) => log(`could not report the workspaces: ${failure.message}`));
-    api(config, `/api/runners/${config.runnerId}/heartbeat`, {
+    const heartbeatAnswered = api(config, `/api/runners/${config.runnerId}/heartbeat`, {
       method: 'POST',
       body: {
         name: config.name,
@@ -6741,6 +6762,7 @@ async function main() {
           : [];
       }
     }).catch((failure) => log(`heartbeat failed: ${failure.message}`));
+    await Promise.all([workspacesReported, heartbeatAnswered]);
   };
 
   await beat();
@@ -6775,7 +6797,7 @@ async function main() {
   }
 
   // R57: looking at a checkout, parking what is in it, or keeping it.
-  const takeWorkspaceRequests = watchWorkspaceRequests(config);
+  const takeWorkspaceRequests = watchWorkspaceRequests(config, { afterTheTreeMoved: beat });
   const workspaceRequests = setInterval(() => {
     void takeWorkspaceRequests();
   }, config.workspacePollSeconds * 1000);

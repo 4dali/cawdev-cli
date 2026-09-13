@@ -88,6 +88,8 @@ export async function fakePlatform({
   const finishedRequests = [];
   /** R155: what a merge run's machine reported, in the order it reported it. */
   const mergeReports = [];
+  /** R218: what the daemon said its checkouts hold, in the order it said it. */
+  const workspaceReports = [];
   /** Session ids the daemon reported off the CLI's `init` event — R69. */
   const sessionIds = [];
   /**
@@ -267,6 +269,11 @@ export async function fakePlatform({
         const taken = pending.splice(0, pending.length);
         return response.end(JSON.stringify(taken));
       }
+      // `/workspaces/release` ends with `/release`, so this takes the survey only.
+      if (url.endsWith('/workspaces') && request.method === 'POST') {
+        workspaceReports.push(...(JSON.parse(body).workspaces ?? []));
+        return response.end('{}');
+      }
       if (url.endsWith('/finished') && url.includes('/workspace-requests/')) {
         finishedRequests.push({
           id: url.split('/workspace-requests/')[1].split('/')[0],
@@ -347,6 +354,7 @@ export async function fakePlatform({
     seen,
     transitions,
     finishedRequests,
+    workspaceReports,
     mergeReports,
     sessionIds,
     outputs,

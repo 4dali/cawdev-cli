@@ -221,6 +221,12 @@ test('Stash empties the checkout and says how to get it back', async (t) => {
   // them to work out.
   assert.match(done.result, /stash pop/);
 
+  // R218. By the time it said "done", it had already told the platform the
+  // tree is empty — the reading the console's row draws, not the answer.
+  const reread = platform.workspaceReports.filter((each) => each.path === path).at(-1);
+  assert.ok(reread, 'the daemon answered without re-reading its checkouts');
+  assert.equal(reread.dirtyFiles, 0, `the last reading still says the tree is dirty: ${JSON.stringify(reread)}`);
+
   const dirty = (await run('git', ['status', '--porcelain'], { cwd: path })).stdout.trim();
   assert.equal(dirty, '', 'the checkout is still dirty');
 });
