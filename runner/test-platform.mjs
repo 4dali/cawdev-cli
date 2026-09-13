@@ -64,6 +64,14 @@ export async function fakePlatform({
    * is a release session with no writer at all — not one with every writer.
    */
   releaseWrites = null,
+  /**
+   * i138: what the MACHINE's tool-rules endpoint answers — R126's
+   * `{ rules, allowsEverything }`. Null is the shape every test before i138
+   * got, an empty list, which the daemon reads as nothing granted. Only read
+   * when the daemon asks, and it only asks when its config says
+   * `acceptsRulesFromConsole`.
+   */
+  machineRules = null,
   brief = {
     path: 'docs/brief',
     index: 'docs/brief/README.md',
@@ -227,6 +235,9 @@ export async function fakePlatform({
         return response.end(JSON.stringify({ kind: 'SECRET' }));
       }
 
+      if (url.includes('/api/runners/') && url.endsWith('/tool-rules') && machineRules) {
+        return response.end(JSON.stringify(machineRules));
+      }
       if (url.endsWith('/tool-rules')) {
         // A list, because the real one answers with a list. The catch-all below
         // answers `{}`, which the daemon then reports as "could not read this

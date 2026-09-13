@@ -4093,22 +4093,6 @@ function writesItsOwnCard(run) {
 }
 
 /**
- * The spawn arguments for a session that does not write code.
- *
- * Everything up to `--allowedTools` is kept — the output format, the streaming
- * input, the model — and the permissions are replaced with the profile's own.
- * `--permission-mode acceptEdits` goes too: a session that cannot write files
- * has no use for permission to.
- */
-/**
- * Everything before `--allowedTools`, which is variadic and swallows the rest.
- *
- * <p>Shared by {@code argsForProfile} and R112's stage args so the two cannot
- * disagree about where the permission list begins — a stage built on a list
- * that still had the coding defaults on the end would be a stage with tools its
- * table never granted, and nothing would have said so.
- */
-/**
  * Tell the platform a usage window is closed — R73, from either place that
  * finds out.
  *
@@ -4150,39 +4134,63 @@ async function reportUsageLimit(config, run, limit, lastText) {
   }).catch((failure) => log(`  could not report the window: ${failure.message}`));
 }
 
-function argsBefore(agentArgs) {
+/**
+ * Everything before `--allowedTools`, which is variadic and swallows the rest.
+ *
+ * <p>Shared by {@code argsForProfile} and R112's stage args so the two cannot
+ * disagree about where the permission list begins — a stage built on a list
+ * that still had the coding defaults on the end would be a stage with tools its
+ * table never granted, and nothing would have said so.
+ *
+ * <p>With `listOnly`, the allow-list is the WHOLE permission — i138. Two of the
+ * coding defaults let a session past its list: `--permission-mode` waves a
+ * class of calls through without consulting it (`acceptEdits` writes files —
+ * proved by spike against 2.1.268, a session allowed only `Read`, `Grep` and
+ * `Glob` wrote a file — and `bypassPermissions` anything at all), and
+ * `--permission-prompt-tool` turns everything else into a question for a person.
+ * A profile's permissions are the whole point of the profile: an ASK session
+ * that can have a person grant it the shell is an ASK session that can write
+ * code, which is exactly what R28 decided it must not be. "Cannot" must not
+ * quietly become "not yet". So both go, for every profile that is not CODE and
+ * for every read-only stage of one.
+ *
+ * <p>`argsForProfile` always stripped them. The stage path did not, and that is
+ * i138: a PLAN run walked as stages was spawned with `acceptEdits` and the
+ * prompt tool its single-process twin never had, so every shell command the
+ * planner reached for — and the `report` its prompt told it to finish with —
+ * became a question on the inbox, on a machine whose operator had turned on
+ * "allow everything". That setting is coding-only, correctly, and so did
+ * nothing for the session that was asking. One function for both paths now,
+ * so they cannot come apart again.
+ */
+function argsBefore(agentArgs, { listOnly = false } = {}) {
   const kept = [];
   for (let i = 0; i < agentArgs.length; i++) {
     if (agentArgs[i] === '--allowedTools') {
-      break;
+      break; // variadic: everything after it is a permission
+    }
+    if (listOnly && (agentArgs[i] === '--permission-mode'
+        || agentArgs[i] === '--permission-prompt-tool')) {
+      i += 1;
+      continue;
     }
     kept.push(agentArgs[i]);
   }
   return kept;
 }
 
+/**
+ * The spawn arguments for a session that does not write code.
+ *
+ * Everything up to `--allowedTools` is kept — the output format, the streaming
+ * input, the model — and the permissions are replaced with the profile's own.
+ * `--permission-mode acceptEdits` goes too: a session that cannot write files
+ * has no use for permission to. And so does the permission prompt — see
+ * `argsBefore` for why "cannot" must not become "not yet".
+ */
 function argsForProfile(agentArgs, profile, run, expertAgents = [], skills = []) {
-  const kept = [];
-  for (let i = 0; i < agentArgs.length; i++) {
-    if (agentArgs[i] === '--allowedTools') {
-      break; // variadic: everything after it is a permission
-    }
-    if (agentArgs[i] === '--permission-mode') {
-      i += 1;
-      continue;
-    }
-    // And the permission-prompt tool. A profile's permissions are the whole
-    // point of the profile: an ASK session that can have a person grant it the
-    // shell is an ASK session that can write code, which is exactly what R28
-    // decided it must not be. "Cannot" must not quietly become "not yet".
-    if (agentArgs[i] === '--permission-prompt-tool') {
-      i += 1;
-      continue;
-    }
-    kept.push(agentArgs[i]);
-  }
   const allowed = PROFILE_TOOLS[profile] ?? READ_ONLY_CAWDEV;
-  return [...kept, '--allowedTools',
+  return [...argsBefore(agentArgs, { listOnly: true }), '--allowedTools',
     ...withSkills(
       withDelegation(typeof allowed === 'function' ? allowed(run) : allowed, expertAgents),
       skills)];
@@ -5537,11 +5545,23 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   if (granted.patterns.length) {
     log(`  this machine has been granted: ${granted.patterns.join(', ')}`);
   }
-  if (granted.everything) {
+  // R126's "everything", and whether it applies HERE. Coding only: nothing else
+  // is spawned with a permission mode or a permission prompt at all —
+  // `argsBefore` strips both, deliberately — so an ASK session cannot be handed
+  // the shell by a setting made about builds, and a PLAN session cannot be
+  // handed a writer by it either.
+  const everything = granted.everything && writesAnythingProfile(run);
+  if (everything) {
     // Said every time, and not once at boot. "Everything" is the setting people
     // turn on for an afternoon and forget, and the log of the run it applied to
     // is where somebody looks afterwards.
     log('  !! this machine allows EVERYTHING: this session will not ask before any command');
+  } else if (granted.everything) {
+    // i138. Said too, because the operator who turned it on and then watched a
+    // plan session get refused a shell needs the log to say the two are
+    // connected — that the setting was read, and is coding-only by design.
+    log(`  this machine allows everything, and that is coding-only: a ${run.profile} session `
+      + 'holds its own list and nothing else');
   }
   // Only a coding session can be given anything by a rule. Asked in the same
   // breath as the ceiling so the two cannot drift apart.
@@ -5693,10 +5713,12 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   // checkout, so it is yours to make" — and this is that decision made through
   // the console instead of by hand.
   //
-  // Coding only. Nothing else is spawned with a permission mode at all:
-  // argsForProfile strips it, deliberately, so an ASK session cannot be handed
-  // the shell by a setting made about builds.
-  if (granted.everything && writesAnythingProfile(run)) {
+  // Coding only — `everything` above says so. And only the stages of a coding
+  // run that write: a read-only stage is spawned through `argsBefore`'s
+  // `listOnly` below, which drops the mode again, because "everything" is a
+  // decision about what an unattended agent may RUN in a checkout and not a
+  // decision that MEMORY may write files.
+  if (everything) {
     const mode = agentArgs.indexOf('--permission-mode');
     if (mode !== -1) {
       agentArgs[mode + 1] = 'bypassPermissions';
@@ -5798,8 +5820,15 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   const profileTools = codesFreely
     ? agentArgs.slice(agentArgs.indexOf('--allowedTools') + 1)
     : (PROFILE_TOOLS[run.profile] ?? READ_ONLY_CAWDEV);
+  // i138. A stage's arguments before the list are the coding defaults' only
+  // when the stage may write: a non-coding profile and a read-only stage are
+  // given the list and nothing that reaches past it — no `acceptEdits`, no
+  // `bypassPermissions`, no permission prompt — which is what `argsForProfile`
+  // has always done for the same profile spawned as one process. Without this
+  // the list `toolsForStage` narrows was narrowed on paper: the mode wrote
+  // files the list never named, and the prompt asked a person for the rest.
   const stageArgs = stage
-    ? [...argsBefore(agentArgs), '--allowedTools',
+    ? [...argsBefore(agentArgs, { listOnly: !codesFreely || readOnlyStage }), '--allowedTools',
       ...toolsForStage(stage.stage,
         withSkills(
           withDelegation(typeof profileTools === 'function' ? profileTools(run) : profileTools,

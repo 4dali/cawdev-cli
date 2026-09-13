@@ -741,6 +741,15 @@ permission stops forever.
 They are named explicitly rather than reached with `bypassPermissions`, because
 nothing here should imply the agent may run arbitrary commands.
 
+Both lines above are the **coding** defaults, and only a session that writes
+code is spawned with them. A profile that does not — `ASK`, `PLAN`, `REVIEW`,
+`AUDIT`, and the rest — and a read-only stage of a coding run — `PLAN`,
+`VERIFY`, `MEMORY` — get their own `--allowedTools` and neither a permission
+mode nor a permission prompt: the list is the whole permission. That is what
+makes "cannot write" true rather than asked for (`acceptEdits` on its own lets
+a session write a file its list does not name), and it is why such a session
+never asks you anything — an unlisted tool is refused, not raised (i138).
+
 - `Bash(git *)` lets it commit. The prompt tells it to commit its work, so the
   default has to allow that — a default configuration that forbids what the
   default prompt asks for is a broken default. A real session wrote the file,
