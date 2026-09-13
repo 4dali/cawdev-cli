@@ -1504,12 +1504,31 @@ async function prepareWorkingCopy(path, branch, defaultBranch, allowDirty) {
       }
     }
   } else {
-    // Branch off the *remote* default when there is one, so the agent starts
-    // from what everyone else has, not from whatever this checkout was left on.
-    const startPoint = await git(path, ['rev-parse', '--verify', `origin/${base}`])
-      .then(() => `origin/${base}`)
-      .catch(() => base);
-    await checkoutCarrying(path, ['checkout', '-b', branch, startPoint], dirty);
+    // This checkout has never held the branch — but the branch itself may
+    // already be on the remote, pushed by a run on one of the project's OTHER
+    // checkouts (R47). `applyHandoff` makes the same check for the same
+    // reason: cutting a fresh branch from the default branch here would give
+    // it a history the remote's copy cannot fast-forward to, and every push
+    // this checkout makes afterwards — not just this run's — would be
+    // rejected as non-fast-forward. Seen live on `MERGE`: a clean `git merge`
+    // needs no session and reports success, and the branch never reaches the
+    // remote at all, silently, on whichever of the project's checkouts happens
+    // not to have seen this branch before.
+    const remoteRef = `origin/${branch}`;
+    const onOrigin = await git(path, ['rev-parse', '--verify', '--quiet', remoteRef])
+      .then(() => true)
+      .catch(() => false);
+    if (onOrigin) {
+      await checkoutCarrying(path, ['checkout', '-b', branch, remoteRef], dirty);
+      log(`  ${branch} was not here — checked out from ${remoteRef}`);
+    } else {
+      // Branch off the *remote* default when there is one, so the agent starts
+      // from what everyone else has, not from whatever this checkout was left on.
+      const startPoint = await git(path, ['rev-parse', '--verify', `origin/${base}`])
+        .then(() => `origin/${base}`)
+        .catch(() => base);
+      await checkoutCarrying(path, ['checkout', '-b', branch, startPoint], dirty);
+    }
   }
 
   // HEAD *now* is the base: "what did this run produce" means what it added,

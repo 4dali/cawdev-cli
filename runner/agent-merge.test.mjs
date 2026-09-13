@@ -115,6 +115,44 @@ async function aRepositoryThatMergesCleanly() {
   return path;
 }
 
+/**
+ * A checkout that has never held the branch, while origin already does — with
+ * history this checkout's own `main` has since moved past. This is the shape
+ * a project's OTHER checkout (R47) leaves behind: it did the real work and
+ * its push landed on the remote; this one only ever fetched refs.
+ */
+async function aRepositoryWhoseBranchIsOnlyOnOrigin() {
+  const path = await mkdtemp(join(tmpdir(), 'cawdev-agent-merge-elsewhere-'));
+  const git = (args) => run('git', args, { cwd: path });
+
+  await git(['init', '-q', '-b', 'main']);
+  await git(['config', 'user.email', 'test@cawdev.test']);
+  await git(['config', 'user.name', 'Test']);
+  await writeFile(join(path, 'README.md'), '# a project\n');
+  await git(['add', '.']);
+  await git(['commit', '-q', '-m', 'first']);
+
+  // The branch, built the way another checkout would have: off this point of
+  // main, with its own commit. Faked as `origin/<branch>` and then removed
+  // here — this checkout has never had it locally.
+  await git(['checkout', '-q', '-b', MERGE_RUN.branch]);
+  await writeFile(join(path, 'branch-work.txt'), "the branch's own work\n");
+  await git(['add', '.']);
+  await git(['commit', '-q', '-m', 'on the branch']);
+  await git(['branch', '-f', `origin/${MERGE_RUN.branch}`, MERGE_RUN.branch]);
+  await git(['checkout', '-q', 'main']);
+  await git(['branch', '-D', MERGE_RUN.branch]);
+
+  // And main moves on without it, the way another PR landing in the meantime
+  // would — which is exactly what makes a fresh cut of `main` unable to
+  // fast-forward to what is already on `origin/<branch>`.
+  await writeFile(join(path, 'main-later.txt'), 'landed on main after the branch was cut\n');
+  await git(['add', '.']);
+  await git(['commit', '-q', '-m', 'later, on main']);
+  await git(['branch', '-f', 'origin/main', 'main']);
+  return path;
+}
+
 async function daemonWith(t, { path, name, rules = null, offers = [MERGE_RUN],
     workspaceRequests = [], env = {} }) {
   // The session has to stay up long enough for its spawn line to be read: a
@@ -246,6 +284,27 @@ test('a merge that comes out clean spawns nothing at all', async (t) => {
   assert.ok(resolved, `a clean merge never reported what it left:\n${said()}`);
   assert.ok(resolved.mergeCommit, 'a clean merge reported no commit');
 });
+
+test('a checkout that has never held the branch starts it from origin, not a fresh cut of main',
+    async (t) => {
+      // The bug this pins: `prepareWorkingCopy` saw no LOCAL branch and cut a
+      // fresh one from `main`, losing whatever the branch already carried on
+      // the remote. Reported as a clean merge — main's own commit does not
+      // conflict with nothing — so no session was ever spawned to notice, and
+      // the branch's own work silently never reached the remote at all.
+      const path = await aRepositoryWhoseBranchIsOnlyOnOrigin();
+      const { said } = await daemonWith(t, { path, name: 'agent-merge-elsewhere' });
+
+      const came = await until(said, /merged into r155-work with no conflict/);
+      assert.ok(came, `the daemon never finished the merge:\n${said()}`);
+
+      assert.ok(/was not here — checked out from origin\/r155-work/.test(said()),
+        `the checkout was not started from origin/r155-work:\n${said()}`);
+
+      const carried = await readFile(join(path, 'branch-work.txt'), 'utf8').catch(() => null);
+      assert.ok(carried, "the checkout lost the branch's own work — it was cut fresh from " +
+        `main instead of starting from what origin already had:\n${said()}`);
+    });
 
 test('a merge session is never handed the tools that ask a person, whatever the rule says',
   async (t) => {
