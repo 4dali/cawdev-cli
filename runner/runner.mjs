@@ -4074,6 +4074,10 @@ const PROFILE_TOOLS = {
   // accept one. `entryNumber` is null on the claim of a cardless plan run —
   // `ClaimedRunView` wraps `presenter.of(run)` — so nothing new crosses the API
   // to say this.
+  //
+  // R198: a plan run on an ISSUE (a confirm) is handed exactly this list. What
+  // differs is one paragraph of prompt, not a tool — the "ended without a plan"
+  // note on the issue is the platform's to write, for the reason above.
   PLAN: (run) => [
     ...READ_ONLY_CAWDEV,
     ...READ_FILES,
@@ -4591,6 +4595,24 @@ ${run.openingPrompt}`;
     // `**undefined**`, and more to the point the first instruction is a
     // different one: write the thing you are about to plan.
     const noCard = !run.entryNumber;
+    // R198. A plan run on an ISSUE is a confirm: the platform moves the issue
+    // NEW → CONFIRMED when the plan is recorded, so the session has to be told
+    // that a plan is a verdict — and that the only honest ending for "I could
+    // not find it" is no plan at all. The kind comes from the API (`entryKind`),
+    // not from the first letter of the ref; a platform older than R198 sends
+    // neither and gets the card paragraph, which is what it did before.
+    const confirming =
+      !noCard && run.entryKind === 'ISSUE'
+        ? `
+**This is an issue, not a card, and it may not yet have been confirmed.** Your
+first job is to establish that it is real: find where in the code it happens and
+say so in the plan. If it is real, plan the fix — cawdev confirms the issue when
+your plan is recorded. If you cannot find the fault, do not write a plan:
+\`report\` kind "blocked" saying what you looked at and why you could not
+reproduce it, and the issue stays New for a person to look at. Whether something
+is *not* a bug is a person's call, not yours.
+`
+        : '';
     const opening = noCard
       ? `You are starting a new piece of work on the cawdev platform, in this project.
 This is the PLAN PHASE: you work out what to do, and you write it down. You do not
@@ -4616,7 +4638,7 @@ you.
 platform. This is the PLAN PHASE: you work out what to do, and you write it down.
 You do not build it, and you have no tool that could — so do not spend turns
 finding that out.
-${about}${briefLine(run)}`;
+${about}${briefLine(run)}${confirming}`;
     const asked = run.openingPrompt
       ? `\n\n${noCard ? 'They asked' : 'They also asked'}:\n\n${run.openingPrompt}`
       : '';
