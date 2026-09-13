@@ -670,6 +670,35 @@ const TOOLS = [
   },
 
   {
+    name: 'backlog_file',
+    description:
+      'File feedback into the project\'s backlog — NOT a card. Something you noticed that a ' +
+      'person should decide about: `kind` is your opinion, ISSUE (broken) or FEATURE (should ' +
+      'also do / do better). A WRITER later accepts it as a roadmap card, accepts it as an ' +
+      'issue, or refuses it with a reason. Use this when you are not sure it deserves a card; ' +
+      'use roadmap_create or issue_file when you are.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_ARGUMENT,
+        kind: { type: 'string', enum: ['ISSUE', 'FEATURE'] },
+        title: { type: 'string' },
+        body: { type: 'string', description: 'Markdown. What you noticed, and what should happen instead.' },
+      },
+      required: ['kind', 'title', 'body'],
+    },
+    handler: async (config, args) => {
+      const slug = await resolveProject(config, args.project);
+      const item = await api(config, `/api/projects/${slug}/backlog`, {
+        method: 'POST',
+        body: pick(args, ['kind', 'title', 'body']),
+      });
+      return `Filed in ${slug}'s backlog as pending: "${item.title}". Somebody will accept it ` +
+        'as a card or an issue, or refuse it.';
+    },
+  },
+
+  {
     name: 'roadmap_update',
     description:
       'Edit an entry\'s title, body, section, related ids or the cards it starts after. ' +

@@ -159,8 +159,10 @@ try {
     name: 'roadmap_comment',
     arguments: { project, number, body: 'A smoke-test comment. It cannot be deleted.' },
   });
+  // R127: the reply says "card N", not "RN" — this call never reads the card,
+  // so it does not know the kind and a prefix would be a guess.
   check('roadmap_comment says something beside the entry', !commented.result?.isError
-    && /Commented on R\d+/.test(textOf(commented.result)), textOf(commented.result));
+    && /Commented on card \d+/.test(textOf(commented.result)), textOf(commented.result));
 
   const fetched = await request('tools/call', {
     name: 'roadmap_get',
@@ -182,6 +184,23 @@ try {
   });
   check('roadmap_decline closes it with a reason', !declined.result?.isError
     && textOf(declined.result).includes('DECLINED'), textOf(declined.result));
+
+  // R199: feedback that is not a card. The smoke token holds roadmap:write,
+  // which covers backlog:write, so this is the same door an ordinary session
+  // files through. A backlog item is not an entry — it has no number — and it
+  // stays pending until a person triages it, which this script cannot do.
+  const filed = await request('tools/call', {
+    name: 'backlog_file',
+    arguments: {
+      project,
+      kind: 'FEATURE',
+      title: 'smoke test feedback (safe to refuse)',
+      body: 'Filed by tools/mcp/smoke.mjs. Refuse it.',
+    },
+  });
+  check('backlog_file files feedback as pending, not as a card', !filed.result?.isError
+    && /as pending/.test(textOf(filed.result)) && !/Created [Ri]\d+/.test(textOf(filed.result)),
+    textOf(filed.result));
 
   const changelog = await request('tools/call', {
     name: 'changelog_list',

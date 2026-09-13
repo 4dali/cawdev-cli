@@ -9,7 +9,10 @@ console, because the API was built to mirror these tools one-for-one.
 
 Mint a token in the cawdev console under **Agent tokens**. Grant it
 `roadmap:write` and `changelog:write` on the project. **You can only grant what
-you hold** — if you are a `READER` there, you get read scopes.
+you hold** — if you are a `READER` there, you get read scopes. A token that
+should only be able to *file feedback* — an application built beside cawdev,
+say — needs just `backlog:write`, which a `READER` may grant and which reaches
+nothing else, not even the roadmap (R199).
 
 Then in the repository the agent works in, add `.mcp.json`:
 
@@ -160,6 +163,7 @@ what you are allowed to do.
 | `roadmap_comment` | Say something *beside* an entry rather than inside it. |
 | `roadmap_set_status` | Move an entry, carrying whatever the status requires. |
 | `roadmap_decline` | Decline with a reason. The only exit. |
+| `backlog_file` | File **feedback**, not a card — something a person should decide about. A WRITER accepts it as a card or an issue, or refuses it (R199). |
 | `changelog_list` | The changelog, grouped by release, newest first. |
 | `changelog_get` | One entry. |
 | `changelog_add` | Add an entry; no version means `Unreleased`. |

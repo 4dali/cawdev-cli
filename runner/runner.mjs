@@ -189,6 +189,10 @@ const DEFAULTS = {
     // `--permission-prompt-tool`, so the call is refused with no question asked.
     'mcp__cawdev__issue_file',
     'mcp__cawdev__propose_entry',
+    // R199. Feedback that is not a card, for a session that noticed something
+    // and is not sure it deserves one. A writer, like issue_file: a read-only
+    // stage is refused it by shape and not by this list.
+    'mcp__cawdev__backlog_file',
     // R96's rounds. An interview is the one profile that cannot work without
     // these, and they were missing for the same reason as the two above.
     'mcp__cawdev__ask_group',
