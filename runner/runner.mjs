@@ -1485,6 +1485,24 @@ async function prepareWorkingCopy(path, branch, defaultBranch, allowDirty) {
   const exists = await git(path, ['branch', '--list', branch]);
   if (exists) {
     await checkoutCarrying(path, ['checkout', branch], dirty);
+    // R212 — a branch can now return to a checkout it left. Its last run here
+    // may have been followed by runs elsewhere that pushed, so the local ref
+    // is stale: strictly behind origin is brought up, and anything else — a
+    // commit origin does not have — is exactly the case the pin protects and
+    // is not touched. Skipped on a dirty carry, because a merge over
+    // uncommitted changes can refuse half-way through and leave the tree in
+    // a state the person did not put it in.
+    if (!dirty) {
+      const remoteRef = `origin/${branch}`;
+      const onOrigin = await git(path, ['rev-parse', '--verify', '--quiet', remoteRef])
+        .then(() => true)
+        .catch(() => false);
+      if (onOrigin) {
+        await git(path, ['merge', '--ff-only', remoteRef])
+          .then(() => log(`  ${branch} fast-forwarded to ${remoteRef}`))
+          .catch(() => log(`  ${branch} has commits origin does not — kept as it is`));
+      }
+    }
   } else {
     // Branch off the *remote* default when there is one, so the agent starts
     // from what everyone else has, not from whatever this checkout was left on.
@@ -7022,12 +7040,20 @@ async function main() {
         //
         // Which checkout this one gets. Null for a run that needs none.
         //
-        // R86/R87: the platform may NAME one, and then it is the only answer.
-        // A later run of a pinned branch has its unpushed commits in that one
-        // directory, and a resumed run has its uncommitted work there — so
+        // R86/R87: the platform may NAME one (`workspace`), and then it is the
+        // only answer. It does so while the branch is BOUND to that checkout:
+        // a later run of a branch whose unpushed commits are in that one
+        // directory, or a resumed run whose uncommitted work is there — so
         // preparing it in whichever checkout happens to be free is preparing it
         // from `origin` with the work still sitting three directories away.
         // Waiting is the right behaviour and the reason is worth saying.
+        //
+        // R212: once the branch is entirely on the remote and nothing is
+        // writing it, the platform names only a PREFERENCE
+        // (`preferredWorkspace`) — the checkout the branch last ran in, where
+        // the local ref already is. Taken when free, passed over when not: a
+        // busy preferred checkout is not worth waiting for, because origin has
+        // everything and prepareWorkingCopy brings a stale ref up to it.
         let workspace = null;
         if (writes) {
           const pinned = offered.workspace ?? null;
@@ -7044,13 +7070,21 @@ async function main() {
               continue;
             }
             if (held.has(pinned)) {
-              noteQueued(offered.run, `waiting for ${pinned}, which is busy`);
+              noteQueued(
+                offered.run,
+                `waiting for ${pinned}, which is busy — the branch has work only that checkout holds`,
+              );
               skipped += 1;
               continue;
             }
             workspace = pinned;
           } else {
-            workspace = config.projects[slug].workspaces.find((path) => !held.has(path)) ?? null;
+            const preferred = offered.preferredWorkspace ?? null;
+            if (preferred && config.projects[slug].workspaces.includes(preferred) && !held.has(preferred)) {
+              workspace = preferred;
+            } else {
+              workspace = config.projects[slug].workspaces.find((path) => !held.has(path)) ?? null;
+            }
             if (!workspace) {
               const total = config.projects[slug].workspaces.length;
               noteQueued(

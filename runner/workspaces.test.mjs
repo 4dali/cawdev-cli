@@ -35,6 +35,25 @@ async function aRepository() {
   return path;
 }
 
+/**
+ * A checkout that shares an `origin` with another — R212. `aRepository()` has
+ * no remote, which is fine while a branch only ever lives in one checkout; a
+ * branch that moves between checkouts needs a remote for them to move through.
+ */
+async function aBareOrigin() {
+  const path = await mkdtemp(join(tmpdir(), 'cawdev-origin-'));
+  await run('git', ['init', '-q', '--bare', '-b', 'main'], { cwd: path });
+  return path;
+}
+
+async function aClone(origin) {
+  const path = await mkdtemp(join(tmpdir(), 'cawdev-ws-'));
+  await run('git', ['clone', '-q', origin, path]);
+  await run('git', ['config', 'user.email', 'test@cawdev.test'], { cwd: path });
+  await run('git', ['config', 'user.name', 'Test'], { cwd: path });
+  return path;
+}
+
 function codingRun(id, label) {
   return { id, projectSlug: 'board', label, branch: `r${id}-work`, profile: 'CODE' };
 }
@@ -177,4 +196,110 @@ test('a bare path is still one workspace', async (t) => {
     platform.transitions.find((each) => each.state === 'RUNNING').workspace,
     workspace,
   );
+});
+
+test("a pushed branch's next run takes the free checkout, not the busy one it prefers", async (t) => {
+  // R212. run-p takes workspaces[0] first — the daemon walks offers in order
+  // and `find` returns the first free path — and run-q would PREFER that same
+  // checkout. Its branch is entirely on the remote, so the preference is not
+  // worth waiting for: it goes into workspaces[1] on the same pass.
+  const workspaces = [await aRepository(), await aRepository()];
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-workspaces-prefers',
+    workspaces,
+    offers: [
+      codingRun('run-p', 'first card'),
+      { ...codingRun('run-q', 'a pushed branch'), prefers: workspaces[0] },
+    ],
+  });
+
+  const both = await platform.until(
+    (transitions) => transitions.filter((each) => each.state === 'RUNNING').length === 2,
+  );
+  assert.ok(both, `the pushed branch waited for its old checkout:\n${said()}`);
+
+  const q = platform.transitions.find((each) => each.state === 'RUNNING' && each.runId === 'run-q');
+  assert.equal(q.workspace, workspaces[1]);
+  assert.ok(!said().includes('which is busy'), `it waited when it did not have to:\n${said()}`);
+});
+
+test('a free preferred checkout is the one taken', async (t) => {
+  // R212's other half: the preference is honoured when it can be. Offered
+  // first with both checkouts free, run-t goes where its branch already is
+  // rather than into the first free path, which is what `find` alone gives.
+  const workspaces = [await aRepository(), await aRepository()];
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-workspaces-preferred-free',
+    workspaces,
+    offers: [{ ...codingRun('run-t', 'a pushed branch'), prefers: workspaces[1] }],
+  });
+
+  const started = await platform.until((transitions) => transitions.some((each) => each.state === 'RUNNING'));
+  assert.ok(started, `the run never started:\n${said()}`);
+  const t1 = platform.transitions.find((each) => each.state === 'RUNNING' && each.runId === 'run-t');
+  assert.equal(t1.workspace, workspaces[1]);
+});
+
+test('a bound branch still waits for its checkout and says what it is protecting', async (t) => {
+  // R86/R87, unchanged by R212 for a branch that is bound: the checkout holds
+  // work origin does not, and the run waits for it however many others are
+  // free — and the reason, which reaches the run page, says why.
+  const workspaces = [await aRepository(), await aRepository()];
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-workspaces-bound',
+    workspaces,
+    offers: [
+      codingRun('run-r', 'first card'),
+      { ...codingRun('run-s', 'a bound branch'), mustUse: workspaces[0] },
+    ],
+  });
+
+  await platform.until((transitions) => transitions.some((each) => each.state === 'RUNNING'));
+  const waited = await platform.until(
+    () => /waiting for .* which is busy — the branch has work only that checkout holds/.test(said()),
+  );
+  assert.ok(waited, `nothing said why the bound branch waited:\n${said()}`);
+  const started = platform.transitions.filter((each) => each.state === 'RUNNING');
+  assert.deepEqual(started.map((each) => each.runId), ['run-r']);
+});
+
+test('a stale local branch is brought up to origin before a session starts', async (t) => {
+  // R212. Two checkouts of one origin. The branch was written and pushed from
+  // ws1; ws2 remembers it at an older commit — the shape a checkout is left in
+  // after the branch moved on to another one. A session starting in ws2 must
+  // start on what origin has, not on what ws2 remembered, or its first push
+  // is refused and its first commit sits on old code.
+  const origin = await aBareOrigin();
+  const ws1 = await aClone(origin);
+  await writeFile(join(ws1, 'README.md'), '# a project\n');
+  await run('git', ['add', '.'], { cwd: ws1 });
+  await run('git', ['commit', '-q', '-m', 'first'], { cwd: ws1 });
+  await run('git', ['push', '-q', '-u', 'origin', 'main'], { cwd: ws1 });
+  const ws2 = await aClone(origin);
+  // The stale ref: r9-work at main, in ws2.
+  await run('git', ['branch', 'r9-work', 'main'], { cwd: ws2 });
+  // The real branch: one commit past main, pushed from ws1.
+  await run('git', ['checkout', '-q', '-b', 'r9-work'], { cwd: ws1 });
+  await writeFile(join(ws1, 'work.txt'), 'done elsewhere\n');
+  await run('git', ['add', '.'], { cwd: ws1 });
+  await run('git', ['commit', '-q', '-m', 'work'], { cwd: ws1 });
+  await run('git', ['push', '-q', '-u', 'origin', 'r9-work'], { cwd: ws1 });
+  t.after(async () => {
+    await rm(origin, { recursive: true, force: true });
+    await rm(ws1, { recursive: true, force: true });
+  });
+
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-workspaces-stale',
+    workspaces: [ws2],
+    offers: [codingRun('9', 'the card')],
+  });
+
+  const started = await platform.until((transitions) => transitions.some((each) => each.state === 'RUNNING'));
+  assert.ok(started, `the run never started:\n${said()}`);
+
+  const { stdout: inWs2 } = await run('git', ['rev-parse', 'HEAD'], { cwd: ws2 });
+  const { stdout: pushed } = await run('git', ['rev-parse', 'r9-work'], { cwd: ws1 });
+  assert.equal(inWs2.trim(), pushed.trim(), `ws2 started on stale code:\n${said()}`);
+  assert.match(said(), /r9-work fast-forwarded to origin\/r9-work/);
 });

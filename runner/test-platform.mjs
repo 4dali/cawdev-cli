@@ -157,7 +157,16 @@ export async function fakePlatform({
         // Everything still unclaimed, every time — a real queue re-offers a run
         // it has not given to anybody, and the daemon's own bookkeeping is what
         // stops it claiming the same one twice.
-        return response.end(JSON.stringify(remaining.map((run) => ({ run }))));
+        //
+        // `mustUse` and `prefers` are test-only fields read off the fixture run
+        // and echoed nowhere else: the checkout the real platform names on the
+        // offer while the branch is bound (R86), and the one it only prefers
+        // once the branch is entirely on the remote (R212).
+        return response.end(JSON.stringify(remaining.map((run) => ({
+          run,
+          workspace: run.mustUse ?? null,
+          preferredWorkspace: run.prefers ?? null,
+        }))));
       }
       if (url.includes('/claim/')) {
         const id = url.split('/claim/')[1];

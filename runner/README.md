@@ -341,6 +341,15 @@ directory) or **discards** it, which is the only thing that frees it. The
 runners page lists what each machine is holding, so a workspace nobody
 remembers cannot quietly sit taken.
 
+**A branch goes back where it was, until it does not have to** (R86, R212). A
+branch's later runs are offered the checkout it last ran in; while that
+checkout holds commits origin does not — or a failed run's tree — it is the
+only answer and the run waits, saying so (*waiting for …, which is busy — the
+branch has work only that checkout holds*). Once the last run pushed and
+nothing is writing the branch, the platform only *prefers* it: a busy preferred
+checkout means any free one, on this machine or another, and a stale local ref
+is fast-forwarded to `origin` before the session starts.
+
 **A cancelled run's uncommitted work is stashed if the person cancelling asked
 for it** (R217). A cancelled run releases its checkout — nothing can come back
 for it — so the run page, when the daemon's last look counted uncommitted
