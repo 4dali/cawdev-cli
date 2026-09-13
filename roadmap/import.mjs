@@ -42,8 +42,10 @@ async function main() {
       `${slug} holds ${known.size}.`,
   );
 
-  // Numbers are allocated by the platform in sequence, so preserving them means
-  // creating in order from an empty (or exactly-prefix-matching) project.
+  // Numbers are allocated by the platform in sequence — the roadmap's own
+  // sequence since R221, which an issue filed today no longer advances — so
+  // preserving them means creating in order from an empty (or
+  // exactly-prefix-matching) project.
   const missing = entries.filter((entry) => !known.has(entry.number));
   const nextExpected = known.size ? Math.max(...known.keys()) + 1 : 1;
   if (missing.length && missing[0].number !== nextExpected) {
@@ -100,13 +102,15 @@ async function main() {
     created += 1;
   }
 
-  // Pass 2: related and starts-after ids, now that every entry exists.
+  // Pass 2: related and starts-after refs, now that every entry exists. Refs
+  // and not numbers — R221: `i90` and `R90` are two cards, and the prefix the
+  // file wrote is the only thing that says which one was meant.
   let linked = 0;
   for (const entry of entries) {
     if (!entry.related.length && !entry.after?.length) continue;
     await call(config, `/api/projects/${slug}/roadmap/${entry.number}`, {
       method: 'PATCH',
-      body: { related: entry.related, after: entry.after ?? [] },
+      body: { related: entry.relatedRefs ?? [], after: entry.afterRefs ?? [] },
     });
     linked += 1;
   }

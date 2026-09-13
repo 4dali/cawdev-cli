@@ -442,7 +442,10 @@ const TOOLS = [
       'thing they exist to stop.',
     inputSchema: {
       type: 'object',
-      properties: { ...PROJECT_ARGUMENT, number: { type: 'integer' } },
+      properties: { ...PROJECT_ARGUMENT, number: {
+          type: ['string', 'integer'],
+          description: 'The card by ref — R91, i91 — or a bare number for a roadmap card (R221).',
+        } },
       required: ['number'],
     },
     handler: async (config, args) => {
@@ -534,7 +537,10 @@ const TOOLS = [
       type: 'object',
       properties: {
         ...PROJECT_ARGUMENT,
-        number: { type: 'integer' },
+        number: {
+          type: ['string', 'integer'],
+          description: 'The card by ref — R91, i91 — or a bare number for a roadmap card (R221).',
+        },
         body: { type: 'string', description: 'Markdown.' },
       },
       required: ['number', 'body'],
@@ -545,8 +551,8 @@ const TOOLS = [
         method: 'POST',
         body: { body: args.body },
       });
-      // The bare number: this call is given one and never reads the card, so
-      // it has no kind and a prefix here would be a guess — R127.
+      // As asked for: this call is given a ref and never reads the card back,
+      // and a bare number was a roadmap card — R221.
       return `Commented on card ${args.number} in ${slug}. It cannot be deleted — that is the point.`;
     },
   },
@@ -583,13 +589,17 @@ const TOOLS = [
         version: { type: 'string' },
         reason: { type: 'string' },
         section: { type: 'string', description: 'Which part of the roadmap, e.g. "Phase 2 — …".' },
-        related: { type: 'array', items: { type: 'integer' } },
+        related: {
+          type: 'array',
+          items: { type: ['string', 'integer'] },
+          description: 'Refs — R12, i15; a bare number is a roadmap card (R221).',
+        },
         after: {
           type: 'array',
-          items: { type: 'integer' },
+          items: { type: ['string', 'integer'] },
           description:
             'Cards this one starts coding after — it waits in the queue until every one of ' +
-            'them is MERGED or SHIPPED. Same project, must exist, never itself.',
+            'them is MERGED or SHIPPED. Refs, as `related`. Same project, must exist, never itself.',
         },
       },
       required: ['title'],
@@ -645,8 +655,8 @@ const TOOLS = [
       'File an issue: something that is broken, with how badly. Lands at NEW — filed and not ' +
       'yet triaged — unless you say CONFIRMED, which claims you have already checked it. The ' +
       'severity is required: it is how the board is ordered. Use `related` to name the card it ' +
-      'was found on. It gets a number from the same sequence the roadmap uses, written with an ' +
-      'i — i91 — so a number addresses exactly one card whichever board it is on.',
+      'was found on, by ref (R84). Issues count on their own sequence — R221 — and are ' +
+      'written with an i: i91 is the ninety-first issue, and R91 is another card.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -655,7 +665,11 @@ const TOOLS = [
         body: { type: 'string', description: 'Markdown. What happens, and what should instead.' },
         severity: { type: 'string', enum: ['CRITICAL', 'MEDIUM', 'MINOR'] },
         status: { type: 'string', enum: ['NEW', 'CONFIRMED'] },
-        related: { type: 'array', items: { type: 'integer' } },
+        related: {
+          type: 'array',
+          items: { type: ['string', 'integer'] },
+          description: 'Refs — R12, i15; a bare number is a roadmap card (R221).',
+        },
       },
       required: ['title', 'severity'],
     },
@@ -701,23 +715,31 @@ const TOOLS = [
   {
     name: 'roadmap_update',
     description:
-      'Edit an entry\'s title, body, section, related ids or the cards it starts after. ' +
+      'Edit an entry\'s title, body, section, related refs or the cards it starts after. ' +
       'Use roadmap_set_status to move it.',
     inputSchema: {
       type: 'object',
       properties: {
         ...PROJECT_ARGUMENT,
-        number: { type: 'integer' },
+        number: {
+          type: ['string', 'integer'],
+          description: 'The card by ref — R91, i91 — or a bare number for a roadmap card (R221).',
+        },
         title: { type: 'string' },
         body: { type: 'string' },
         section: { type: 'string' },
-        related: { type: 'array', items: { type: 'integer' } },
+        related: {
+          type: 'array',
+          items: { type: ['string', 'integer'] },
+          description: 'Refs — R12, i15; a bare number is a roadmap card (R221). [] clears it.',
+        },
         after: {
           type: 'array',
-          items: { type: 'integer' },
+          items: { type: ['string', 'integer'] },
           description:
             'Cards this one starts coding after — it waits in the queue until every one of ' +
-            'them is MERGED or SHIPPED. Same project, must exist, never itself. [] clears it.',
+            'them is MERGED or SHIPPED. Refs, as `related`. Same project, must exist, never ' +
+            'itself. [] clears it.',
         },
       },
       required: ['number'],
@@ -746,7 +768,10 @@ const TOOLS = [
       type: 'object',
       properties: {
         ...PROJECT_ARGUMENT,
-        number: { type: 'integer' },
+        number: {
+          type: ['string', 'integer'],
+          description: 'The card by ref — R91, i91 — or a bare number for a roadmap card (R221).',
+        },
         status: {
           type: 'string',
           enum: [
@@ -784,7 +809,10 @@ const TOOLS = [
       'The reason is the point: it stops the idea being proposed again.',
     inputSchema: {
       type: 'object',
-      properties: { ...PROJECT_ARGUMENT, number: { type: 'integer' }, reason: { type: 'string' } },
+      properties: { ...PROJECT_ARGUMENT, number: {
+          type: ['string', 'integer'],
+          description: 'The card by ref — R91, i91 — or a bare number for a roadmap card (R221).',
+        }, reason: { type: 'string' } },
       required: ['number', 'reason'],
     },
     handler: async (config, args) => {
@@ -852,12 +880,13 @@ const TOOLS = [
         version: { type: 'string' },
         breaking: { type: 'boolean' },
         entryNumber: {
-          type: 'integer',
+          type: ['string', 'integer'],
           description:
-            'The roadmap card or issue this entry describes — R156. Set it. Until R156 the only '
-            + 'link was the ref you type into the prose, which cannot be queried, so a release '
-            + 'could not tell whether a card already had an entry and would write a second one '
-            + 'beside the first. Put the ref in the text as well; that is what a reader sees.',
+            'The roadmap card or issue this entry describes — R156 — by ref: R91, i91, or a '
+            + 'bare number for a roadmap card (R221). Set it. Until R156 the only link was the '
+            + 'ref you type into the prose, which cannot be queried, so a release could not '
+            + 'tell whether a card already had an entry and would write a second one beside '
+            + 'the first. Put the ref in the text as well; that is what a reader sees.',
         },
       },
       required: ['category', 'text'],
@@ -887,10 +916,11 @@ const TOOLS = [
         version: { type: 'string' },
         breaking: { type: 'boolean' },
         entryNumber: {
-          type: 'integer',
+          type: ['string', 'integer'],
           description:
-            'The roadmap card or issue this entry describes — R156. Set it on an older entry '
-            + 'that has never been linked; omitting it leaves whatever link is already there.',
+            'The roadmap card or issue this entry describes — R156 — by ref (R91, i91; a bare '
+            + 'number is a roadmap card). Set it on an older entry that has never been linked; '
+            + 'omitting it leaves whatever link is already there.',
         },
       },
       required: ['number'],
@@ -917,7 +947,10 @@ const TOOLS = [
     handler: async (config) => {
       const { runId, project } = await requireRun(config);
       const run = await api(config, `/api/projects/${project}/runs/${runId}`);
-      const entry = await api(config, `/api/projects/${project}/roadmap/${run.entryNumber}`);
+      // By ref — R221: a number alone is two cards, and the run says which.
+      // Falls back to the number for a platform older than R221's view.
+      const cardRef = run.entryRef ?? run.entryNumber;
+      const entry = await api(config, `/api/projects/${project}/roadmap/${cardRef}`);
       const messages = await api(config, `/api/projects/${project}/runs/${runId}/messages`);
       const questions = await api(config, `/api/projects/${project}/runs/${runId}/questions`);
       // The discussion comes with the card, not only from roadmap_get. This is
@@ -925,7 +958,7 @@ const TOOLS = [
       // at the start is an argument that gets had again.
       const comments = await api(
         config,
-        `/api/projects/${project}/roadmap/${run.entryNumber}/comments`,
+        `/api/projects/${project}/roadmap/${cardRef}/comments`,
       );
       // Every session this card has already had — R38. Its own try, because a
       // history that cannot be read is not a reason to fail the one call a
@@ -933,7 +966,7 @@ const TOOLS = [
       // and the honest consequence of not knowing is to say nothing about it.
       const history = await api(
         config,
-        `/api/projects/${project}/roadmap/${run.entryNumber}/runs`,
+        `/api/projects/${project}/roadmap/${cardRef}/runs`,
       ).catch(() => []);
       // R99. What this project IS, as a machine last read it out of
       // `docs/brief/`. Its own try, like the history above and for the same
@@ -951,7 +984,7 @@ const TOOLS = [
       // call it makes when it has lost its place.
       const plans = await api(
         config,
-        `/api/projects/${project}/roadmap/${run.entryNumber}/plans`,
+        `/api/projects/${project}/roadmap/${cardRef}/plans`,
       ).catch(() => []);
 
       const lines = [];

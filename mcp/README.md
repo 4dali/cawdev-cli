@@ -136,10 +136,14 @@ being proposed again in six months. Same for changelog entries — correct the
 text, do not remove the record. Same for comments: nothing removes one, and the
 most you can do to your own is correct its wording.
 
-### Ids are permanent
+### Ids are permanent, and a card is named by its ref
 
-An entry's R-number never changes and is never reused. Commit messages and code
-comments point at it.
+An entry's number never changes and is never reused. Commit messages and code
+comments point at it. Since R221 a roadmap card and an issue each count on
+their own sequence, so `R91` and `i91` are two cards: wherever a tool takes
+`number`, `related`, `after` or `entryNumber`, pass the ref — `"i91"` for an
+issue — and a bare `91` is read as the roadmap card, which is what it always
+was.
 
 ### When a call is refused
 

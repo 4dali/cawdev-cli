@@ -11,15 +11,16 @@
 > node tools/roadmap/export.mjs cawdev --issues
 > ```
 
-What is broken, and how badly. Issues share the roadmap's numbering — one
-sequence across both, so a commit that names a number is not ambiguous — and
-everything else about them: comments, history, sessions, and the development
-board a fix runs on.
+What is broken, and how badly. Issues share everything about a roadmap card
+but its numbering: comments, history, sessions, and the development board a fix
+runs on.
 
-One sequence, two prefixes. Card 91 filed as an issue is written `i91`; there is
-no `R91` as well, because there is only one card 91, and `i91` and `R91` never
-both exist. The prefix says which board it is on and nothing more — the number
-is the identity, and every input still takes the bare integer.
+Two sequences, two prefixes — R221. Issues count on their own: `i1` is the
+first issue filed, whatever the roadmap has reached, and `i91` and `R91` are
+two cards. The ref — the prefix and the number together — is the identity, and
+it is what names a card everywhere: in a `Related:` line, in a path, in a
+branch name (`i91-…`). Issues filed before R221 keep the numbers they had on the
+roadmap's sequence, which is why this file starts where it starts.
 
 What is different is the question. The roadmap answers *what do we intend to
 build*; this answers *what is wrong right now*. That is why they are two files

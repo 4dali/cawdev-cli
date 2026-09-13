@@ -186,15 +186,19 @@ try {
 
   // The branch the console proposes. Kept in step with proposeBranch() in
   // runs.service.ts, and with the working method that names branches after the
-  // entry — roadmap.mjs --live checks CODING branches exist.
-  const branch = `r${entry.number}-${entry.title
+  // entry — roadmap.mjs --live checks CODING branches exist. R221: the prefix
+  // is the card's REF lowercased — `r` for a roadmap card, `i` for an issue —
+  // so a person starting an issue cuts the same name PhaseChain.branchFor does.
+  const proposeBranch = (card) => `${card.ref.toLowerCase()}-${card.title
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .split('-')
     .slice(0, 5)
     .join('-')}`;
-  check('the proposed branch names the entry', branch === `r${entry.number}-console-smoke-safe-to-decline`, branch);
+  const branch = proposeBranch(entry);
+  check('the proposed branch names the entry, with an r for a roadmap card',
+    branch === `r${entry.number}-console-smoke-safe-to-decline`, branch);
 
   // --- the discussion under the entry ---------------------------------------
 
@@ -821,10 +825,12 @@ try {
     expect: 400,
     body: JSON.stringify({ prompt: 'x', aboutEntry: 99999 }),
   });
-  // "no entry 99999" since #144, which stopped spelling a number as a ref
-  // before it knew the kind; this read `no R99999` and had failed since.
+  // "no entry R99999" since R221: a bare number in `aboutEntry` is a roadmap
+  // card, so the refusal names the ref it looked for. (#144 had made this
+  // `no entry 99999`, back when a number could not be spelled as a ref before
+  // the kind was known.)
   check('a card the project does not have is refused, rather than silently dropped',
-    /no entry 99999/.test(noSuchCard?.message ?? ''), JSON.stringify(noSuchCard));
+    /no entry R99999/.test(noSuchCard?.message ?? ''), JSON.stringify(noSuchCard));
 
   await console_(`/api/projects/${project}/runs/${aboutCard.id}/transition`, {
     method: 'POST',
@@ -844,7 +850,7 @@ try {
     { title: `a card from R${entry.number}'s question`, body: '**Build:** nothing.' });
   const afterCreate = await console_(`/api/projects/${project}/runs/${question.id}`);
   check('the run reports the card its session created',
-    afterCreate.created?.some((each) => each.number === madeByRun.number),
+    afterCreate.created?.some((each) => each.ref === madeByRun.ref),
     JSON.stringify(afterCreate.created));
 
   // And a person's card afterwards is not attributed to it.
@@ -1056,7 +1062,9 @@ try {
 
   // R44: the card is named after the finding, files where the person said, and
   // shows the severity rather than spending its title on it.
-  const acceptedCard = await console_(`/api/projects/${project}/roadmap/${accepted.entryNumber}`);
+  // By ref — R221: an accepted finding is an issue, and its number alone
+  // would read as the roadmap card beside it.
+  const acceptedCard = await console_(`/api/projects/${project}/roadmap/${accepted.entryRef}`);
   check('the card takes the finding’s title, with no severity welded on',
     acceptedCard.title === 'a finding', JSON.stringify(acceptedCard.title));
   check('it lands in the section the person chose, at the status they chose',
@@ -1073,9 +1081,11 @@ try {
     .find((entry) => entry.number === accepted.entryNumber);
   check('the issues board carries the finding too, without a body',
     boarded?.audit?.severity === 'CRITICAL' && !boarded.body, JSON.stringify(boarded));
+  // By ref, not number — R221: the roadmap card sharing the issue's number is
+  // a different card, and its presence here would be no finding.
   check('and it is NOT on the roadmap board, which asks a different question',
     !(await console_(`/api/projects/${project}/roadmap?brief=true`))
-      .some((entry) => entry.number === accepted.entryNumber));
+      .some((entry) => entry.ref === accepted.entryRef));
 
   const secondFinding = await asToken(auditor.runToken,
     `/api/projects/${project}/runs/${audit.id}/proposals`,
@@ -1083,7 +1093,7 @@ try {
   const unfiled = await console_(
     `/api/projects/${project}/runs/${audit.id}/proposals/${secondFinding.id}/accept`,
     { method: 'POST' });
-  const unfiledCard = await console_(`/api/projects/${project}/roadmap/${unfiled.entryNumber}`);
+  const unfiledCard = await console_(`/api/projects/${project}/roadmap/${unfiled.entryRef}`);
   // R85: NEW, not PLANNED — "filed, nobody has looked" is where a finding
   // starts, and PLANNED is a roadmap answer to a question issues do not ask.
   check('accepting without saying where files it under a named bucket, at NEW',
@@ -1116,7 +1126,7 @@ try {
   const asCard = await console_(
     `/api/projects/${project}/runs/${audit.id}/proposals/${fourthFinding.id}/accept`,
     { method: 'POST', body: JSON.stringify({}) });
-  const proposedCard = await console_(`/api/projects/${project}/roadmap/${asCard.entryNumber}`);
+  const proposedCard = await console_(`/api/projects/${project}/roadmap/${asCard.entryRef}`);
   check('accepted with the defaults, it is a roadmap card at CONSIDERING with no severity',
     proposedCard.kind === 'ROADMAP' && proposedCard.status === 'CONSIDERING'
       && proposedCard.severity == null,
@@ -1126,10 +1136,11 @@ try {
     JSON.stringify(proposedCard.audit));
   const roadmapNow = await console_(`/api/projects/${project}/roadmap?brief=true`);
   check('it is on the roadmap board, and the issues board does not have it',
-    roadmapNow.some((entry) => entry.number === asCard.entryNumber
+    roadmapNow.some((entry) => entry.ref === asCard.entryRef
       && entry.audit?.runId === audit.id)
+      // By ref — R221: an issue may share the card's number.
       && !(await console_(`/api/projects/${project}/issues?brief=true`))
-        .some((entry) => entry.number === asCard.entryNumber));
+        .some((entry) => entry.ref === asCard.entryRef));
 
   let rankedCard = null;
   try {
@@ -1211,7 +1222,9 @@ try {
   const filedOnTheWay = await console_(
     `/api/projects/${project}/runs/${staging.id}/proposals/${onTheWay.id}/accept`,
     { method: 'POST', body: JSON.stringify({}) });
-  const issueOnTheWay = await console_(`/api/projects/${project}/roadmap/${filedOnTheWay.entryNumber}`);
+  // By ref, not number: since R221 an issue and a card can share a number,
+  // and a bare one under /roadmap reads as the card.
+  const issueOnTheWay = await console_(`/api/projects/${project}/roadmap/${filedOnTheWay.entryRef}`);
   check('the issue lands on the issues board with its severity, unrelated to the cards',
     issueOnTheWay.kind === 'ISSUE' && issueOnTheWay.severity === 'MINOR'
       && issueOnTheWay.related.length === 0
@@ -1277,15 +1290,28 @@ try {
       body: 'Filed by the console smoke, and declined by it.',
     }),
   });
-  check('an issue is filed at NEW with its severity, on the roadmap numbering',
-    filed.kind === 'ISSUE' && filed.severity === 'MINOR' && filed.status === 'NEW',
+  check('an issue is filed at NEW with its severity, on the issues\' own numbering',
+    filed.kind === 'ISSUE' && filed.severity === 'MINOR' && filed.status === 'NEW'
+      && filed.ref === `i${filed.number}`,
     JSON.stringify(filed).slice(0, 200));
+  // R221: the proposed branch for an issue is i-prefixed, the same name the
+  // platform's own chained fix would cut.
+  check('the proposed branch for an issue starts with an i',
+    proposeBranch(filed).startsWith(`i${filed.number}-`), proposeBranch(filed));
 
   const issues = await console_(`/api/projects/${project}/issues`);
   check('it is on the issues board and not on the roadmap',
-    issues.some((each) => each.number === filed.number)
+    issues.some((each) => each.ref === filed.ref)
       && (await console_(`/api/projects/${project}/roadmap`))
-        .every((each) => each.number !== filed.number));
+        .every((each) => each.ref !== filed.ref));
+  // R221: the issue is reached by ref under /roadmap, and a bare number there
+  // is the roadmap card sharing it — or nothing.
+  const byRef = await console_(`/api/projects/${project}/roadmap/${filed.ref}`);
+  check('/roadmap/i<n> reads the issue', byRef.ref === filed.ref && byRef.kind === 'ISSUE');
+  const bareNumber = await console_(`/api/projects/${project}/roadmap/${filed.number}`)
+    .catch((failure) => failure);
+  check('/roadmap/<n> is the roadmap card of that number, never the issue',
+    bareNumber?.kind !== 'ISSUE', JSON.stringify(bareNumber).slice(0, 200));
 
   const reRanked = await console_(
     `/api/projects/${project}/issues/${filed.number}/severity`,
@@ -1311,7 +1337,7 @@ try {
 
   // Declined rather than left: entries cannot be deleted, and a smoke-test
   // issue sitting open on a real board is noise somebody has to triage.
-  await console_(`/api/projects/${project}/roadmap/${filed.number}/decline`, {
+  await console_(`/api/projects/${project}/roadmap/${filed.ref}/decline`, {
     method: 'POST',
     body: JSON.stringify({ reason: 'A smoke-test issue, declined by the test that made it.' }),
   }).catch(() => undefined);
