@@ -1102,6 +1102,44 @@ try {
     /NEW/.test(refusedStart?.message ?? '') && /CONFIRMED/.test(refusedStart?.message ?? ''),
     JSON.stringify(refusedStart));
 
+  // R214: an audit says what kind of thing it found. A card proposal has no
+  // severity, lands on the ROADMAP board at CONSIDERING, and still names the
+  // audit that raised it — with nothing to say about a ranking there was not.
+  const fourthFinding = await asToken(auditor.runToken,
+    `/api/projects/${project}/runs/${audit.id}/proposals`,
+    { kind: 'ROADMAP', title: 'a fourth finding', body: 'Should also do this.' });
+  check('an audit proposes a roadmap card, with no severity',
+    fourthFinding.kind === 'ROADMAP' && fourthFinding.severity == null,
+    JSON.stringify(fourthFinding));
+  const asCard = await console_(
+    `/api/projects/${project}/runs/${audit.id}/proposals/${fourthFinding.id}/accept`,
+    { method: 'POST', body: JSON.stringify({}) });
+  const proposedCard = await console_(`/api/projects/${project}/roadmap/${asCard.entryNumber}`);
+  check('accepted with the defaults, it is a roadmap card at CONSIDERING with no severity',
+    proposedCard.kind === 'ROADMAP' && proposedCard.status === 'CONSIDERING'
+      && proposedCard.severity == null,
+    JSON.stringify([proposedCard.kind, proposedCard.status, proposedCard.severity]));
+  check('and it still links back to the audit, ranked by nobody',
+    proposedCard.audit?.runId === audit.id && proposedCard.audit?.severity == null,
+    JSON.stringify(proposedCard.audit));
+  const roadmapNow = await console_(`/api/projects/${project}/roadmap?brief=true`);
+  check('it is on the roadmap board, and the issues board does not have it',
+    roadmapNow.some((entry) => entry.number === asCard.entryNumber
+      && entry.audit?.runId === audit.id)
+      && !(await console_(`/api/projects/${project}/issues?brief=true`))
+        .some((entry) => entry.number === asCard.entryNumber));
+
+  let rankedCard = null;
+  try {
+    await asToken(auditor.runToken, `/api/projects/${project}/runs/${audit.id}/proposals`,
+      { kind: 'ROADMAP', severity: 'MINOR', title: 'a ranked card', body: 'No.' });
+  } catch (failure) {
+    rankedCard = failure.message;
+  }
+  check('a roadmap proposal with a severity is refused, not silently unranked',
+    /-> 400/.test(rankedCard ?? '') && /no severity/.test(rankedCard ?? ''),
+    JSON.stringify(rankedCard));
+
   const twice = await console_(
     `/api/projects/${project}/runs/${audit.id}/proposals/${finding.id}/accept`,
     { method: 'POST', expect: 409 });

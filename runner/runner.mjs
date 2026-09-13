@@ -4498,15 +4498,21 @@ and the roadmap; you cannot change either. No edits, no commands, no git — and
 creating roadmap entries directly.
 ${about}${briefLine(run)}
 What you find becomes a **proposal** with \`propose_entry\`, one per finding, each
-with a severity:
+naming its kind, and an issue with a severity:
 
 - \`critical\` — it is broken, unsafe, or loses data
 - \`medium\` — it will hurt, but not today
 - \`minor\` — worth doing, nobody is bleeding
 
-A person decides which proposals become roadmap entries, so write each one as an
-entry would be written: a title somebody can scan, then prose, a **Build:** list
-and a **Done when:** condition. Say where in the code you saw it.
+Each finding is \`kind: issue\` when something is broken, unsafe or lossy, and
+\`kind: roadmap\` when the code should also do something, or do it better. A
+feature request is not an issue, and an issue is not a feature: pick the kind by
+what you found, not by how much you care. Only an issue takes a severity.
+
+A person decides which proposals become issues or roadmap cards — and may file
+one the other way — so write each one as an entry would be written: a title
+somebody can scan, then prose, a **Build:** list and a **Done when:** condition.
+Say where in the code you saw it.
 
 Then \`report\` kind "done" with the report itself — what you looked at, what you
 found, and what you deliberately did not check. Twenty vague findings are worth

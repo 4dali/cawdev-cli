@@ -1091,15 +1091,28 @@ const TOOLS = [
   {
     name: 'propose_entry',
     description:
-      'Record something an audit found, as a proposed roadmap entry. A PERSON decides which ' +
-      'proposals become entries — you are not creating one, you are suggesting it. Severity is ' +
-      '"critical" (broken, unsafe, or loses data), "medium" (it will hurt, but not today) or ' +
-      '"minor" (worth doing, nobody is bleeding). Write each one as an entry would be written, ' +
-      'and say where in the code you saw it. Only an audit session may use this.',
+      'Record something an audit found, as a proposed entry. `kind` is your opinion: "issue" ' +
+      '(broken, unsafe, or loses data — with a severity) or "roadmap" (it should also do this, ' +
+      'or do it better — no severity). A PERSON decides, and may file it the other way — you ' +
+      'are not creating an entry, you are suggesting it. Default "issue", so an audit written ' +
+      'before there was a choice files what it always did. Severity is "critical" (broken, ' +
+      'unsafe, or loses data), "medium" (it will hurt, but not today) or "minor" (worth doing, ' +
+      'nobody is bleeding). Write each one as an entry would be written, and say where in the ' +
+      'code you saw it. Only an audit session may use this.',
     inputSchema: {
       type: 'object',
       properties: {
-        severity: { type: 'string', enum: ['critical', 'medium', 'minor'] },
+        kind: {
+          type: 'string',
+          enum: ['issue', 'roadmap'],
+          description: 'What you found: "issue" when something is broken, "roadmap" when the ' +
+            'code should also do something, or do it better. Default "issue".',
+        },
+        severity: {
+          type: 'string',
+          enum: ['critical', 'medium', 'minor'],
+          description: 'Required for an issue, refused for a roadmap card.',
+        },
         title: { type: 'string', description: 'Short enough to scan in a list.' },
         body: {
           type: 'string',
@@ -1107,21 +1120,28 @@ const TOOLS = [
             'Markdown: what and why, a **Build:** list, and a **Done when:** condition.',
         },
       },
-      required: ['severity', 'title', 'body'],
+      required: ['title', 'body'],
     },
     handler: async (config, args) => {
       const { runId, project } = await requireRun(config);
+      // R214. The kind is the audit's opinion; the API refuses an issue with
+      // no severity and a card with one, each with a sentence, so neither is
+      // checked here.
       const proposal = await api(config, `/api/projects/${project}/runs/${runId}/proposals`, {
         method: 'POST',
         body: {
-          severity: args.severity.toUpperCase(),
+          kind: (args.kind ?? 'issue').toUpperCase(),
+          severity: args.severity?.toUpperCase(),
           title: args.title,
           body: args.body,
         },
       });
+      const as = proposal.kind === 'ROADMAP'
+        ? 'a roadmap card'
+        : `an issue (${proposal.severity})`;
       return (
-        `Proposed #${proposal.seq}: ${proposal.severity} — ${proposal.title}. ` +
-        `It is not on the roadmap: somebody will decide.`
+        `Proposed #${proposal.seq} as ${as} — ${proposal.title}. ` +
+        `It is not on any board: somebody will decide.`
       );
     },
   },
