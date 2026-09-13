@@ -3807,12 +3807,15 @@ function conflictedWrites(run) {
  * `conflictedWrites`' shape, with the list decided by the PLATFORM rather than
  * by git: the claim carries the paths the release procedure bumps a version in,
  * and the prompt's step 4 is built from the same list, so the instruction and
- * the permission cannot name different files.
+ * the permission cannot name different files. Since i189 that list is the
+ * project's own, declared by an owner on its settings page — never read from
+ * a file in the checkout, which whoever last committed there would have set.
  *
- * An empty list is not a fallback to "anything". A platform too old to send it
- * yields a session that cannot bump the version and says so in its report —
- * which is the legible failure, and a far better one than a release session
- * that could write wherever it liked because the list was missing.
+ * An empty list is not a fallback to "anything". A platform too old to send it,
+ * or a project that declares no version files, yields a session that cannot
+ * bump the version and says so in its report — which is the legible failure,
+ * and a far better one than a release session that could write wherever it
+ * liked because the list was missing.
  */
 function releaseWrites(run) {
   const files = Array.isArray(run?.releaseWrites) ? run.releaseWrites : [];
@@ -4361,7 +4364,7 @@ this was resolved without opening your transcript.`;
     const files = Array.isArray(run.releaseWrites) ? run.releaseWrites : [];
     const list = files.length
       ? files.map((path) => `\`${path}\``).join(', ')
-      : 'none — this platform named no version files, so say so in your report '
+      : 'none — this project declares no version files, so say so in your report '
         + 'rather than looking for a way round it';
 
     return `You are cutting a release in a working copy on branch \`${run.branch}\`, for the

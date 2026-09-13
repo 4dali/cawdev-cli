@@ -244,12 +244,13 @@ test('the prompt says what it may do, then hands over the platform\'s procedure'
   assert.ok(prompt.includes(OPENING), `the opening prompt was not handed over:\n${prompt}`);
 });
 
-test('a platform that named no version files yields a session with no writer at all',
+test('a project that declares no version files yields a session with no writer at all',
     async (t) => {
       // An empty list is not a fallback to "anything". A platform older than
-      // R187 sends nothing here, and the honest outcome is a session that
-      // cannot bump the version and says so — not one that could write
-      // wherever it liked because the list was missing.
+      // R187 sends nothing here, and since i189 so does a project whose owner
+      // has declared no version files; the honest outcome either way is a
+      // session that cannot bump the version and says so — not one that could
+      // write wherever it liked because the list was missing.
       const { spawnLine, record } = await daemonWith(t, {
         name: 'test-release-no-list',
         releaseWrites: null,
@@ -258,5 +259,5 @@ test('a platform that named no version files yields a session with no writer at 
       assert.deepEqual(tools.filter((each) => /^(Write|Edit)/.test(each)), []);
       assert.ok(tools.includes('Bash(git *)'));
       const prompt = await untilWritten(record);
-      assert.match(prompt, /named no version files, so say so in your report/);
+      assert.match(prompt, /declares no version files, so say so in your report/);
     });
