@@ -4048,6 +4048,13 @@ const PROFILE_TOOLS = {
   // resumed after it is still spawnable.
   ROADMAP: ROADMAP_WRITE_CAWDEV,
   AUDIT: [...READ_ONLY_CAWDEV, 'mcp__cawdev__propose_entry', ...READ_FILES],
+  // R227. Stage for planning: AUDIT's list, name for name. It reads the code
+  // and the roadmap, proposes the cards it cut a change into, and can write
+  // nothing — not a file, not an entry. What differs from an audit is the
+  // prompt, and the prompt is not where a permission lives. Its own key here
+  // rather than an alias, because a profile with no entry falls through to
+  // `?? READ_ONLY_CAWDEV` and loses `propose_entry` silently — R112's lesson.
+  STAGE: [...READ_ONLY_CAWDEV, 'mcp__cawdev__propose_entry', ...READ_FILES],
   // R124's plan phase. AUDIT's list without `propose_entry`: it reads the
   // repository and the card, and writes NOTHING — not the code, not the
   // roadmap, not even the plan.
@@ -4584,6 +4591,66 @@ Say where in the code you saw it.
 Then \`report\` kind "done" with the report itself — what you looked at, what you
 found, and what you deliberately did not check. Twenty vague findings are worth
 less than four you can point at.
+
+They asked:
+
+${run.openingPrompt}`;
+  }
+
+  if (run.profile === 'STAGE') {
+    // R227. An audit's permissions and a different question. An audit is
+    // asked what is wrong; this is handed a change and asked what cards it
+    // is. The order the prompt gives — read first, cut second, file third,
+    // then report the cutting — is the order the work has to happen in: a
+    // session that files before it has read the code cuts by the prompt's
+    // words, not the code's shape.
+    return `You are staging a change for planning on the cawdev platform. You can READ
+the code and the roadmap; you cannot change either. No edits, no commands, no git —
+and no creating roadmap entries directly.
+${about}${briefLine(run)}
+You have been handed a change that is too big to be one roadmap card. Your job is
+not to plan it and not to build it: it is to **cut** it — to read the code and say
+which cards this is, in what order, each small enough to be planned and built on
+its own.
+
+**Read first.** Start with \`roadmap_where\`, then \`roadmap_list\` to see what is
+already recorded — a card that already covers part of this is a card you do not
+file twice. Then read the code the change touches, with a purpose: where does
+each piece live, what depends on it, what would break. \`code_map\` is one call
+and answers "where does this live"; \`file_deps\` answers "what would I break".
+
+**Then cut.** Each card is a self-contained piece of work: it can be planned and
+built on its own, and when it lands the code is in a state somebody could ship.
+Aim for the fewest cards that are each small enough — four to six is usual —
+and put them in **build order**. Read two or three existing entries before you
+write one, and match their shape:
+
+- a title somebody can scan in a list
+- prose saying what and why, naming real files and symbols
+- a **Build:** list
+- a **Done when:** condition somebody could check
+- a line saying which of the other cards it comes after — the first says it
+  comes after none
+
+**Then file.** Every card is \`propose_entry\` with \`kind: roadmap\`, in build
+order, all under **one \`section\`** you name for the change — the same string on
+every call, because the shared section is what makes six proposals read as one
+change. A staging session that files under six sections has not staged anything.
+
+If, on the way, you find something **already broken** — unsafe, lossy, wrong
+today — you may file it as \`kind: issue\` with a severity (critical, medium or
+minor). That is the exception and not the job: one issue found while reading is
+worth filing; a list of them means you audited when you were asked to cut.
+
+You are proposing, not creating. A person accepts each card — as the card you
+proposed, as an issue, or not at all — and nothing reaches the roadmap that
+nobody read. Cards accepted from this session are related to each other on the
+board, so you do not need to spell the relationships into the bodies beyond the
+"comes after" line.
+
+Then \`report\` kind "done" with **the cutting itself**: what the cards are, in
+what order, what each depends on, and what you deliberately left out and why.
+That report is what the person reads before they read a single card.
 
 They asked:
 
@@ -5349,8 +5416,8 @@ function writesAnythingProfile(run) {
  * which is why R108's briefing and R109's stored plan had to come first.
  *
  * <p>A run with NO lifecycle spawns exactly as it always did. That is not a
- * fallback, it is the ordinary case for ASK, ROADMAP and AUDIT, and for every
- * project that has not configured one.
+ * fallback, it is the ordinary case for ASK, ROADMAP, AUDIT and STAGE, and for
+ * every project that has not configured one.
  */
 /**
  * Says so about the stages that will never run — R122.
@@ -7056,8 +7123,8 @@ async function main() {
         //
         // The project's gate, which counts CODING runs only — R70.
         // It is a checkout, and the checkout is the whole reason for it: an
-        // ASK, a ROADMAP or an AUDIT contends for no working copy, no branch
-        // and no dev-stack port, so measuring it against a per-project budget
+        // ASK, a ROADMAP, an AUDIT or a STAGE contends for no working copy, no
+        // branch and no dev-stack port, so measuring it against a per-project budget
         // bounds it by a constraint it does not have.
         //
         // Which checkout this one gets. Null for a run that needs none.

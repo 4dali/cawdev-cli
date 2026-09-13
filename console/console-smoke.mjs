@@ -821,8 +821,10 @@ try {
     expect: 400,
     body: JSON.stringify({ prompt: 'x', aboutEntry: 99999 }),
   });
+  // "no entry 99999" since #144, which stopped spelling a number as a ref
+  // before it knew the kind; this read `no R99999` and had failed since.
   check('a card the project does not have is refused, rather than silently dropped',
-    /no R99999/.test(noSuchCard?.message ?? ''), JSON.stringify(noSuchCard));
+    /no entry 99999/.test(noSuchCard?.message ?? ''), JSON.stringify(noSuchCard));
 
   await console_(`/api/projects/${project}/runs/${aboutCard.id}/transition`, {
     method: 'POST',
@@ -1150,6 +1152,85 @@ try {
     method: 'POST',
     body: JSON.stringify({ state: 'CANCELLED', summary: 'Audit check done.' }),
   });
+
+  // --- R227: stage for planning — an audit's permissions, a different result --
+
+  const staging = await console_(`/api/projects/${project}/runs/ask`, {
+    method: 'POST',
+    body: JSON.stringify({ prompt: 'split the tool rules move into cards', profile: 'STAGE' }),
+  });
+  check('a staging session has no branch and its own profile',
+    staging.profile === 'STAGE' && staging.kind === 'MANUAL' && staging.branch === null,
+    JSON.stringify([staging.kind, staging.profile, staging.branch]));
+  const stager = await asToken(runnerToken, `/api/runners/${runner.id}/claim/${staging.id}`);
+  await asToken(runnerToken, `/api/projects/${project}/runs/${staging.id}/transition`, {
+    state: 'RUNNING',
+  });
+  const pieces = [];
+  for (const title of ['the first piece', 'the second piece']) {
+    pieces.push(await asToken(stager.runToken,
+      `/api/projects/${project}/runs/${staging.id}/proposals`,
+      { kind: 'ROADMAP', title, body: '**Build:** it.', section: 'The tool rules move' }));
+  }
+  check('a staging session proposes cards under one section, and creates nothing',
+    pieces.every((each) => each.kind === 'ROADMAP' && each.section === 'The tool rules move'
+      && each.accepted === false)
+      && (await console_(`/api/projects/${project}/runs/${staging.id}`)).created.length === 0,
+    JSON.stringify(pieces));
+  // "Cannot create an entry directly" is the machine's to enforce, not the
+  // API's: the session is spawned with no `roadmap_create` and no shell
+  // (`stage-for-planning.test.mjs` reads that off the spawn line), the same
+  // way an audit is. The run token itself carries the scopes every run's
+  // does, so the check here is what the session actually did, not what the
+  // token could.
+  const onTheWay = await asToken(stager.runToken,
+    `/api/projects/${project}/runs/${staging.id}/proposals`,
+    { severity: 'MINOR', title: 'broken on the way', body: 'Seen while reading.' });
+  check('it may also file an issue it found on the way, with a severity',
+    onTheWay.kind === 'ISSUE' && onTheWay.severity === 'MINOR', JSON.stringify(onTheWay));
+
+  const stagedOne = await console_(
+    `/api/projects/${project}/runs/${staging.id}/proposals/${pieces[0].id}/accept`,
+    { method: 'POST', body: JSON.stringify({}) });
+  const stagedTwo = await console_(
+    `/api/projects/${project}/runs/${staging.id}/proposals/${pieces[1].id}/accept`,
+    { method: 'POST', body: JSON.stringify({}) });
+  const cardOne = await console_(`/api/projects/${project}/roadmap/${stagedOne.entryNumber}`);
+  const cardTwo = await console_(`/api/projects/${project}/roadmap/${stagedTwo.entryNumber}`);
+  check('accepted with the defaults, both land at CONSIDERING under the section the session named',
+    [cardOne, cardTwo].every((card) => card.status === 'CONSIDERING'
+      && card.section === 'The tool rules move' && card.kind === 'ROADMAP'),
+    JSON.stringify([cardOne.section, cardOne.status, cardTwo.section, cardTwo.status]));
+  check('related to each other, both ways',
+    cardOne.related.includes(cardTwo.number) && cardTwo.related.includes(cardOne.number),
+    JSON.stringify([cardOne.related, cardTwo.related]));
+  check('and each says it was raised by a staging session',
+    cardOne.audit?.profile === 'STAGE' && cardTwo.audit?.profile === 'STAGE'
+      && cardOne.audit?.runId === staging.id,
+    JSON.stringify([cardOne.audit, cardTwo.audit]));
+  const filedOnTheWay = await console_(
+    `/api/projects/${project}/runs/${staging.id}/proposals/${onTheWay.id}/accept`,
+    { method: 'POST', body: JSON.stringify({}) });
+  const issueOnTheWay = await console_(`/api/projects/${project}/roadmap/${filedOnTheWay.entryNumber}`);
+  check('the issue lands on the issues board with its severity, unrelated to the cards',
+    issueOnTheWay.kind === 'ISSUE' && issueOnTheWay.severity === 'MINOR'
+      && issueOnTheWay.related.length === 0
+      && (await console_(`/api/projects/${project}/issues?brief=true`))
+        .some((entry) => entry.number === filedOnTheWay.entryNumber),
+    JSON.stringify([issueOnTheWay.kind, issueOnTheWay.severity, issueOnTheWay.related]));
+
+  // Ended by its runner, the way a real one ends: FINISHED is the daemon's move.
+  await asToken(runnerToken, `/api/projects/${project}/runs/${staging.id}/transition`, {
+    state: 'FINISHED', summary: 'Cut into two.',
+  });
+  const stagedNotice = (await console_('/api/inbox')).finished
+    .find((each) => each.runId === staging.id);
+  check('a finished staging session lands in the inbox with its cards counted',
+    stagedNotice?.profile === 'STAGE' && stagedNotice?.findings === 3,
+    JSON.stringify(stagedNotice));
+  if (stagedNotice) {
+    await console_(`/api/inbox/notices/${stagedNotice.id}/seen`, { method: 'POST' });
+  }
 
   const liveNow = await console_('/api/runs/live');
   const thisOne = liveNow.find((each) => each.run.id === session.id);

@@ -183,7 +183,7 @@ token gets a refusal saying so.
 | `await_answer` | Resume waiting for a question `ask_user` handed back. |
 | `ask_group` | Ask a **round** — up to twelve questions that belong together, under one title. Blocks until every one of them has been answered, then hands back a `group_id`. |
 | `await_group` | Resume waiting for a round `ask_group` handed back. |
-| `propose_entry` | **Audit runs only.** Record a finding as a proposal, naming its kind — `issue` with a severity, or `roadmap` without. A person accepts it as either, or leaves it (R214). |
+| `propose_entry` | **Audit and staging runs only.** Record a finding — or a card cut from a bigger change (R227) — as a proposal, naming its kind — `issue` with a severity, or `roadmap` without — and, optionally, the `section` it belongs under; a staging session names one section for every card of the change. A person accepts it as either, or leaves it (R214). |
 | `approve` | **Not yours to call.** Claude Code calls it itself, as `--permission-prompt-tool`, when no rule covers a tool call. |
 
 **`ask_user` is for decisions that are genuinely theirs** — an architectural

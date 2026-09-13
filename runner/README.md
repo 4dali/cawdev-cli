@@ -298,9 +298,10 @@ How many coding runs go at once is `min(workspaces, maxSessions)`. A run that
 waits now says **"no free workspace in cawdev (2 here, all busy)"** instead of
 "that project already has a run here", which was a proxy for it.
 
-**This number caps coding and nothing else** (R70). `ASK`, `ROADMAP` and `AUDIT`
-runs take no workspace, so a project whose checkouts are all busy still starts a
-question, an entry-writing session and an audit at once. `INTERVIEW`, `MERGE`
+**This number caps coding and nothing else** (R70). `ASK`, `ROADMAP`, `AUDIT`
+and `STAGE` runs take no workspace, so a project whose checkouts are all busy
+still starts a question, an entry-writing session, an audit and a staging
+session at once. `INTERVIEW`, `MERGE`
 and `RELEASE` do take one — each commits something — and count against this
 number; what each may *write* in it is far narrower than a coding run's and is
 decided by the profile, not by the prompt: an interview writes `docs/brief/`,
@@ -765,7 +766,9 @@ nothing here should imply the agent may run arbitrary commands.
 
 Both lines above are the **coding** defaults, and only a session that writes
 code is spawned with them. A profile that does not — `ASK`, `PLAN`, `REVIEW`,
-`AUDIT`, and the rest — and a read-only stage of a coding run — `PLAN`,
+`AUDIT`, `STAGE` (R227 — an audit's list, name for name, with a prompt that
+asks it to cut a change into cards rather than to look for what is wrong), and
+the rest — and a read-only stage of a coding run — `PLAN`,
 `VERIFY`, `MEMORY` — get their own `--allowedTools` and neither a permission
 mode nor a permission prompt: the list is the whole permission. That is what
 makes "cannot write" true rather than asked for (`acceptEdits` on its own lets

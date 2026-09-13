@@ -1091,14 +1091,16 @@ const TOOLS = [
   {
     name: 'propose_entry',
     description:
-      'Record something an audit found, as a proposed entry. `kind` is your opinion: "issue" ' +
+      'Record something an audit found, or a card a staging session cut, as a proposed entry. ' +
+      '`kind` is your opinion: "issue" ' +
       '(broken, unsafe, or loses data — with a severity) or "roadmap" (it should also do this, ' +
       'or do it better — no severity). A PERSON decides, and may file it the other way — you ' +
       'are not creating an entry, you are suggesting it. Default "issue", so an audit written ' +
       'before there was a choice files what it always did. Severity is "critical" (broken, ' +
       'unsafe, or loses data), "medium" (it will hurt, but not today) or "minor" (worth doing, ' +
-      'nobody is bleeding). Write each one as an entry would be written, and say where in the ' +
-      'code you saw it. Only an audit session may use this.',
+      'nobody is bleeding). `section` is where you think it belongs; a staging session names ' +
+      'ONE for every card of the change. Write each one as an entry would be written, and say ' +
+      'where in the code you saw it. Only an audit or a staging session may use this.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1119,6 +1121,13 @@ const TOOLS = [
           description:
             'Markdown: what and why, a **Build:** list, and a **Done when:** condition.',
         },
+        section: {
+          type: 'string',
+          description:
+            'The roadmap section this belongs under, in your opinion. Optional. The person ' +
+            'accepting sees it as the default and may file it elsewhere. A staging session ' +
+            'uses the same section on every card it cuts from one change.',
+        },
       },
       required: ['title', 'body'],
     },
@@ -1134,13 +1143,15 @@ const TOOLS = [
           severity: args.severity?.toUpperCase(),
           title: args.title,
           body: args.body,
+          section: args.section,
         },
       });
       const as = proposal.kind === 'ROADMAP'
         ? 'a roadmap card'
         : `an issue (${proposal.severity})`;
+      const under = proposal.section ? ` under "${proposal.section}"` : '';
       return (
-        `Proposed #${proposal.seq} as ${as} — ${proposal.title}. ` +
+        `Proposed #${proposal.seq} as ${as}${under} — ${proposal.title}. ` +
         `It is not on any board: somebody will decide.`
       );
     },

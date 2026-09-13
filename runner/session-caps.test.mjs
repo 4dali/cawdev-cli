@@ -90,7 +90,7 @@ async function until(said, pattern, timeout = 20000) {
   return false;
 }
 
-test('a project at its cap still starts an ASK, a ROADMAP, an AUDIT and a PLAN', async (t) => {
+test('a project at its cap still starts an ASK, a ROADMAP, an AUDIT, a STAGE and a PLAN', async (t) => {
   // R124 added the fourth, and it is the one the entry exists for. A plan phase
   // that queued behind a coding run would put thinking about one card back on
   // the critical path of building another — which is the whole thing the split
@@ -100,6 +100,9 @@ test('a project at its cap still starts an ASK, a ROADMAP, an AUDIT and a PLAN',
   // not an endorsement of starting one: it is a run handed straight to the
   // daemon by a stub platform, which is precisely the shape of an interrupted
   // ROADMAP session resumed after the release. It has to keep working.
+  //
+  // R227 added STAGE, and it is an audit's shape exactly: it reads the
+  // checkout where it stands and takes none.
   const workspaces = [await aRepository()];
   const { platform, said } = await daemonWith(t, {
     name: 'test-caps-noncoding',
@@ -109,19 +112,20 @@ test('a project at its cap still starts an ASK, a ROADMAP, an AUDIT and a PLAN',
       asking('run-ask', 'what did R12 decide?', 'ASK'),
       asking('run-roadmap', 'file that as an entry', 'ROADMAP'),
       asking('run-audit', 'read the tools directory', 'AUDIT'),
+      asking('run-stage', 'cut the tool rules move into cards', 'STAGE'),
       asking('run-plan', 'work out what to do about R12', 'PLAN'),
     ],
   });
 
-  // All five, on one checkout. The one checkout is the coding cap and four of
-  // these five never touch it.
+  // All six, on one checkout. The one checkout is the coding cap and five of
+  // these six never touch it.
   const all = await platform.until(
-    (transitions) => transitions.filter((each) => each.state === 'RUNNING').length === 5,
+    (transitions) => transitions.filter((each) => each.state === 'RUNNING').length === 6,
   );
   assert.ok(all, `something queued behind the coding run:\n${said()}`);
 
   const started = platform.transitions.filter((each) => each.state === 'RUNNING');
-  for (const id of ['run-ask', 'run-roadmap', 'run-audit', 'run-plan']) {
+  for (const id of ['run-ask', 'run-roadmap', 'run-audit', 'run-stage', 'run-plan']) {
     // Took no checkout, and says so rather than claiming one it is not in.
     assert.equal(started.find((each) => each.runId === id).workspace, null);
   }
