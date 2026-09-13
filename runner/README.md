@@ -341,6 +341,19 @@ directory) or **discards** it, which is the only thing that frees it. The
 runners page lists what each machine is holding, so a workspace nobody
 remembers cannot quietly sit taken.
 
+**A cancelled run's uncommitted work is stashed if the person cancelling asked
+for it** (R217). A cancelled run releases its checkout — nothing can come back
+for it — so the run page, when the daemon's last look counted uncommitted
+files, offers *Cancel and stash the changes* beside *Cancel, leave them in the
+checkout*. The stash is this daemon's, taken in the child's close handler once
+the agent process is dead and never a moment earlier: `git stash push
+--include-untracked -m "cawdev: stashed when <run> was cancelled"`. The
+transcript then ends with what was parked and the `git -C <path> stash pop`
+that recovers it, or that there was nothing to park, or why it could not be —
+never a second failure, since the run is already over. A run that took no
+checkout of its own (an ASK standing in your working copy) is refused the
+option by the platform.
+
 Provision them however you like — `git clone`, then whatever the project needs
 to build. R48 makes them cheap by cloning a golden checkout per run; until then
 they are yours to create, and two or three is plenty.

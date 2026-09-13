@@ -24,6 +24,10 @@ import { once } from 'node:events';
  * @param runLive whether a run reads as still going. False by default, which
  *   makes the daemon reap the child straight away; true for a test that needs
  *   the spawned session to stay up long enough to be looked at.
+ * @param stashOnCancel what the run says about its uncommitted work — R217.
+ *   True is a person having cancelled with "stash the changes"; the daemon
+ *   acts on it in the child's close handler, so it only means anything with
+ *   `runState: 'CANCELLED'`.
  * @param mcpServers what the claim says this project has turned on — R76.
  *   What the PROJECT asked for: whether any of it is attached is the machine's
  *   answer, which is the thing under test.
@@ -43,6 +47,7 @@ export async function fakePlatform({
   runLive = false,
   /** Overrides the state alone — see the run endpoint below. */
   runState = null,
+  stashOnCancel = false,
   mcpServers = [],
   expertAgents = [],
   skills = [],
@@ -105,6 +110,8 @@ export async function fakePlatform({
   const usage = [];
   /** What the daemon read out of each repository — R24, and R96's `brief`. */
   const gitReadings = [];
+  /** Working-copy readings as posted — R217 reads the last one. */
+  const workingCopies = [];
   /** R112: every stage begin and report the daemon sent, in order. */
   const stageCalls = [];
   /** R112: the approvals it raised at a gate. */
@@ -285,6 +292,10 @@ export async function fakePlatform({
         gitReadings.push({ slug: url.split('/git/')[1], ...JSON.parse(body) });
         return response.end('{}');
       }
+      if (url.endsWith('/working-copy') && request.method === 'POST') {
+        workingCopies.push({ runId: url.split('/runs/')[1]?.split('/')[0], ...JSON.parse(body) });
+        return response.end('{}');
+      }
       if (url.endsWith('/transition') && request.method === 'POST') {
         const transition = JSON.parse(body);
         transition.runId = url.split('/runs/')[1]?.split('/')[0];
@@ -307,6 +318,7 @@ export async function fakePlatform({
         return response.end(JSON.stringify({
           live: runLive,
           state: runState ?? (runLive ? 'RUNNING' : 'FINISHED'),
+          stashOnCancel,
         }));
       }
       response.end('{}');
@@ -360,6 +372,7 @@ export async function fakePlatform({
     outputs,
     usage,
     gitReadings,
+    workingCopies,
     /** Waits for a reading of the repository to arrive — R24, R96. */
     async untilGit(timeout = 20000) {
       const deadline = Date.now() + timeout;

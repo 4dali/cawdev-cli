@@ -1411,6 +1411,51 @@ async function checkoutCarrying(path, checkoutArgs, dirty) {
   }
 }
 
+/**
+ * Parks a cancelled run's uncommitted work — R217.
+ *
+ * Called from the child's close handler and nowhere else: the one moment the
+ * daemon knows the agent is dead and nothing else is about to be spawned for
+ * this run. A stash taken a second earlier parks half a change. Never throws —
+ * the run is already over, and a stash that could not be taken is a sentence
+ * on the transcript, not a second failure.
+ *
+ * The same "did it actually park anything" check as `checkoutCarrying`:
+ * `stash push` exits 0 having done nothing, and a transcript that named a
+ * stash which is not on the list would send somebody popping a stranger's.
+ */
+async function stashAfterCancel(config, run, cwd) {
+  const say = (body) =>
+    api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/output`, {
+      method: 'POST',
+      body: { lines: [{ kind: 'SYSTEM', body }] },
+    }).catch((failure) => log(`  could not record the stash: ${failure.message}`));
+
+  const dirty = await git(cwd, ['status', '--porcelain']).catch(() => '');
+  if (!dirty) {
+    await say(`Nothing was uncommitted in ${cwd} when the agent stopped; there was nothing to stash.`);
+    return;
+  }
+  const label = `cawdev: stashed when ${run.label ?? run.branch ?? run.id.slice(0, 8)} was cancelled`;
+  try {
+    await git(cwd, ['stash', 'push', '--include-untracked', '-m', label]);
+    const parked = (await git(cwd, ['stash', 'list', '--format=%gs', '-1']).catch(() => ''))
+      .includes(label);
+    if (!parked) throw new Error('git stash push reported success but the stash is not on the list');
+    const files = dirty.split('\n').filter(Boolean).length;
+    log(`  stashed ${files} file(s) in ${cwd}, as asked when the run was cancelled`);
+    await say(
+      `Stashed ${files} uncommitted file(s) in ${cwd} as "${label}".\n` +
+        `Recover it with: git -C ${cwd} stash pop`,
+    );
+  } catch (failure) {
+    await say(
+      `Could not stash the uncommitted work in ${cwd}: ${failure.message.split('\n')[0]}. ` +
+        'The changes are still there.',
+    );
+  }
+}
+
 async function prepareWorkingCopy(path, branch, defaultBranch, allowDirty) {
   await access(join(path, '.git')).catch(() => {
     throw new Error(`${path} is not a git repository.`);
@@ -6395,6 +6440,23 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       // pull request after it would be a pull request for an empty branch.
       if (!stage) {
         await settleActions(config, run, cwd);
+      }
+
+      // R217. The person who cancelled said what to do with the uncommitted
+      // work, and this is the first moment it can be done: the agent is dead,
+      // and a cancelled run spawns no further stage. Only on a run that took a
+      // checkout — an ASK standing in somebody's working copy has nothing of
+      // its own here. The reading that follows is what turns the page's count
+      // back to zero.
+      if (current?.state === 'CANCELLED' && current.stashOnCancel && child.cawdevWorkspace) {
+        await stashAfterCancel(config, run, cwd);
+        const state = await readWorkingCopy(cwd).catch(() => null);
+        if (state && writesAnythingProfile(run)) {
+          await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/working-copy`, {
+            method: 'POST',
+            body: state,
+          }).catch((failure) => log(`  could not report the working copy: ${failure.message}`));
+        }
       }
 
       // The last reading, after the agent has stopped changing things and after
