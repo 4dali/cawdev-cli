@@ -1457,7 +1457,17 @@ async function stashAfterCancel(config, run, cwd) {
   }
 }
 
-async function prepareWorkingCopy(path, branch, defaultBranch, allowDirty) {
+/**
+ * Puts the checkout on the run's branch, cutting it if it is new.
+ *
+ * `baseBranch` is R260's: a sprint's branch, when the claim carried one. It
+ * is what a NEW branch is cut from, and it has to be on origin — a base that
+ * does not resolve is a throw, not the local fallback the default gets, because
+ * a card cut from `main` under a sprint-branch name is a card whose pull
+ * request will target the wrong place with nothing saying so. With no
+ * `baseBranch` every path here is byte for byte what it was before R260.
+ */
+async function prepareWorkingCopy(path, branch, defaultBranch, allowDirty, baseBranch = null) {
   await access(join(path, '.git')).catch(() => {
     throw new Error(`${path} is not a git repository.`);
   });
@@ -1482,7 +1492,7 @@ async function prepareWorkingCopy(path, branch, defaultBranch, allowDirty) {
     log(`  fetch skipped: ${failure.message.split('\n')[0]}`);
   });
 
-  const base = defaultBranch || 'main';
+  const base = baseBranch || defaultBranch || 'main';
   const exists = await git(path, ['branch', '--list', branch]);
   if (exists) {
     await checkoutCarrying(path, ['checkout', branch], dirty);
@@ -1527,7 +1537,17 @@ async function prepareWorkingCopy(path, branch, defaultBranch, allowDirty) {
       // from what everyone else has, not from whatever this checkout was left on.
       const startPoint = await git(path, ['rev-parse', '--verify', `origin/${base}`])
         .then(() => `origin/${base}`)
-        .catch(() => base);
+        .catch(() => {
+          // R260. The local fallback exists for no-remote experiments and
+          // stays for the default; a sprint's branch has no such excuse.
+          if (baseBranch) {
+            throw new Error(
+              `${baseBranch} is not on origin, so ${branch} cannot be cut from it. ` +
+                "The sprint's branch has to be cut before its cards are started.",
+            );
+          }
+          return base;
+        });
       await checkoutCarrying(path, ['checkout', '-b', branch, startPoint], dirty);
     }
   }
@@ -2753,10 +2773,10 @@ async function perform(config, run, cwd, action) {
     log(`  pushing ${run.branch}${byRule(action)}`);
     ({ ok, result } = await pushBranch(cwd, run.branch));
   } else if (action.kind === 'OPEN_PR') {
-    log(`  opening a pull request for ${run.branch}${byRule(action)}`);
+    log(`  opening a pull request for ${run.branch} into ${run.baseBranch ?? 'the default branch'}${byRule(action)}`);
     ({ ok, result } = await openPullRequest(cwd, run, action.message));
   } else if (action.kind === 'MERGE') {
-    log(`  MERGING ${run.branch}${byRule(action)} — nobody is reading this diff`);
+    log(`  MERGING ${run.branch} into ${run.baseBranch ?? 'the default branch'}${byRule(action)} — nobody is reading this diff`);
     ({ ok, result } = await mergePullRequest(cwd, run.branch));
   } else {
     result = `This runner does not know how to ${action.kind}.`;
@@ -3048,6 +3068,18 @@ async function performWorkspaceRequest(config, request, afterTheTreeMoved = null
     } else {
       log(`  checking for tag ${version} on the remote`);
       ({ ok, result } = await tagOnTheRemote(cwd, version));
+    }
+  } else if (request.kind === 'CUT_BRANCH') {
+    // R260. Put the sprint's branch on origin, from the default's tip. A branch
+    // already there is a success, not a conflict — the sprint wanted one to
+    // exist, and one does. Touches no working tree: the push names two refs
+    // and this checkout's HEAD is not one of them.
+    const name = (request.message ?? '').trim();
+    if (!name) {
+      result = 'A cut has to name a branch. Nothing was cut.';
+    } else {
+      log(`  cutting ${name} on origin from ${request.defaultBranch || 'main'}`);
+      ({ ok, result } = await cutBranchOnOrigin(cwd, name, request.defaultBranch));
     }
   } else {
     result = `This runner does not know how to ${request.kind}.`;
@@ -3354,12 +3386,16 @@ async function openPullRequest(cwd, run, title) {
   const opened = await gh(cwd, [
     'pr', 'create',
     '--head', run.branch,
+    // R260. The sprint's branch, when the claim carried one; otherwise the
+    // argv is byte for byte what it was and the host picks its own default.
+    ...(run.baseBranch ? ['--base', run.baseBranch] : []),
     '--title', title?.trim() || run.label || run.branch,
     // The body says what opened it and why, because somebody will find this in
     // a review queue with no idea where it came from.
     '--body', `Opened by cawdev's \`auto_pr\` rule for **${run.label ?? run.branch}**.\n\n`
       + `Nobody clicked anything: this project's rules say a finished run opens a pull request. `
-      + `The session's transcript, commits and reports are on the run in the cawdev console.`,
+      + `The session's transcript, commits and reports are on the run in the cawdev console.`
+      + (run.baseBranch ? `\n\nIts base is \`${run.baseBranch}\`, the branch of its sprint.` : ''),
   ]);
   if (opened.code === 0 && opened.out) {
     // gh prints the URL and nothing else on success.
@@ -3464,6 +3500,50 @@ async function tagOnTheRemote(cwd, version) {
     return { ok: false, result: `There is no tag ${version} on the remote yet.` };
   }
   return { ok: true, result: `${sha}\n${version} is on the remote.` };
+}
+
+/**
+ * Puts a sprint's branch on origin — R260's `CUT_BRANCH`.
+ *
+ * `git push origin origin/<default>:refs/heads/<name>`: the source is the
+ * REMOTE default's tip as of the fetch, not this checkout's, so what the
+ * sprint's cards are cut from is what everyone else has. Already there is
+ * `ok: true` — the request wanted the branch to exist and it does — and the
+ * sha reported is wherever it is, which may not be the default's tip.
+ */
+async function cutBranchOnOrigin(cwd, name, defaultBranch) {
+  const base = defaultBranch || 'main';
+  const ref = `refs/heads/${name}`;
+  await git(cwd, ['fetch', '--prune', 'origin']).catch((failure) => {
+    log(`  fetch skipped: ${failure.message.split('\n')[0]}`);
+  });
+
+  let there;
+  try {
+    there = await git(cwd, ['ls-remote', '--heads', 'origin', ref]);
+  } catch (failure) {
+    return { ok: false, result: `Could not ask the remote about ${name}: ${failure.message}` };
+  }
+  const already = there.split('\n').map((each) => each.trim()).filter(Boolean)
+    .find((each) => each.endsWith(`\t${ref}`));
+  if (already) {
+    const sha = already.split(/\s+/)[0];
+    return { ok: true, result: `${sha}\n${name} is already on origin at ${sha.slice(0, 7)}.` };
+  }
+
+  const from = `origin/${base}`;
+  let tip;
+  try {
+    tip = await git(cwd, ['rev-parse', '--verify', from]);
+  } catch {
+    return { ok: false, result: `${from} is not in this checkout, so there is nothing to cut ${name} from.` };
+  }
+  try {
+    await git(cwd, ['push', 'origin', `${from}:${ref}`]);
+  } catch (failure) {
+    return { ok: false, result: `Could not push ${name}: ${failure.message}` };
+  }
+  return { ok: true, result: `${tip}\n${name} cut from ${from} at ${tip.slice(0, 7)}.` };
 }
 
 /**
@@ -3678,13 +3758,16 @@ async function askGit(cwd, head, defaultBranch) {
  * that has left the remote. Proving a merge is possible; disproving one is not,
  * and UNKNOWN is the honest answer rather than a guess dressed as a reading.
  */
-async function readMergeState(cwd, { branch, defaultBranch, head, prUrl }) {
+async function readMergeState(cwd, { branch, defaultBranch, baseBranch, head, prUrl }) {
   const viaGh = await askGitHub(cwd, branch, prUrl).catch(() => null);
   if (viaGh) {
     return viaGh;
   }
 
-  const viaGit = await askGit(cwd, head, defaultBranch)
+  // R260: landed means landed on the branch's BASE — the sprint's branch when
+  // it has one. The gh path above already reads the pull request wherever it
+  // points; this is the fallback's half of the same rule.
+  const viaGit = await askGit(cwd, head, baseBranch ?? defaultBranch)
     .catch(() => null)
     .then((result) => result ?? { landed: 'CANNOT_TELL' });
 
@@ -5223,6 +5306,15 @@ async function startRun(config, offered, workspace) {
     // session that must not stall should not have the tool that stalls it, and
     // one that must ask should not be relied on to remember to.
     run.rules = claimed.rules ?? null;
+    // R260. What this run's branch is cut from, when that is not the default:
+    // the branch of the sprint its card is in. Cutting, merging-in, the pull
+    // request's base and the merge check read it; `defaultBranch` stays what
+    // a reset, the code map and the brief read. Null on every run until a
+    // sprint has a branch — and then everything below is what it was.
+    run.baseBranch = claimed.baseBranch ?? null;
+    if (run.baseBranch) {
+      log(`  cut from ${run.baseBranch} (the sprint's branch)`);
+    }
     // R69. Whether this is the same conversation picked back up, and which one.
     // Null on an ordinary claim, which is nearly all of them.
     resume = claimed.resume ?? null;
@@ -5304,7 +5396,7 @@ async function startRun(config, offered, workspace) {
         await resetWorkspace(resolve(path));
       }
       const prepared = await prepareWorkingCopy(
-        resolve(path), run.branch, defaultBranch, allowDirty);
+        resolve(path), run.branch, defaultBranch, allowDirty, run.baseBranch);
       branch = prepared.branch;
       baseCommit = prepared.base;
       if (handoff) {
@@ -5322,7 +5414,7 @@ async function startRun(config, offered, workspace) {
         // R155. The daemon does the merge, BEFORE anything is spawned, and what
         // git conflicts on becomes the session's whole write scope. A clean
         // merge needs no session at all and gets none.
-        merge = await prepareMerge(resolve(path), branch, defaultBranch);
+        merge = await prepareMerge(resolve(path), branch, run.baseBranch ?? defaultBranch);
         run.conflictedFiles = merge.conflicted;
         log(merge.clean
           ? `  ${merge.into} merged into ${branch} with no conflict — nothing to resolve`
@@ -6701,6 +6793,13 @@ function capabilities(config) {
     // say it in a transcript.
     skills: config.skills ?? [],
     agent: config.agentCommand,
+    // R260. This daemon knows a claim can carry `baseBranch` — a sprint's
+    // branch to cut from, open the pull request against and merge into. It
+    // is the WHOLE of how the platform tells an old daemon from a new one:
+    // the runner reports no version, so a run cut from a sprint's branch is
+    // offered only to a machine that says this, and a machine that does not
+    // is told why on the queue rather than handed a base it would ignore.
+    baseBranches: true,
   });
 }
 

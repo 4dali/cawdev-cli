@@ -432,10 +432,11 @@ than twenty-six. A machine that wants it unattended puts that string in its own
 ### What a person can ask of a checkout
 
 R57. The daemon polls `workspace-requests/claim` every few seconds and does one
-of **eight** things to a checkout it serves. It said six for two entries, and
+of **nine** things to a checkout it serves. It said six for two entries, and
 `HANDOFF` had been missing from the list since R148 — a table that quietly does
 not describe one of the things a person can ask for is worse than no table. So
-count the rows below against that number before you trust either.
+count the rows below against that number before you trust either. `CUT_BRANCH`
+is the ninth, R260's.
 
 | | |
 |---|---|
@@ -447,6 +448,7 @@ count the rows below against that number before you trust either.
 | `MERGE` | R134's Merge button on the development board: `gh pr merge <url> --squash --delete-branch` for the branch in `message`. The only kind whose effect is **not** in the checkout — it lands a branch on the host and touches no working tree, which is why several branches merge safely from one clone. The URL is reported on the result's first line, and the platform reads that line as the evidence to put on the card. **The platform hands a project's merges to machines one at a time, in the order they were asked for** (R188), so a claim may come back without a merge that is plainly queued — it is offered on a later poll, once the one ahead of it is over. |
 | `HANDOFF` | R148's hand-off, and the only kind addressed to a **run** rather than to a directory alone: the branch is pushed, whatever was uncommitted is packaged as a patch on its base sha, and the checkout is put back on the default branch. The next claim can then go to any machine. |
 | `TAG` | R156's release: `git ls-remote --tags origin refs/tags/<version>` for the version in `message`. **The remote, not this clone** — a local tag nobody pushed is exactly the state a release is trying to rule out, and `git tag --list` cannot tell the two apart. A read; it fetches nothing and moves no ref. The sha is reported on the result's first line, the way `MERGE` reports its URL, because the platform will not confirm a release on `ok: true` alone. **A tag that is not there yet is `ok: false` with a sentence, and that is a normal answer** — the release procedure pushes the tag last, so the first check correctly finds nothing. Addressed to a **release** rather than to a directory alone, which is why it is asked for from the roadmap board and refused on this channel. |
+| `CUT_BRANCH` | R260's sprint branch: `git push origin origin/<default>:refs/heads/<name>` for the branch in `message`, after a fetch — so the sprint's cards are cut from what everyone else has, not from whatever this checkout was left on. The second kind after `MERGE` whose effect is **not** in the checkout: the push names two refs and this clone's HEAD is not one of them, so any live checkout of the project will do and nothing local moves. **A branch already on origin is `ok: true`** ("already on origin at <sha>") — the sprint wanted one to exist, and one does. The sha is reported on the result's first line, the way `TAG` reports its. Addressed to a **sprint** and asked for from the sprint page by an OWNER, for `MERGE`'s reason — it reaches the remote — and refused on this channel. A `MERGE` of a card's pull request into a sprint branch still runs `--squash --delete-branch`: the card's branch goes, the sprint's stays. Landing the sprint branch itself is R261's, not this daemon's yet. |
 
 **A `MERGE` that fails also says which KIND of failure it was** — R155, in one
 of five words beside `gh`'s own unchanged text:
@@ -504,7 +506,20 @@ files at all. R47 removes the need for this by giving each run a workspace.
 1. **Claims it.** The claim response carries the run's own `cawdr_` token and
    the project's default branch — the runner never touches the project API,
    which is session-only.
-2. **Prepares the working copy**: fetch, then branch off the default.
+
+   **Base branches** (R260). The claim may also carry `baseBranch`: the
+   branch of the sprint the card is in, copied onto the work item when it was
+   opened. When it is there, cutting, the daemon's own merge-in (R155), the
+   pull request's `--base` and the merge check's git fallback use it; a
+   reset, the code map and the brief go on reading `defaultBranch`. When it
+   is not — every run until a sprint has a branch — every git and `gh` call
+   is byte for byte what it was. A base that is not on origin **fails the
+   run** saying so, rather than falling back to the default under the
+   sprint-branch's name. The daemon says `baseBranches: true` in its
+   capabilities, and that key is how the platform knows not to offer a based
+   run to an older daemon.
+2. **Prepares the working copy**: fetch, then branch off the default — or
+   off `origin/<baseBranch>` when the claim carried one.
    **A dirty tree stops it unless somebody said otherwise.** An agent let loose
    in a checkout with uncommitted work will at best confuse itself and at worst
    commit somebody's half-finished thoughts — so the console shows what is

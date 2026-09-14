@@ -38,6 +38,13 @@ import { once } from 'node:events';
  * @param brief where a brief lives and what it is made of — R96. The real claim
  *   always carries it; a test can pass null to stand in for an API older than
  *   R96, which is how the daemon's fallback gets exercised.
+ * @param actions what `/actions/claim` hands out, ONCE, on the first run that
+ *   asks — R260's tests need an `OPEN_PR` to read the `gh` argv off. Empty is
+ *   what every test before it got, and what a project with no rules answers.
+ *
+ * A fixture run may carry `baseBranch` — R260 — which the claim echoes as the
+ * real platform's `baseBranch`: the sprint's branch the run is cut from. The
+ * `mustUse` pattern, read off the fixture and echoed nowhere else.
  */
 export async function fakePlatform({
   offers = [],
@@ -84,11 +91,17 @@ export async function fakePlatform({
       { path: 'docs/brief/01-product.md', title: 'Product', about: 'What this is.' },
     ],
   },
+  actions = [],
 } = {}) {
   const seen = [];
   const transitions = [];
   const remaining = [...offers];
   const pending = [...workspaceRequests];
+  const pendingActions = [...actions];
+  /** R260: what the daemon said each closing action did. */
+  const finishedActions = [];
+  /** R260: every registration body, so a test can read the capabilities off it. */
+  const registrations = [];
   /** What the daemon said it did, so a test can read the stash ref back. */
   const finishedRequests = [];
   /** R155: what a merge run's machine reported, in the order it reported it. */
@@ -151,6 +164,7 @@ export async function fakePlatform({
         }));
       }
       if (url.endsWith('/api/runners') && request.method === 'POST') {
+        registrations.push(JSON.parse(body));
         return response.end(JSON.stringify({ id: 'runner-1', name: JSON.parse(body).name }));
       }
       if (url.includes('/queue')) {
@@ -177,10 +191,13 @@ export async function fakePlatform({
           response.writeHead(409, { 'content-type': 'application/json' });
           return response.end(JSON.stringify({ message: 'already claimed' }));
         }
-        remaining.splice(at, 1);
+        const [claimed] = remaining.splice(at, 1);
         return response.end(JSON.stringify({
           runToken: 'cawdr_fake',
           defaultBranch: 'main',
+          // R260: the sprint's branch this run is cut from, when the fixture
+          // says one. Absent otherwise, as on a platform before R260.
+          ...(claimed.baseBranch ? { baseBranch: claimed.baseBranch } : {}),
           allowDirty,
           resume,
           mcpServers,
@@ -277,8 +294,16 @@ export async function fakePlatform({
         // A list, because the real one answers with a list. The catch-all below
         // answers `{}` to anything unrouted, and a stub that quietly hands an
         // object to a caller expecting an array tests the daemon's crash
-        // handling instead of the behaviour the test came for.
-        return response.end('[]');
+        // handling instead of the behaviour the test came for. Taken on read,
+        // like the real one — R260's tests hand an OPEN_PR over this way.
+        return response.end(JSON.stringify(pendingActions.splice(0, pendingActions.length)));
+      }
+      if (url.includes('/actions/') && url.endsWith('/finished') && request.method === 'POST') {
+        finishedActions.push({
+          id: url.split('/actions/')[1].split('/')[0],
+          ...JSON.parse(body),
+        });
+        return response.end('{}');
       }
       if (url.endsWith('/workspace-requests/claim') && request.method === 'POST') {
         // Taken on read, like the real one: handed over once and then gone.
@@ -375,6 +400,8 @@ export async function fakePlatform({
     seen,
     transitions,
     finishedRequests,
+    finishedActions,
+    registrations,
     workspaceReports,
     mergeReports,
     sessionIds,
@@ -414,6 +441,15 @@ export async function fakePlatform({
       const deadline = Date.now() + timeout;
       while (Date.now() < deadline) {
         if (predicate(transitions)) return true;
+        await new Promise((done) => setTimeout(done, 150));
+      }
+      return false;
+    },
+    /** The same, for a closing action coming back — R260. */
+    async untilActionFinished(predicate, timeout = 20000) {
+      const deadline = Date.now() + timeout;
+      while (Date.now() < deadline) {
+        if (predicate(finishedActions)) return true;
         await new Promise((done) => setTimeout(done, 150));
       }
       return false;
