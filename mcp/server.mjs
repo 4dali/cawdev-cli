@@ -1159,8 +1159,12 @@ const TOOLS = [
       'before there was a choice files what it always did. Severity is "critical" (broken, ' +
       'unsafe, or loses data), "medium" (it will hurt, but not today) or "minor" (worth doing, ' +
       'nobody is bleeding). `section` is where you think it belongs; a scoping session names ' +
-      'ONE for every card of the idea. Write each one as an entry would be written, and say ' +
-      'where in the code you saw it. Only an audit or a scoping session may use this.',
+      'ONE for every card of the idea. A roadmap card MUST say what it starts after — `after`: ' +
+      '`[]` for a card that starts after none, `"#2"` for the second card you proposed in this ' +
+      'run (the number this tool answered with), `"R12"` for a card already on the roadmap. ' +
+      'You can only name what has already been proposed, so file in build order. Write each ' +
+      'one as an entry would be written, and say where in the code you saw it. Only an audit ' +
+      'or a scoping session may use this.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1188,6 +1192,18 @@ const TOOLS = [
             'accepting sees it as the default and may file it elsewhere. A scoping session ' +
             'uses the same section on every card it cuts from one idea.',
         },
+        after: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'What this card starts after. Required for a roadmap card, refused on an issue. ' +
+            '`[]` for a card that starts after none — the first. `"#2"` names the second ' +
+            'card you proposed in THIS run, by the number this tool answered with; it must ' +
+            'already have been proposed, so propose what a card depends on before the card. ' +
+            '`"R12"` or `"i7"` names a card already on the roadmap. A person adds the cards ' +
+            'in this order, and a coding session on one waits until what it starts after has ' +
+            'landed.',
+        },
       },
       required: ['title', 'body'],
     },
@@ -1195,7 +1211,8 @@ const TOOLS = [
       const { runId, project } = await requireRun(config);
       // R214. The kind is the audit's opinion; the API refuses an issue with
       // no severity and a card with one, each with a sentence, so neither is
-      // checked here.
+      // checked here — and neither is `after`: a card without one is refused
+      // with the sentence that says what to send.
       const proposal = await api(config, `/api/projects/${project}/runs/${runId}/proposals`, {
         method: 'POST',
         body: {
@@ -1204,14 +1221,20 @@ const TOOLS = [
           title: args.title,
           body: args.body,
           section: args.section,
+          after: args.after,
         },
       });
       const as = proposal.kind === 'ROADMAP'
         ? 'a roadmap card'
         : `an issue (${proposal.severity})`;
       const under = proposal.section ? ` under "${proposal.section}"` : '';
+      const startsAfter = proposal.kind !== 'ROADMAP' || !Array.isArray(proposal.after)
+        ? ''
+        : proposal.after.length
+          ? ` Starts after ${proposal.after.join(', ')}.`
+          : ' Starts after none.';
       return (
-        `Proposed #${proposal.seq} as ${as}${under} — ${proposal.title}. ` +
+        `Proposed #${proposal.seq} as ${as}${under} — ${proposal.title}.${startsAfter} ` +
         `It is not on any board: somebody will decide.`
       );
     },

@@ -111,6 +111,38 @@ test('a roadmap proposal carries no severity, and says it is a card', async (t) 
   assert.match(text, /Proposed #1 as a roadmap card — The Git tab shows the card behind a branch\./);
 });
 
+test('a card says what it starts after, as written, and reads it back', async (t) => {
+  const platform = await fakePlatform();
+  t.after(() => platform.close());
+
+  const first = await callTool(platform.url, 'propose_entry', {
+    kind: 'roadmap', title: 'The outbox', body: 'First.', section: 'Mail', after: [],
+  });
+  assert.deepEqual(platform.posted[0].after, []);
+  assert.match(first, /Proposed #1 as a roadmap card under "Mail" — The outbox\. Starts after none\./);
+
+  const second = await callTool(platform.url, 'propose_entry', {
+    kind: 'roadmap', title: 'Email as a channel', body: 'Second.', section: 'Mail',
+    after: ['#1', 'R40'],
+  });
+  // As given: `#1` is not a card yet and has no number to translate to. The
+  // platform resolves it when somebody accepts, against what was accepted.
+  assert.deepEqual(platform.posted[1].after, ['#1', 'R40']);
+  assert.match(second, /Starts after #1, R40\./);
+});
+
+test('an issue says nothing about build order, and the tool does not invent one', async (t) => {
+  const platform = await fakePlatform();
+  t.after(() => platform.close());
+
+  await callTool(platform.url, 'propose_entry', {
+    severity: 'minor', title: 'Broken on the way', body: 'x',
+  });
+  // Absent, not `[]`: the API refuses a list on an issue, and an empty one
+  // sent by the tool would be a value the model never gave.
+  assert.equal('after' in platform.posted[0], false);
+});
+
 test('the platform decides whether the kind and severity agree, and its sentence reaches the audit', async (t) => {
   // The tool does not second-guess the rule: a card with a severity is the
   // API's 400, worded for a reader, and that wording is what the model sees.

@@ -4588,7 +4588,10 @@ naming its kind, and an issue with a severity:
 Each finding is \`kind: issue\` when something is broken, unsafe or lossy, and
 \`kind: roadmap\` when the code should also do something, or do it better. A
 feature request is not an issue, and an issue is not a feature: pick the kind by
-what you found, not by how much you care. Only an issue takes a severity.
+what you found, not by how much you care. Only an issue takes a severity. Only a
+card takes \`after\` — what it starts after — and a card must: \`after: []\` when
+it depends on nothing, \`["R12"]\` for a card already on the roadmap, \`["#1"]\`
+for a card you proposed earlier in this run.
 
 A person decides which proposals become issues or roadmap cards — and may file
 one the other way — so write each one as an entry would be written: a title
@@ -4636,13 +4639,22 @@ write one, and match their shape:
 - prose saying what and why, naming real files and symbols
 - a **Build:** list
 - a **Done when:** condition somebody could check
-- a line saying which of the other cards it comes after — the first says it
-  comes after none
 
 **Then file.** Every card is \`propose_entry\` with \`kind: roadmap\`, in build
 order, all under **one \`section\`** you name for the idea — the same string on
 every call, because the shared section is what makes six proposals read as one
 change. A scoping session that files under six sections has not scoped anything.
+
+**Every card says what it starts after** — \`after\`, on the call, not a line in
+the body. The first card sends \`after: []\`. A later card names the cards it
+depends on by the number the tool answered with: \`after: ["#1"]\`, \`after:
+["#1", "#3"]\` — or \`"R12"\` for a card already on the roadmap. You can only
+name what has already been proposed, which is why the order you file in is the
+build order: a card that depends on one you have not filed yet is a card you
+are filing too early. The platform refuses a card with no \`after\`, and a
+person adds the cards in that order — #2 cannot go on the roadmap until #1 has.
+This is what makes the order you worked out real: a coding session on a card
+waits until every card it starts after has landed.
 
 If, on the way, you find something **already broken** — unsafe, lossy, wrong
 today — you may file it as \`kind: issue\` with a severity (critical, medium or
@@ -4652,8 +4664,8 @@ worth filing; a list of them means you audited when you were asked to cut.
 You are proposing, not creating. A person accepts each card — as the card you
 proposed, as an issue, or not at all — and nothing reaches the roadmap that
 nobody read. Cards accepted from this session are related to each other on the
-board, so you do not need to spell the relationships into the bodies beyond the
-"comes after" line.
+board, and each carries what it starts after, so you do not need to spell the
+relationships into the bodies.
 
 Then \`report\` kind "done" with **the cutting itself**: what the cards are, in
 what order, what each depends on, and what you deliberately left out and why.

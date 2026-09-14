@@ -226,6 +226,14 @@ test('the prompt asks for a cutting, not for findings', async (t) => {
   assert.match(prompt, /`propose_entry` with `kind: roadmap`/);
   assert.match(prompt, /one `section`/);
   assert.match(prompt, /build order/);
+  // And the order is DATA on the call, not a line in the body: the first card
+  // sends `after: []`, a later one names the earlier ones by `#n`. The prose
+  // instruction it replaced is gone, or the model would write both.
+  assert.match(prompt, /\*\*Every card says what it starts after\*\*/);
+  assert.match(prompt, /`after: \[\]`/);
+  assert.match(prompt, /`after: \["#1"\]`/);
+  assert.doesNotMatch(prompt, /a line saying which of the other cards it comes after/);
+  assert.doesNotMatch(prompt, /"comes after" line/);
   // An issue is the exception and not the job.
   assert.match(prompt, /`kind: issue`/);
   assert.match(prompt, /the exception and not the job/);

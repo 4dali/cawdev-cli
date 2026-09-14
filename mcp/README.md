@@ -187,7 +187,7 @@ token gets a refusal saying so.
 | `await_answer` | Resume waiting for a question `ask_user` handed back. |
 | `ask_group` | Ask a **round** — up to twelve questions that belong together, under one title. Blocks until every one of them has been answered, then hands back a `group_id`. |
 | `await_group` | Resume waiting for a round `ask_group` handed back. |
-| `propose_entry` | **Audit and scoping runs only.** Record a finding — or a card cut from a bigger idea (R227) — as a proposal, naming its kind — `issue` with a severity, or `roadmap` without — and, optionally, the `section` it belongs under; a scoping session names one section for every card of the idea. A person accepts it as either, or leaves it (R214). |
+| `propose_entry` | **Audit and scoping runs only.** Record a finding — or a card cut from a bigger idea (R227) — as a proposal, naming its kind — `issue` with a severity, or `roadmap` without — and, optionally, the `section` it belongs under; a scoping session names one section for every card of the idea. A `roadmap` card **must** say what it starts `after`: `[]` for the first, `"#2"` for the second card proposed in this run (the number the tool answered with — it has to exist already, so file in build order), `"R12"` for a card on the roadmap. A person accepts it as either, or leaves it (R214) — and adds the cards in that order: #2 is refused until #1 is on the roadmap. |
 | `approve` | **Not yours to call.** Claude Code calls it itself, as `--permission-prompt-tool`, when no rule covers a tool call. |
 
 **`ask_user` is for decisions that are genuinely theirs** — an architectural
