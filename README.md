@@ -43,7 +43,10 @@ fell three sections behind and `"Roadmap"`, the fallback for an entry with no
 section of its own, became a junk drawer holding eight built features (R45).
 
 When you see the note: add the section to `SECTION_ORDER` in the position it
-should read in, or give those entries a section that is already there.
+should read in, or give those entries a section that is already there. Sections
+are renamed, merged and unfiled from the console's **Sections** dialog on the
+roadmap board (R264), and that dialog cannot reach this file: after a rename,
+update `SECTION_ORDER` too, or the note will list the new name.
 
 ## `tools/roadmap/import.mjs`
 
