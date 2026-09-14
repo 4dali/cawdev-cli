@@ -90,7 +90,7 @@ async function until(said, pattern, timeout = 20000) {
   return false;
 }
 
-test('a project at its cap still starts an ASK, a ROADMAP, an AUDIT, a STAGE and a PLAN', async (t) => {
+test('a project at its cap still starts an ASK, a ROADMAP, an AUDIT, a SCOPE and a PLAN', async (t) => {
   // R124 added the fourth, and it is the one the entry exists for. A plan phase
   // that queued behind a coding run would put thinking about one card back on
   // the critical path of building another — which is the whole thing the split
@@ -101,7 +101,7 @@ test('a project at its cap still starts an ASK, a ROADMAP, an AUDIT, a STAGE and
   // daemon by a stub platform, which is precisely the shape of an interrupted
   // ROADMAP session resumed after the release. It has to keep working.
   //
-  // R227 added STAGE, and it is an audit's shape exactly: it reads the
+  // R227 added SCOPE (R248 named it), and it is an audit's shape exactly: it reads the
   // checkout where it stands and takes none.
   const workspaces = [await aRepository()];
   const { platform, said } = await daemonWith(t, {
@@ -112,7 +112,7 @@ test('a project at its cap still starts an ASK, a ROADMAP, an AUDIT, a STAGE and
       asking('run-ask', 'what did R12 decide?', 'ASK'),
       asking('run-roadmap', 'file that as an entry', 'ROADMAP'),
       asking('run-audit', 'read the tools directory', 'AUDIT'),
-      asking('run-stage', 'cut the tool rules move into cards', 'STAGE'),
+      asking('run-scope', 'cut the tool rules move into cards', 'SCOPE'),
       asking('run-plan', 'work out what to do about R12', 'PLAN'),
     ],
   });
@@ -125,7 +125,7 @@ test('a project at its cap still starts an ASK, a ROADMAP, an AUDIT, a STAGE and
   assert.ok(all, `something queued behind the coding run:\n${said()}`);
 
   const started = platform.transitions.filter((each) => each.state === 'RUNNING');
-  for (const id of ['run-ask', 'run-roadmap', 'run-audit', 'run-stage', 'run-plan']) {
+  for (const id of ['run-ask', 'run-roadmap', 'run-audit', 'run-scope', 'run-plan']) {
     // Took no checkout, and says so rather than claiming one it is not in.
     assert.equal(started.find((each) => each.runId === id).workspace, null);
   }

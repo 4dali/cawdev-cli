@@ -1124,16 +1124,16 @@ const TOOLS = [
   {
     name: 'propose_entry',
     description:
-      'Record something an audit found, or a card a staging session cut, as a proposed entry. ' +
+      'Record something an audit found, or a card a scoping session cut, as a proposed entry. ' +
       '`kind` is your opinion: "issue" ' +
       '(broken, unsafe, or loses data — with a severity) or "roadmap" (it should also do this, ' +
       'or do it better — no severity). A PERSON decides, and may file it the other way — you ' +
       'are not creating an entry, you are suggesting it. Default "issue", so an audit written ' +
       'before there was a choice files what it always did. Severity is "critical" (broken, ' +
       'unsafe, or loses data), "medium" (it will hurt, but not today) or "minor" (worth doing, ' +
-      'nobody is bleeding). `section` is where you think it belongs; a staging session names ' +
-      'ONE for every card of the change. Write each one as an entry would be written, and say ' +
-      'where in the code you saw it. Only an audit or a staging session may use this.',
+      'nobody is bleeding). `section` is where you think it belongs; a scoping session names ' +
+      'ONE for every card of the idea. Write each one as an entry would be written, and say ' +
+      'where in the code you saw it. Only an audit or a scoping session may use this.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1158,8 +1158,8 @@ const TOOLS = [
           type: 'string',
           description:
             'The roadmap section this belongs under, in your opinion. Optional. The person ' +
-            'accepting sees it as the default and may file it elsewhere. A staging session ' +
-            'uses the same section on every card it cuts from one change.',
+            'accepting sees it as the default and may file it elsewhere. A scoping session ' +
+            'uses the same section on every card it cuts from one idea.',
         },
       },
       required: ['title', 'body'],

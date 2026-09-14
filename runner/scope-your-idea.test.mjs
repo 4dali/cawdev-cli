@@ -1,18 +1,19 @@
-// node --test tools/runner/stage-for-planning.test.mjs
+// node --test tools/runner/scope-your-idea.test.mjs
 //
-// R227's half that lives on the machine: what a STAGE session is allowed to
+// R227's half that lives on the machine: what a SCOPE session (named by R248,
+// so that "stage" is the lifecycle's word alone) is allowed to
 // do, read off the daemon's own `spawning:` line the way `release-action.test.mjs`
 // reads its own.
 //
-// The card's claim is that STAGE carries exactly an audit's permissions and a
+// The card's claim is that SCOPE carries exactly an audit's permissions and a
 // different prompt. So the assertions come in two halves: the tool list is the
 // audit's, name for name — `propose_entry` among them, and no writer of any
 // kind — and the prompt asks for a cutting rather than for findings. Delete
-// `PROFILE_TOOLS.STAGE` and the session falls through to `READ_ONLY_CAWDEV`,
+// `PROFILE_TOOLS.SCOPE` and the session falls through to `READ_ONLY_CAWDEV`,
 // which is the list with no `propose_entry` in it: the first test goes red.
 //
 // The project config below permits `Bash(mvn *)`. That is the control: a
-// coding run on this project WOULD be spawned with it, and a staging session
+// coding run on this project WOULD be spawned with it, and a scoping session
 // must not.
 
 import assert from 'node:assert/strict';
@@ -30,17 +31,17 @@ const DAEMON = new URL('./runner.mjs', import.meta.url).pathname;
 
 const OPENING = 'Split "move the runner\'s tool rules into the database" into cards.';
 
-const STAGE_RUN = {
-  id: 'run-stage',
+const SCOPE_RUN = {
+  id: 'run-scope',
   projectSlug: 'board',
-  label: 'Stage for planning',
+  label: 'Scope your idea',
   branch: null,
-  profile: 'STAGE',
+  profile: 'SCOPE',
   kind: 'MANUAL',
   openingPrompt: OPENING,
 };
 
-const AUDIT_RUN = { ...STAGE_RUN, id: 'run-audit', label: 'Audit', profile: 'AUDIT' };
+const AUDIT_RUN = { ...SCOPE_RUN, id: 'run-audit', label: 'Audit', profile: 'AUDIT' };
 
 async function untilSaid(said, pattern, timeout = 20000) {
   const deadline = Date.now() + timeout;
@@ -52,7 +53,7 @@ async function untilSaid(said, pattern, timeout = 20000) {
 }
 
 async function aRepository() {
-  const path = await mkdtemp(join(tmpdir(), 'cawdev-stage-'));
+  const path = await mkdtemp(join(tmpdir(), 'cawdev-scope-'));
   await run('git', ['init', '-q', '-b', 'main'], { cwd: path });
   await run('git', ['config', 'user.email', 'test@cawdev.test'], { cwd: path });
   await run('git', ['config', 'user.name', 'Test'], { cwd: path });
@@ -102,10 +103,10 @@ async function untilWritten(path, timeout = 20000) {
   return '';
 }
 
-async function daemonWith(t, { name, offers = [STAGE_RUN] }) {
+async function daemonWith(t, { name, offers = [SCOPE_RUN] }) {
   const path = await aRepository();
   const platform = await fakePlatform({ offers, runLive: true });
-  const home = await mkdtemp(join(tmpdir(), 'cawdev-stage-cfg-'));
+  const home = await mkdtemp(join(tmpdir(), 'cawdev-scope-cfg-'));
   const record = join(home, 'prompt.txt');
   const config = join(home, 'config.json');
   await writeFile(config, JSON.stringify({
@@ -114,7 +115,7 @@ async function daemonWith(t, { name, offers = [STAGE_RUN] }) {
     agentCommand: await aRecorder(home, record),
     pollSeconds: 1,
     workspacePollSeconds: 1,
-    // The control. A coding run here is spawned with `Bash(mvn *)`; a staging
+    // The control. A coding run here is spawned with `Bash(mvn *)`; a scoping
     // session must not be, whatever the project says it permits.
     projects: { board: { path, allowedTools: ['Bash(mvn *)'] } },
   }));
@@ -153,11 +154,11 @@ function toolsOn(line) {
   return after.match(/\S+\([^)]*\)|\S+/g) ?? [];
 }
 
-test('a staging session takes no checkout and prepares nothing, like an audit', async (t) => {
-  const { said, untilSaid } = await daemonWith(t, { name: 'test-stage-nothing-prepared' });
-  assert.ok(await untilSaid(/a stage session: no branch, nothing prepared/), said());
+test('a scoping session takes no checkout and prepares nothing, like an audit', async (t) => {
+  const { said, untilSaid } = await daemonWith(t, { name: 'test-scope-nothing-prepared' });
+  assert.ok(await untilSaid(/a scope session: no branch, nothing prepared/), said());
   // The claim carried no branch and the daemon cut none.
-  assert.match(said(), /claiming board Stage for planning on null/);
+  assert.match(said(), /claiming board Scope your idea on null/);
 });
 
 test('it is spawned with the audit\'s tool list, name for name', async (t) => {
@@ -166,15 +167,15 @@ test('it is spawned with the audit\'s tool list, name for name', async (t) => {
   // list written down here — which would drift the first time the audit's
   // changed.
   const { spawnLines, untilSaid, said } = await daemonWith(t, {
-    name: 'test-stage-tools',
-    offers: [STAGE_RUN, AUDIT_RUN],
+    name: 'test-scope-tools',
+    offers: [SCOPE_RUN, AUDIT_RUN],
   });
   assert.ok(await untilSaid(/spawning:[\s\S]*spawning:/), `only one spawned:\n${said()}`);
   const lines = spawnLines();
   assert.equal(lines.length, 2, said());
   const [first, second] = lines.map(toolsOn);
   assert.deepEqual([...first].sort(), [...second].sort(),
-    `a staging session and an audit were spawned with different lists:\n${lines.join('\n')}`);
+    `a scoping session and an audit were spawned with different lists:\n${lines.join('\n')}`);
 
   const tools = first;
   // What it has: the reads, `propose_entry`, the files.
@@ -204,16 +205,16 @@ test('it is spawned with the audit\'s tool list, name for name', async (t) => {
     assert.ok(!on.includes('Edit'), `an Edit in:\n${line}`);
     assert.ok(!on.some((each) => each.startsWith('Bash')), `a shell in:\n${line}`);
     assert.ok(!on.includes('Bash(mvn *)'),
-      `a staging session was spawned with the project's build tools:\n${line}`);
+      `a scoping session was spawned with the project's build tools:\n${line}`);
   }
 });
 
 test('the prompt asks for a cutting, not for findings', async (t) => {
-  const { record } = await daemonWith(t, { name: 'test-stage-prompt' });
+  const { record } = await daemonWith(t, { name: 'test-scope-prompt' });
   const prompt = await untilWritten(record);
   assert.ok(prompt, 'the agent was never given a prompt on stdin');
 
-  assert.match(prompt, /^You are staging a change for planning/);
+  assert.match(prompt, /^You are scoping an idea for planning/);
   // Read first, cut second, file third, report the cutting last — in that order.
   const read = prompt.indexOf('**Read first.**');
   const cut = prompt.indexOf('**Then cut.**');

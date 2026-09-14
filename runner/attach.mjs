@@ -317,7 +317,7 @@ function wrapChoices(choices, width, gap = '   ') {
  * number that was guessed.
  *
  * **Only coding sessions are counted against `room`** — R70. The checkouts are
- * what that number bounds, and an ASK, a ROADMAP, an AUDIT or a STAGE takes none.
+ * what that number bounds, and an ASK, a ROADMAP, an AUDIT or a SCOPE takes none.
  */
 export function sessionCounts(runner, runs) {
   const live = (runs ?? []).filter((run) => run.state !== 'queued');
