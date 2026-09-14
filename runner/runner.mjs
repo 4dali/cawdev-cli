@@ -25,6 +25,7 @@ import { painter } from '../lib/ansi.mjs';
 import { bannerLines, tintLog } from './banner.mjs';
 import { codeMapOf } from '../lib/code-map.mjs';
 import { usageLimitOf } from '../lib/usage-limit.mjs';
+import { TranscriptBatch } from '../lib/transcript-batch.mjs';
 import { parseUsage } from '../lib/usage-report.mjs';
 import { qualified, writeRunPlugin } from '../lib/run-plugin.mjs';
 import { AI_CONFIG, harnessPrompt, readRepoConfig } from '../lib/harness-prompt.mjs';
@@ -2556,16 +2557,32 @@ async function projectMcpServers(cwd) {
  * are held for a beat and sent together, in order, one request at a time —
  * because two batches in flight can arrive out of order, and a transcript out
  * of order is worse than a transcript a half-second late.
+ *
+ * The batching, the retry and the backoff are `../lib/transcript-batch.mjs`,
+ * pure of the network for the same reason `code-map.mjs` is pure of a
+ * repository: the hard part — a failed send kept rather than dropped, so a
+ * reconnect (this run may by then be `UNREACHABLE` on the platform — see
+ * `RunService#driving`) replays everything in the order it was produced — is
+ * then testable without a socket. This subclass adds the two daemon-only
+ * things: what a send actually POSTs to, and the tee to the attached
+ * terminal, which should not wait on a flush window, let alone the network.
  */
-class Transcript {
-  constructor(config, run, { every = 400, max = 100 } = {}) {
+class Transcript extends TranscriptBatch {
+  constructor(config, run, opts) {
+    super(
+      (lines) => api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/output`, {
+        method: 'POST',
+        body: { lines },
+      }),
+      {
+        ...opts,
+        onRetry: ({ lines, delayMs, failure }) => log(
+          `  could not record output (${lines.length} line${lines.length === 1 ? '' : 's'} `
+          + `held, retrying in ${Math.round(delayMs / 1000)}s): ${failure.message}`),
+      },
+    );
     this.config = config;
     this.run = run;
-    this.every = every;
-    this.max = max;
-    this.pending = [];
-    this.sending = null;
-    this.timer = null;
   }
 
   push(line) {
@@ -2578,36 +2595,7 @@ class Transcript {
       runId: this.run.id,
       line: { ...line, at: new Date().toISOString() },
     });
-    this.pending.push(line);
-    if (this.pending.length >= this.max) {
-      void this.flush();
-    } else if (!this.timer) {
-      this.timer = setTimeout(() => void this.flush(), this.every);
-      this.timer.unref?.();
-    }
-  }
-
-  async flush() {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-    // One request at a time: awaiting the previous send is what keeps the
-    // transcript in the order the session produced it.
-    this.sending = (this.sending ?? Promise.resolve()).then(() => this.send());
-    await this.sending;
-  }
-
-  async send() {
-    const lines = this.pending.splice(0, this.pending.length);
-    if (!lines.length) return;
-    await api(this.config, `/api/projects/${this.run.projectSlug}/runs/${this.run.id}/output`, {
-      method: 'POST',
-      body: { lines },
-      // A dropped line is not worth failing a run over. Say so and carry on:
-      // the session is still working, and the person watching would rather see
-      // the rest than nothing.
-    }).catch((failure) => log(`  could not record output: ${failure.message}`));
+    super.push(line);
   }
 }
 
