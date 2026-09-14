@@ -58,13 +58,25 @@ async function main() {
 
   // Pass 1: create or update everything, without related ids, so a forward
   // reference (R4 relating to R7) does not fail on a not-yet-created entry.
+  //
+  // The sprint goes here too, beside the section — R257: it names no other
+  // card, so it needs no second pass. By number only; the importer does not
+  // open sprints (it could not choose their numbers), so a file naming a
+  // sprint the target database does not have fails with the API's own
+  // sentence naming the ones it does. 0 takes a card out of a sprint the file
+  // no longer puts it in.
   let created = 0;
   let updated = 0;
   for (const entry of entries) {
     if (known.has(entry.number)) {
       await call(config, `/api/projects/${slug}/roadmap/${entry.number}`, {
         method: 'PATCH',
-        body: { title: entry.title, body: entry.body, section: entry.section ?? '' },
+        body: {
+          title: entry.title,
+          body: entry.body,
+          section: entry.section ?? '',
+          sprint: entry.sprint?.number ?? 0,
+        },
       });
       await call(config, `/api/projects/${slug}/roadmap/${entry.number}/status`, {
         method: 'POST',
@@ -91,6 +103,7 @@ async function main() {
         version: entry.version ?? undefined,
         reason: entry.reason ?? undefined,
         section: entry.section ?? undefined,
+        sprint: entry.sprint?.number ?? undefined,
       },
     });
     if (result.number !== entry.number) {

@@ -395,12 +395,19 @@ const TOOLS = [
   {
     name: 'roadmap_list',
     description:
-      'A project\'s roadmap entries, optionally filtered by status. Use brief=true to survey ' +
-      'without pulling every entry\'s body into context.',
+      'A project\'s roadmap entries, optionally filtered by status or by sprint. Use brief=true ' +
+      'to survey without pulling every entry\'s body into context.',
     inputSchema: {
       type: 'object',
       properties: {
         ...PROJECT_ARGUMENT,
+        sprint: {
+          type: 'integer',
+          minimum: 1,
+          description:
+            'Only cards in this sprint, by number — 1 for S1. A number the project has no ' +
+            'sprint for is refused naming the ones it has.',
+        },
         status: {
           type: 'string',
           enum: [
@@ -422,6 +429,9 @@ const TOOLS = [
       const brief = args.brief !== false;
       const query = new URLSearchParams();
       if (args.status) query.set('status', args.status);
+      // R257. The API refuses a number with no sprint behind it, naming the
+      // sprints there are; that sentence is passed through as the tool error.
+      if (args.sprint) query.set('sprint', String(args.sprint));
       query.set('brief', String(brief));
 
       const entries = await api(config, `/api/projects/${slug}/roadmap?${query}`);
@@ -589,6 +599,14 @@ const TOOLS = [
         version: { type: 'string' },
         reason: { type: 'string' },
         section: { type: 'string', description: 'Which part of the roadmap, e.g. "Phase 2 — …".' },
+        sprint: {
+          type: 'integer',
+          minimum: 0,
+          description:
+            'The sprint to file this card into, by number — 1 for S1. 0 takes it out of its ' +
+            'sprint; leave it out to leave it alone. A CLOSED sprint refuses a card that is ' +
+            'not already in it, and only a person can reopen one — do not retry.',
+        },
         related: {
           type: 'array',
           items: { type: ['string', 'integer'] },
@@ -610,7 +628,7 @@ const TOOLS = [
         method: 'POST',
         body: pick(args, [
           'title', 'body', 'status', 'branch', 'merge', 'version', 'reason', 'section', 'related',
-          'after',
+          'after', 'sprint',
         ]),
       });
       return `Created ${refOf(entry)} in ${slug}.\n\n${formatEntry(entry, {})}`;
@@ -715,8 +733,8 @@ const TOOLS = [
   {
     name: 'roadmap_update',
     description:
-      'Edit an entry\'s title, body, section, related refs or the cards it starts after. ' +
-      'Use roadmap_set_status to move it.',
+      'Edit an entry\'s title, body, section, sprint, related refs or the cards it starts ' +
+      'after. Use roadmap_set_status to move it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -728,6 +746,14 @@ const TOOLS = [
         title: { type: 'string' },
         body: { type: 'string' },
         section: { type: 'string' },
+        sprint: {
+          type: 'integer',
+          minimum: 0,
+          description:
+            'The sprint to file this card into, by number — 1 for S1. 0 takes it out of its ' +
+            'sprint; leave it out to leave it alone. A CLOSED sprint refuses a card that is ' +
+            'not already in it, and only a person can reopen one — do not retry.',
+        },
         related: {
           type: 'array',
           items: { type: ['string', 'integer'] },
@@ -748,7 +774,8 @@ const TOOLS = [
       const slug = await resolveProject(config, args.project);
       const entry = await api(config, `/api/projects/${slug}/roadmap/${args.number}`, {
         method: 'PATCH',
-        body: pick(args, ['title', 'body', 'section', 'related', 'after']),
+        // pick keeps a present 0, which is how a card leaves its sprint.
+        body: pick(args, ['title', 'body', 'section', 'related', 'after', 'sprint']),
       });
       return `Updated ${refOf(entry)}.\n\n${formatEntry(entry, {})}`;
     },
@@ -1725,6 +1752,12 @@ function approvalTimeoutSeconds() {
 // API has no such endpoint either: DECLINED with a reason is the only exit.
 // The same goes for comments — nothing here removes one, and nothing there
 // does either.
+//
+// Nor is there a sprint_open, sprint_close or sprint_rename — R257. Opening,
+// closing and renaming a sprint are a person's acts on the page, and the API
+// says so structurally (POST/PATCH /sprints take a session, not a token). An
+// agent's whole reach here is reading a card's sprint and filing a card into
+// one with roadmap_create / roadmap_update `sprint`.
 
 function pick(source, keys) {
   const out = {};
@@ -1866,6 +1899,13 @@ function formatEntry(entry, { brief, comments, plan }) {
   if (entry.version) lines.push(`  version: ${entry.version}`);
   if (entry.declinedReason) lines.push(`  declined because: ${entry.declinedReason}`);
   if (entry.section) lines.push(`  section: ${entry.section}`);
+  // R257. Always printed when the card has one, so a reader's shape does not
+  // depend on which tool printed the card; a closed sprint says so.
+  if (entry.sprint) {
+    lines.push(
+      `  sprint: ${entry.sprint.ref} ${entry.sprint.name}${entry.sprint.state === 'CLOSED' ? ' (closed)' : ''}`,
+    );
+  }
   if (entry.related?.length) {
     // Each id written the way its own card is written, when the API said so.
     lines.push(

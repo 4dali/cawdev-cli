@@ -39,6 +39,9 @@ const SECTION_ORDER = [
   'Phase 5 — agents, skills and a marketplace',
   'Phase 5 — notifications, and the console away from the desk',
   'Phase 6 — the meta-harness: a lifecycle, not a chat',
+  // R257 named this one at the export that first carried the sprint cards.
+  // Phase 7 (administration) is left for its own cards to name.
+  'Phase 8 — sprints: a numbered set of cards, and the branch they land on together',
   'The generated files and the tools',
   // Named rather than appended: six entries were arriving here silently, which
   // is the state R45's note exists to end. Last, because a finding somebody
