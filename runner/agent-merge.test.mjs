@@ -257,6 +257,40 @@ test('a conflicting merge spawns a session that can write the conflicted file an
       assert.deepEqual(prepared.conflictedFiles, [CONFLICTED]);
     });
 
+test('a sprint branch\u2019s merge session — a MANUAL run with no card — is handed the same list, and no gh',
+    async (t) => {
+      // R261. The sprint's branch is a work item with no card, so its R155
+      // session is a MANUAL-kind run with the MERGE profile. The daemon keys
+      // the tool list on the profile, so it is R155's list unchanged — and
+      // in particular still no `gh`: a sprint branch that has lived beside
+      // main for weeks is exactly the conflicting branch this exists for, and
+      // the landing is still the platform's MERGE request, never the session's.
+      const path = await aRepositoryThatConflicts();
+      const sprintRun = {
+        id: 'run-sprint-merge', projectSlug: 'board', kind: 'MANUAL',
+        label: 'S1 Notifications \u2014 the sprint branch',
+        openingPrompt: 'S1 Notifications \u2014 the sprint branch',
+        branch: MERGE_RUN.branch, profile: 'MERGE',
+      };
+      const { platform, said } = await daemonWith(t, {
+        path, name: 'agent-merge-sprint', offers: [sprintRun],
+      });
+
+      assert.ok(await until(said, /spawning:/), said());
+      const tools = spawnedTools(said());
+      for (const tool of tools) {
+        assert.ok(!/gh\b/.test(tool),
+          `a sprint merge session was spawned with something that can reach gh: ${tool}`);
+      }
+      const writes = tools.filter((each) => /^(Edit|Write)\(/.test(each)).sort();
+      assert.deepEqual(writes, [`Edit(${CONFLICTED})`, `Write(${CONFLICTED})`]);
+      assert.deepEqual(tools.filter((each) => each.startsWith('Bash')), ['Bash(git *)']);
+
+      const prepared = platform.mergeReports.find((each) => each.kind === 'prepared');
+      assert.ok(prepared, `the daemon never said what git merged:\n${said()}`);
+      assert.deepEqual(prepared.conflictedFiles, [CONFLICTED]);
+    });
+
 test('a merge that comes out clean spawns nothing at all', async (t) => {
   const path = await aRepositoryThatMergesCleanly();
   const { platform, said } = await daemonWith(t, { path, name: 'agent-merge-clean' });

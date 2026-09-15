@@ -3056,7 +3056,11 @@ async function performWorkspaceRequest(config, request, afterTheTreeMoved = null
       result = 'A merge has to name a branch. Nothing was merged.';
     } else {
       log(`  MERGING ${branch} — asked for from the console`);
-      ({ ok, result, failure: failureKind } = await mergePullRequest(cwd, branch));
+      // R261. A sprint's branch lands with a merge commit; every other branch
+      // squashes as it always did. The claim says which.
+      ({ ok, result, failure: failureKind } = await mergePullRequest(cwd, branch, {
+        method: request.mergeMethod ?? null,
+      }));
     }
   } else if (request.kind === 'TAG') {
     // R156's release. A read: it asks the HOST whether the tag is there, so it
@@ -3068,6 +3072,28 @@ async function performWorkspaceRequest(config, request, afterTheTreeMoved = null
     } else {
       log(`  checking for tag ${version} on the remote`);
       ({ ok, result } = await tagOnTheRemote(cwd, version));
+    }
+  } else if (request.kind === 'OPEN_PR') {
+    // R261. The first half of a sprint merge: open the pull request from the
+    // sprint's branch to the default — or find the one already there — and
+    // report its URL on the first line. The platform cannot know whether one
+    // exists (it holds no git-host credential), so it always asks this first
+    // and queues the MERGE when this comes back ok. Host-side like MERGE: the
+    // branch is on origin already (CUT_BRANCH put it there and every card
+    // merged into it), so nothing is pushed and no working tree moves.
+    const branch = (request.message ?? '').trim();
+    if (!branch) {
+      result = 'A pull request has to name a branch. Nothing was opened.';
+    } else {
+      const base = request.baseBranch ?? request.defaultBranch ?? 'main';
+      log(`  OPENING a pull request for ${branch} → ${base} — asked for from the console`);
+      ({ ok, result } = await openPullRequestFor(cwd, {
+        branch,
+        base,
+        title: request.title?.trim() || branch,
+        body: `Opened by cawdev for the sprint branch \`${branch}\`${request.title ? ` — ${request.title.trim()}` : ''}.\n\n`
+          + `Merging it lands every card of the sprint on ${base}.`,
+      }));
     }
   } else if (request.kind === 'CUT_BRANCH') {
     // R260. Put the sprint's branch on origin, from the default's tip. A branch
@@ -3378,24 +3404,44 @@ async function openPullRequest(cwd, run, title) {
     }
   }
 
-  const existing = await findPullRequest(cwd, run.branch).catch(() => null);
+  return openPullRequestFor(cwd, {
+    branch: run.branch,
+    // R260. The sprint's branch, when the claim carried one; otherwise the
+    // argv is byte for byte what it was and the host picks its own default.
+    base: run.baseBranch ?? null,
+    title: title?.trim() || run.label || run.branch,
+    // The body says what opened it and why, because somebody will find this in
+    // a review queue with no idea where it came from.
+    body: `Opened by cawdev's \`auto_pr\` rule for **${run.label ?? run.branch}**.\n\n`
+      + `Nobody clicked anything: this project's rules say a finished run opens a pull request. `
+      + `The session's transcript, commits and reports are on the run in the cawdev console.`
+      + (run.baseBranch ? `\n\nIts base is \`${run.baseBranch}\`, the branch of its sprint.` : ''),
+  });
+}
+
+/**
+ * The `gh pr create` itself, shared by the rule path above and R261's
+ * `OPEN_PR` workspace request — one argv, so a sprint's pull request and a
+ * card's are opened the same way. An existing pull request is a success, not
+ * a conflict: whoever asked wanted one to exist, and one does. The URL is the
+ * FIRST LINE of the result, the way `mergePullRequest` reports it, because the
+ * platform reads that line as the evidence and nothing else.
+ *
+ * `--base` only when one is given: with no base the argv is byte for byte what
+ * it was before R260 and the host picks its own default.
+ */
+async function openPullRequestFor(cwd, { branch, base, title, body }) {
+  const existing = await findPullRequest(cwd, branch).catch(() => null);
   if (existing && !existing.includes('/compare/')) {
     return { ok: true, result: existing };
   }
 
   const opened = await gh(cwd, [
     'pr', 'create',
-    '--head', run.branch,
-    // R260. The sprint's branch, when the claim carried one; otherwise the
-    // argv is byte for byte what it was and the host picks its own default.
-    ...(run.baseBranch ? ['--base', run.baseBranch] : []),
-    '--title', title?.trim() || run.label || run.branch,
-    // The body says what opened it and why, because somebody will find this in
-    // a review queue with no idea where it came from.
-    '--body', `Opened by cawdev's \`auto_pr\` rule for **${run.label ?? run.branch}**.\n\n`
-      + `Nobody clicked anything: this project's rules say a finished run opens a pull request. `
-      + `The session's transcript, commits and reports are on the run in the cawdev console.`
-      + (run.baseBranch ? `\n\nIts base is \`${run.baseBranch}\`, the branch of its sprint.` : ''),
+    '--head', branch,
+    ...(base ? ['--base', base] : []),
+    '--title', title,
+    '--body', body,
   ]);
   if (opened.code === 0 && opened.out) {
     // gh prints the URL and nothing else on success.
@@ -3419,12 +3465,21 @@ async function openPullRequest(cwd, run, title) {
  *
  * R134 reaches the same function from the development board's Merge button,
  * unchanged in what it does: a rule-merged branch and a hand-merged one should
- * land the same way. (Worth knowing: the release convention wants a MERGE
- * COMMIT for a release branch, because a squash rewrites the commit a tag
- * points at. Release branches are not worked through the development board
- * today; if that changes, this is the line that has to change with it.)
+ * land the same way.
+ *
+ * **Except a sprint's branch — R261.** Nine card branches squashed onto
+ * `s1-notifications` are nine commits, and squashing that onto the default
+ * would collapse them into one nobody can revert on its own. The claim says
+ * `mergeMethod: 'MERGE_COMMIT'` for a sprint item's merge and nothing for every
+ * other, so a project with no sprints produces byte for byte the argv it did.
+ * The second line of the result says which happened, and the platform quotes
+ * it on every card of the sprint — the only way a daemon too old to read
+ * `mergeMethod` (it would squash, silently) is ever noticed. (The release
+ * convention wants a merge commit for a release branch too, for the same
+ * reason; release branches are not worked through the development board
+ * today, and if that changes this is the line that has to change with it.)
  */
-async function mergePullRequest(cwd, branch) {
+async function mergePullRequest(cwd, branch, { method = null } = {}) {
   const url = await findPullRequest(cwd, branch).catch(() => null);
   if (!url || url.includes('/compare/')) {
     return {
@@ -3433,13 +3488,19 @@ async function mergePullRequest(cwd, branch) {
       result: 'There is no pull request for this branch to merge. Nothing was merged.',
     };
   }
-  const merged = await gh(cwd, ['pr', 'merge', url, '--squash', '--delete-branch']);
+  const mergeCommit = method === 'MERGE_COMMIT';
+  const merged = await gh(cwd, ['pr', 'merge', url, mergeCommit ? '--merge' : '--squash', '--delete-branch']);
   if (merged.code === 0) {
     // The URL on its own FIRST LINE — R134. The platform reads that line as the
     // evidence a merge happened and puts it on the card as the card's `merge`
     // field, which `MERGED` refuses to be blank. The sentence after it is for
-    // whoever reads the result as text, which is what the run-action path does.
-    return { ok: true, failure: null, result: `${url}\nsquashed and merged; the branch is deleted.` };
+    // whoever reads the result as text, which is what the run-action path does
+    // — and, since R261, what the landing comment on a sprint's cards quotes.
+    return {
+      ok: true,
+      failure: null,
+      result: `${url}\n${mergeCommit ? 'merged with a merge commit' : 'squashed and merged'}; the branch is deleted.`,
+    };
   }
   return {
     ok: false,
