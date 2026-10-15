@@ -81,8 +81,8 @@ async function daemonWith(t, { name, profile, branch = 'cto-interview', withBrie
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(home, { recursive: true, force: true });
-    await rm(path, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await rm(socketPathFor(name), { force: true });
   });
 
@@ -104,7 +104,7 @@ test('an interview is prepared a working copy and a branch, like a coding run', 
   // The branch is the point: the brief is committed and read before it lands,
   // so it goes out through the project's finish rules like any other work.
   assert.ok(await untilSaid(/working copy .* is on cto-interview/), said());
-  assert.doesNotMatch(said(), /nothing prepared/);
+  assert.doesNotMatch(said(), /nothing cut/);
 });
 
 test('it may write the brief and nothing else', async (t) => {
@@ -141,7 +141,7 @@ test('an ASK session still has nothing prepared', async (t) => {
     name: 'test-interview-ask-untouched',
     profile: 'ASK',
   });
-  assert.ok(await untilSaid(/no branch, nothing prepared/), said());
+  assert.ok(await untilSaid(/no branch, nothing cut/), said());
 });
 
 test('the git survey says whether the repository already has a brief', async (t) => {

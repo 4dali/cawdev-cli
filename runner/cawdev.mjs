@@ -26,11 +26,20 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { attach, urlFrom, valueOf } from './attach.mjs';
-import { asker, mintForThisMachine, setUpThisMachine } from './bootstrap.mjs';
+import { asker, askOne, mintForThisMachine, setUpThisMachine } from './bootstrap.mjs';
 import { liveSockets, probeSocket, socketPathFor } from './control.mjs';
+import {
+  addProject, addWorkspace, readConfigFile, reloadIfRunning, removeProject, setAcceptsRulesFromConsole,
+  setQuality, setAgentEnabled,
+} from './configure.mjs';
+import { restartNeededFor } from '../lib/runner-config.mjs';
+import { Select } from './select.mjs';
+import { storedSession } from './sign-in.mjs';
 import { loadToken } from './token-store.mjs';
 import { painter } from '../lib/ansi.mjs';
+import { KNOWN_AGENTS } from '../lib/agents.mjs';
 import { mark } from './brand.mjs';
+import { cliVersion, isBelow } from '../lib/version.mjs';
 
 const HERE = dirname(new URL(import.meta.url).pathname);
 const RUNNER = join(HERE, 'runner.mjs');
@@ -46,14 +55,30 @@ const USAGE = `
   cawdev --no-start         attach only; never launch a daemon
   cawdev --watch-only       do not sign in; watch without being able to act
   cawdev --leave-running    leave the daemon running when you quit
+  cawdev --version          this CLI's version, and the platform's
   cawdev --help
+
+  cawdev config                          a menu: add a project, add a
+                                          workspace, agents, console rules
+  cawdev config add-project              serve one more project you can write to, or create one
+  cawdev config add-workspace            another checkout for a project you
+                                          already serve — R47's concurrency
+  cawdev config remove-project <slug>    stop serving a project (its checkouts
+                                          stay on disk)
+  cawdev config agent enable|disable <claude|agy|codex>
+  cawdev config rules on|off             accept permission rules from the console
+  cawdev config quality on|off <slug>    scan that project's branches with
+                                         SonarQube after a run's TEST stage
+  cawdev config show                     this machine's config, token redacted
 
   On a machine with no config, cawdev sets one up: it signs you in through the
   browser, asks which projects this machine should run agents for, clones them,
-  and mints its own runner token. No token is ever typed.
+  and mints its own runner token. No token is ever typed. \`cawdev config\` is
+  the same walk, one change at a time, on a machine already set up.
 
   Inside: enter prompts the session you are watching, / takes a command
-  (/help lists them), L lists the runs, and q stops the machine and leaves.
+  (/help lists them), L lists the runs, c configures this machine (the same
+  menu as \`cawdev config\`, on screen), and q stops the machine and leaves.
   It asks twice while sessions are running. --leave-running keeps it up.
 `;
 
@@ -238,7 +263,7 @@ export async function socketToAttach(argv, ink = painter()) {
  * hold more than one value, which is what makes moving the default a
  * three-line change rather than a two-line bug.
  */
-const DEFAULT_URL = 'http://localhost:4200';
+const DEFAULT_URL = 'https://app.cawdev.com';
 
 /**
  * Two URLs, because they answer two different questions.
@@ -267,6 +292,21 @@ export function signInUrl(file, argv, env = process.env) {
 }
 
 /**
+ * Where THIS launch signs in: `signInUrl` over the config the launch would use.
+ *
+ * The banner, the version check and the person's own session all asked
+ * `urlFrom(argv)`, which knows `--url` and `CAWDEV_URL` and never the config —
+ * so `cawdev --config local.config.json` minted the machine's token at the
+ * config's localhost and then opened the browser on app.cawdev.com for the
+ * person. One reading, taken once, so the three cannot disagree with the mint.
+ */
+export async function launchUrl(argv, env = process.env, cwd = process.cwd()) {
+  const configPath = await findConfig(argv, env, cwd);
+  const file = configPath ? await readConfigFile(configPath) : null;
+  return signInUrl(file, argv, env);
+}
+
+/**
  * What `readConfig` will call this machine — and therefore the storage key.
  *
  * Deliberately a copy of the daemon's own precedence (`CAWDEV_URL`, the config,
@@ -280,22 +320,10 @@ export function daemonUrl(file, env = process.env) {
   return String(env.CAWDEV_URL ?? file?.url ?? DEFAULT_URL).replace(/\/+$/, '');
 }
 
-/**
- * The config as an object, or null if it will not parse.
- *
- * Null rather than a throw: an unreadable config is the daemon's complaint to
- * make — it names the file and the parse error — and swallowing it here to
- * offer a setup walk would replace a precise message with a wrong guess about
- * what somebody wants.
- */
-export async function readConfigFile(path) {
-  try {
-    const parsed = JSON.parse(await readFile(path, 'utf8'));
-    return parsed && typeof parsed === 'object' ? parsed : null;
-  } catch {
-    return null;
-  }
-}
+// `readConfigFile` lives in configure.mjs since R288 — the attached UI reads
+// the file too, and this module imports attach.mjs. Re-exported so nothing
+// that imported it from here has to move.
+export { readConfigFile };
 
 /**
  * The setup walk, with the terminal handed to it and taken back.
@@ -337,6 +365,201 @@ async function runMint(configPath, file, argv, ink) {
   });
 }
 
+/**
+ * This CLI's version against the platform's — R283.
+ *
+ * Best-effort and silent on the happy path, matching `acceptsConsoleRules`'
+ * own philosophy (R126's comment on the daemon side): a mismatch is worth a
+ * line, agreement is worth nothing. Never thrown from here — a network hiccup
+ * is not evidence of a stale CLI, and `cawdev` has an attach to get on with.
+ */
+async function warnIfVersionMismatched(url, ink) {
+  try {
+    const mine = await cliVersion();
+    const response = await fetch(`${url}/api/health`);
+    if (!response.ok) return;
+    const health = await response.json();
+    if (health.version && health.version !== mine && health.version !== 'unknown') {
+      console.log(`  ${ink.warn('!')} ${ink.muted(`This CLI is ${mine}; ${url} is on ${health.version}.`)}`);
+      console.log(`  ${ink.muted('Update this machine\'s cawdev if things look wrong.')}`);
+    }
+    if (isBelow(mine, health.minimumCliVersion)) {
+      console.log(`  ${ink.danger('!')} ${ink.text(`This CLI (${mine}) is below what ${url} requires `
+        + `(${health.minimumCliVersion}) — the daemon will refuse to start until it is updated.`)}`);
+    }
+  } catch {
+    // Best-effort. readConfig's own health check, before registering, is
+    // where a genuinely unreachable platform actually matters.
+  }
+}
+
+/**
+ * `cawdev --version`: this CLI's own version, and the platform's.
+ *
+ * Works with no config and no sign-in — `/api/health` needs neither — so it
+ * answers on a machine that has not been set up at all yet.
+ */
+async function runVersion(url, ink) {
+  const mine = await cliVersion();
+  console.log(`  ${ink.muted('cawdev')} ${ink.text(mine)}`);
+  try {
+    const response = await fetch(`${url}/api/health`);
+    const health = response.ok ? await response.json() : null;
+    if (health) {
+      console.log(`  ${ink.muted(url)} ${ink.text(health.version)}`);
+      if (isBelow(mine, health.minimumCliVersion)) {
+        console.log(`  ${ink.danger('This CLI is below the minimum that platform requires')} `
+          + `(${health.minimumCliVersion}). Update it.`);
+      } else if (health.version !== mine && health.version !== 'unknown') {
+        console.log(`  ${ink.muted('These differ — update whichever is behind.')}`);
+      }
+    } else {
+      console.log(`  ${ink.muted(url)} ${ink.warn('did not answer')}`);
+    }
+  } catch (failure) {
+    console.log(`  ${ink.muted(url)} ${ink.warn(`unreachable (${failure.message})`)}`);
+  }
+}
+
+/**
+ * `cawdev config` — R283's granular half of the setup walk, on a machine
+ * already configured. A direct subcommand (`add-project`, `add-workspace`,
+ * `remove-project <slug>`,
+ * `agent enable|disable <command>`, `rules on|off`, `quality on|off <slug>`,
+ * `show`) or, with none, a
+ * menu — the same `Select` widget everything that offers a choice uses.
+ */
+async function runConfig(args, ink) {
+  const configPath = await findConfig(args);
+  if (!configPath) {
+    throw new Error('No config on this machine yet. Run `cawdev --setup` first.');
+  }
+  const file = await readConfigFile(configPath);
+  if (!file) {
+    throw new Error(`Could not read ${configPath}.`);
+  }
+
+  if (args[0] === 'show') {
+    printConfig(file, ink, (line) => console.log(line));
+    return;
+  }
+
+  const url = daemonUrl(file);
+  const session = await storedSession(url);
+  if (!session.signedIn) {
+    throw new Error('Not signed in on this machine. Run `cawdev --setup` first.');
+  }
+
+  const ask = asker();
+  const say = (line) => console.log(line);
+  try {
+    const action = args.length ? args : await pickAction(ask, say);
+    await runAction(action, { configPath, file, url, session, ask, say, ink });
+  } finally {
+    ask.close();
+  }
+}
+
+export async function pickAction(ask, say, pick = askOne) {
+  const picked = await pick(ask, say, new Select({
+    title: 'What do you want to change on this machine?',
+    rows: [
+      { id: 'add-project', label: 'Add a project — or create one on cawdev' },
+      { id: 'add-workspace', label: 'Add a workspace to a project' },
+      { id: 'remove-project', label: 'Stop serving a project' },
+      { id: 'agent-enable', label: `Enable an agent (${KNOWN_AGENTS.join(' / ')})` },
+      { id: 'agent-disable', label: 'Disable an agent' },
+      { id: 'rules-on', label: 'Accept permission rules from the console' },
+      { id: 'rules-off', label: 'Stop accepting rules from the console' },
+      { id: 'quality-on', label: 'Scan a project\'s branches with SonarQube after TEST' },
+      { id: 'quality-off', label: 'Stop scanning a project\'s branches' },
+      { id: 'show', label: 'Show this machine\'s config' },
+    ],
+  }));
+  const id = picked.row.id;
+  if (id === 'agent-enable' || id === 'agent-disable') {
+    const command = (await ask.line(`  Which agent — ${KNOWN_AGENTS.join(', ')}? `)).trim();
+    return ['agent', id === 'agent-enable' ? 'enable' : 'disable', command];
+  }
+  if (id === 'remove-project') {
+    return ['remove-project', (await ask.line('  Which project (slug)? ')).trim()];
+  }
+  if (id === 'rules-on') return ['rules', 'on'];
+  if (id === 'rules-off') return ['rules', 'off'];
+  if (id === 'quality-on' || id === 'quality-off') {
+    const slug = (await ask.line('  Which project (slug)? ')).trim();
+    return ['quality', id === 'quality-on' ? 'on' : 'off', slug];
+  }
+  return [id];
+}
+
+export async function runAction([verb, ...rest], { configPath, file, url, session, ask, say, ink, reloadOptions = {} }) {
+  if (verb === 'show') {
+    printConfig(file, ink, say);
+    return;
+  }
+  // R294: every change ends the same way — the daemon on this config, if one
+  // is running, is signalled and its own verdict is printed. For a project or
+  // a workspace that verdict is "needs a restart", because `config.projects`
+  // is read once at boot; but it is the daemon saying so about the file it is
+  // actually on, not this command guessing about a daemon it cannot see.
+  const reload = (next) => reloadIfRunning(file.name, say, ink, {
+    fallback: restartNeededFor(file, next), ...reloadOptions,
+  });
+  if (verb === 'add-project') {
+    await reload(await addProject({ configPath, file, url, session, ask, say, ink }));
+    return;
+  }
+  if (verb === 'add-workspace') {
+    await reload(await addWorkspace({ configPath, file, url, session, ask, say, ink }));
+    return;
+  }
+  if (verb === 'remove-project') {
+    const [slug] = rest;
+    if (!slug) {
+      throw new Error('Name a project: cawdev config remove-project <slug>');
+    }
+    await reload(await removeProject({ file, configPath, ask, say, ink, slug }));
+    return;
+  }
+  if (verb === 'agent') {
+    const [sub, command] = rest;
+    if (!KNOWN_AGENTS.includes(command)) {
+      throw new Error(`Name an agent: cawdev config agent enable|disable ${KNOWN_AGENTS.join('|')}`);
+    }
+    await reload(await setAgentEnabled({
+      file, configPath, ask, say, ink, command, enabled: sub === 'enable',
+    }));
+    return;
+  }
+  if (verb === 'rules') {
+    const [sub] = rest;
+    await reload(await setAcceptsRulesFromConsole({ file, configPath, ask, say, ink, enabled: sub === 'on' }));
+    return;
+  }
+  if (verb === 'quality') {
+    // R300. The block is captured per project at boot, so the daemon's own
+    // verdict here is always "restart" — and it is the daemon that says so.
+    const [sub, slug] = rest;
+    if (!['on', 'off'].includes(sub) || !slug) {
+      throw new Error('Name a project: cawdev config quality on|off <slug>');
+    }
+    await reload(await setQuality({ file, configPath, ask, say, ink, slug, enabled: sub === 'on' }));
+    return;
+  }
+  throw new Error(`Not a cawdev config command: ${verb}. See cawdev --help.`);
+}
+
+/** The config as somebody would want to read it back — never the secret. */
+export function printConfig(file, ink, say) {
+  const shown = { ...file };
+  if (shown.token) shown.token = `${String(shown.token).slice(0, 10)}…`;
+  say(JSON.stringify(shown, null, 2)
+    .split('\n')
+    .map((line) => `  ${ink.text(line)}`)
+    .join('\n'));
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const ink = painter();
@@ -346,12 +569,28 @@ async function main() {
     return;
   }
 
+  if (argv[0] === 'config') {
+    await runConfig(argv.slice(1), ink);
+    return;
+  }
+
+  const url = await launchUrl(argv);
+
+  if (argv.includes('--version')) {
+    await runVersion(url, ink);
+    return;
+  }
+
   // The mark, once, before anything else happens. It is the only decoration in
   // the program and it is here because this is the moment somebody is waiting:
   // a browser about to open, or a daemon about to boot.
-  for (const line of mark(ink, { tagline: urlFrom(argv) })) {
+  for (const line of mark(ink, { tagline: url })) {
     console.log(`\n${line}\n`);
   }
+
+  // R283. Best-effort, silent when the two agree — see the function's own
+  // comment for why this never throws.
+  await warnIfVersionMismatched(url, ink);
 
   // Asked for by name, the walk runs even where one has been done before —
   // that is what "again" means, and adding a project to this machine is the
@@ -368,7 +607,7 @@ async function main() {
   }
 
   const socketPath = await socketToAttach(argv, ink);
-  await attach(argv, { socketPath });
+  await attach(argv, { socketPath, url });
 }
 
 /**

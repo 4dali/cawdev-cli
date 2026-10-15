@@ -12,12 +12,16 @@
 // against your working copies; it should be a file you can read first.
 
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile,
 } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 
 import { join, resolve } from 'node:path';
+import { spawnFailureSaid, workspaceProblem, workspaceProblemSaid } from './workspace-check.mjs';
+import { changedLines } from './changed-lines.mjs';
+import { adapterFor, hostFor, repoOf } from './git-host.mjs';
 import { describeTurn, totalsOf } from '../lib/usage.mjs';
 import { withinCeiling } from '../lib/tool-rules.mjs';
 import { serveControl } from './control.mjs';
@@ -27,14 +31,30 @@ import { codeMapOf } from '../lib/code-map.mjs';
 import { usageLimitOf } from '../lib/usage-limit.mjs';
 import { TranscriptBatch } from '../lib/transcript-batch.mjs';
 import { parseUsage } from '../lib/usage-report.mjs';
-import { qualified, writeRunPlugin } from '../lib/run-plugin.mjs';
+import {
+  ANTIGRAVITY_EXPERTS_PLUGIN, qualified, writeAntigravityExpertsPlugin, writeRunPlugin,
+} from '../lib/run-plugin.mjs';
 import { AI_CONFIG, harnessPrompt, readRepoConfig } from '../lib/harness-prompt.mjs';
 import { loadToken, storedUrls } from './token-store.mjs';
 import {
-  CARD_WRITE, CAWDEV_READS, GIT_READS, driftedFrom, readOnlyExpert, toolsForStage,
+  CARD_WRITE, CAWDEV_READS, GIT_READS, beforeTheWorkExists, driftedFrom, readOnlyExpert,
+  toolsForStage,
 } from '../lib/stage-tools.mjs';
 import { capabilityIn, describeCall } from '../lib/tool-line.mjs';
 import { findSecret } from '../lib/secrets.mjs';
+import { BackgroundShells } from '../lib/background-shells.mjs';
+import { cliVersion, isBelow } from '../lib/version.mjs';
+import { reloadableFor, restartNeededFor } from '../lib/runner-config.mjs';
+import {
+  createAutoWorkspace, discoverAutoWorkspaces, isAutoWorkspace,
+} from './auto-workspaces.mjs';
+import { agentOfCommand, needsEverything } from '../lib/agents.mjs';
+import { cawdevToolNames, codexArgs, translateCodexEvent } from '../lib/codex.mjs';
+import {
+  drivingPath, isAlive, killedByRestart, leftBehind, memoryMaxOf, probeScope, readDriving,
+  restartSummary, scoped, snapshotOf, writeDriving,
+} from './restart.mjs';
+import { COMMITS_ITS_WORK, settleBranch } from '../lib/finish-check.mjs';
 
 // --- configuration -----------------------------------------------------------
 
@@ -53,12 +73,12 @@ const DEFAULTS = {
    * the URL, so a default naming one door while a person signs in at the other
    * files a live credential under a name the daemon never looks up.
    *
-   * The cost is stated rather than hidden: through `:4200` the daemon's calls
-   * go via the Angular dev proxy, so `ng serve` has to be up. A machine running
-   * only the API says so in its config, which is one line and the thing configs
-   * are for.
+   * The default now names cawdev's own hosted instance, `app.cawdev.com`,
+   * rather than a local address — a machine with no config talks to that
+   * instance until told otherwise. A self-hosted deployment says so in its
+   * config, which is one line and the thing configs are for.
    */
-  url: 'http://localhost:4200',
+  url: 'https://app.cawdev.com',
   name: 'this-machine',
   /**
    * The agent this machine spawns.
@@ -72,7 +92,7 @@ const DEFAULTS = {
    * cure. A default that is simply the thing this daemon exists to run costs
    * nothing and cannot be missing.
    */
-  agentCommand: 'claude',
+  agentCommands: ['claude'],
   /**
    * Verified against Claude Code 2.1.247.
    *
@@ -160,6 +180,13 @@ const DEFAULTS = {
     // would be a question with one sensible answer.
     'mcp__cawdev__code_map',
     'mcp__cawdev__file_deps',
+    // R302. The SonarQube reading — a read, allowed by default like the map.
+    // Through READ_ONLY_CAWDEV this reaches REVIEW and AUDIT as the card
+    // asks, and ASK, SCOPE, MERGE, RELEASE and INTERVIEW as well: it is a
+    // read and harmless there, and subtracting it from five lists would be
+    // five lists to keep in step. PLAN is the one profile that drops it —
+    // `beforeTheWorkExists`, below — because the card says so.
+    'mcp__cawdev__quality_get',
     'mcp__cawdev__roadmap_statuses',
     'mcp__cawdev__roadmap_list',
     'mcp__cawdev__roadmap_get',
@@ -194,6 +221,10 @@ const DEFAULTS = {
     // and is not sure it deserves one. A writer, like issue_file: a read-only
     // stage is refused it by shape and not by this list.
     'mcp__cawdev__backlog_file',
+    // R368. Ticks one item of the card's Done-when checklist as built. A
+    // writer, like the three above: it is not in CAWDEV_READS, so a read-only
+    // stage is refused it by shape and not by this list.
+    'mcp__cawdev__done_when_tick',
     // R96's rounds. An interview is the one profile that cannot work without
     // these, and they were missing for the same reason as the two above.
     'mcp__cawdev__ask_group',
@@ -337,15 +368,22 @@ const DEFAULTS = {
   usageSeconds: 600,
 };
 
-async function readConfig() {
+/** The `--config` path this process was started with, or the default. */
+function configPathFromArgv() {
   const index = process.argv.indexOf('--config');
-  const path = index === -1 ? 'runner.config.json' : process.argv[index + 1];
+  return index === -1 ? 'runner.config.json' : process.argv[index + 1];
+}
+
+async function readConfig() {
+  const path = configPathFromArgv();
 
   let file = {};
+  let fromFile = false;
   try {
     file = JSON.parse(await readFile(path, 'utf8'));
+    fromFile = true;
   } catch (failure) {
-    if (index !== -1) {
+    if (process.argv.includes('--config')) {
       throw new Error(`Could not read ${path}: ${failure.message}`);
     }
     // No config file is fine when everything comes from the environment.
@@ -369,7 +407,7 @@ async function readConfig() {
      */
     token: process.env.CAWDEV_TOKEN ?? file.token ?? (await loadToken(url)),
     name: process.env.CAWDEV_RUNNER_NAME ?? file.name ?? DEFAULTS.name,
-    agentCommand: process.env.CAWDEV_AGENT_COMMAND ?? file.agentCommand ?? DEFAULTS.agentCommand,
+    agentCommands: file.agentCommands ?? (file.agentCommand ? [file.agentCommand] : null) ?? (process.env.CAWDEV_AGENT_COMMAND ? process.env.CAWDEV_AGENT_COMMAND.split(',').map(s => s.trim()) : null) ?? DEFAULTS.agentCommands,
     // Which projects this runner serves, and where their working copies are.
     projects: normaliseProjects(file.projects ?? {}),
     /**
@@ -386,11 +424,40 @@ async function readConfig() {
       file.acceptsRulesFromConsole ?? DEFAULTS.acceptsRulesFromConsole,
     /** Whether a run here may reach the operator's browser. Per project too. */
     browser: file.browser ?? DEFAULTS.browser,
+    /**
+     * How many checkouts per project this machine may CLONE by itself when a
+     * coding run would otherwise wait for a free one — see auto-workspaces.mjs.
+     * Absent is none: an actuator that spends disk and a clone's time is
+     * switched on, never on by default.
+     */
+    autoWorkspaces: autoWorkspacesOf(file.autoWorkspaces),
+    /**
+     * R339: the memory ceiling each agent session is spawned under, as
+     * systemd reads it (`6G`, `75%`) — Linux only, see restart.mjs. Absent is
+     * none. Raw here; `main` probes whether this machine can apply it.
+     */
+    sessionMemoryMax: file.sessionMemoryMax ?? null,
     skillCache: file.skillCache ?? DEFAULTS.skillCache,
     skillPrepareSeconds: file.skillPrepareSeconds ?? DEFAULTS.skillPrepareSeconds,
     idleSeconds: file.idleSeconds ?? DEFAULTS.idleSeconds,
     usageSeconds: file.usageSeconds ?? DEFAULTS.usageSeconds,
     sessionExitSeconds: file.sessionExitSeconds ?? DEFAULTS.sessionExitSeconds,
+    /**
+     * The FILE this daemon booted from, absolute, or null when everything
+     * came from the environment — R288. Published on the control socket so
+     * the attached terminal's `c` key edits the config this process is
+     * actually running on and not one it guessed at. Absolute because the
+     * daemon's cwd is not the terminal's: `cawdev` starts it detached.
+     */
+    configPath: fromFile ? resolve(path) : null,
+    /**
+     * The file as it was when this daemon booted — R294. What every later
+     * reading is compared against, so the daemon can say which of its
+     * settings the file has moved on from and only a restart would apply.
+     * The RAW file, not `config`: the question is what the operator changed,
+     * and defaults filled in here are not something they wrote.
+     */
+    bootedFile: fromFile ? file : null,
   };
 
   if (!config.token) {
@@ -436,6 +503,12 @@ async function readConfig() {
  *   "dycrypt": "/Users/you/code/dycrypt"
  *   "dycrypt": { "path": "…", "allowedTools": ["Bash(mvn *)", "mcp__roadmap"] }
  *   "cawdev":  { "workspaces": ["/…/ws-1", "/…/ws-2", "/…/ws-3"] }
+ *   "cawdev":  { "workspaces": [...], "quality": { "command": "sonar-scanner", "tokenEnv": "SONAR_TOKEN" } }
+ *
+ * R300: the fourth form adds a `quality` block — see `qualityBlockOf` — and a
+ * project with one has its branches scanned after a coding run's TEST stage.
+ * Captured here at boot, not hot-swapped: adding or changing the block needs
+ * a restart, and `restartNeededFor` says so.
  *
  * R47: a bare path means ONE workspace, which is what every config meant
  * before workspaces existed. Concurrency for a project is
@@ -444,6 +517,32 @@ async function readConfig() {
  * which is the truth rather than "that project already has a run here" standing
  * in for it.
  */
+/** `autoWorkspaces` as a count: a whole number from 0, anything else is 0. */
+function autoWorkspacesOf(value) {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : 0;
+}
+
+/**
+ * The on-demand checkouts beside each project's first one, joined to its list
+ * — at boot, and again on SIGHUP, when one may have been made or dropped by
+ * somebody else. A checkout gone from disk leaves the list unless a run holds
+ * it; one that appeared joins it. The configured checkouts are never touched.
+ */
+async function syncAutoWorkspaces(projects, held = new Set()) {
+  for (const [slug, project] of Object.entries(projects)) {
+    const first = project.workspaces[0];
+    const found = await discoverAutoWorkspaces(first);
+    const kept = project.workspaces.filter((path) => !isAutoWorkspace(first, path)
+      || found.includes(path) || held.has(path));
+    const added = found.filter((path) => !kept.includes(path));
+    const dropped = project.workspaces.filter((path) => !kept.includes(path));
+    project.workspaces = [...kept, ...added];
+    for (const path of added) log(`  ${slug}: serving the checkout made on demand at ${path}`);
+    for (const path of dropped) log(`  ${slug}: ${path} is gone — no longer serving it`);
+  }
+}
+
 function normaliseProjects(projects) {
   const normalised = {};
   for (const [slug, value] of Object.entries(projects)) {
@@ -481,9 +580,56 @@ function normaliseProjects(projects) {
       // falls through to the machine's answer; `false` here refuses it for one
       // project on a machine that otherwise allows it.
       browser: settings.browser,
+      // R300: whether, and how, this project's branches are scanned with
+      // SonarQube after TEST. Null is the ordinary case and means never.
+      quality: qualityBlockOf(slug, settings.quality),
     };
   }
   return normalised;
+}
+
+/**
+ * A project's `quality` block, normalised — R300.
+ *
+ * The scan is opt-in TWICE: here, on the machine, and on the project, which
+ * must have a SonarQube key (the claim carries it). A machine with no block
+ * never scans and never says so; a machine with one and no scanner on its
+ * PATH reports an `error` reading rather than nothing, so the page says the
+ * scan could not run instead of showing a branch nobody looked at.
+ *
+ * `tokenEnv` names the variable this machine holds the scanner token in. The
+ * platform never sends one: the project's SonarQube token (R304) is the
+ * platform's reader credential and stays there; the scanner's is the
+ * operator's and stays here. `url` overrides the platform's `sonarUrl` for
+ * a machine that reaches the server by another name (a LAN hostname).
+ *
+ * `whenBranchesRefused` is what to do on a server that refuses
+ * `sonar.branch.name` — Community Edition. The default, `skip`, reports an
+ * error saying so; `main` re-runs the scan as the project's MAIN analysis,
+ * which overwrites the project's dashboard with this branch's code and so
+ * makes the platform's project reading describe whichever branch scanned
+ * last; `project` — R316 — analyses the branch as its own scratch SonarQube
+ * project instead, `<key>:branch:<branch>-<hash>`, overwritten on each run,
+ * with "new" meaning a line the branch changed. Both are an operator's own
+ * opt-in — nothing opts in for them — and `project` additionally needs the
+ * scanner token to hold *Create Projects* on the server, and for the
+ * server's default project visibility to not be public (or this publishes
+ * the code).
+ */
+function qualityBlockOf(slug, block) {
+  if (!block) return null;
+  const when = block.whenBranchesRefused ?? 'skip';
+  if (when !== 'skip' && when !== 'main' && when !== 'project') {
+    throw new Error(
+      `Project "${slug}": quality.whenBranchesRefused must be "skip", "main" or "project", not "${when}".`);
+  }
+  return {
+    command: block.command ?? 'sonar-scanner',
+    tokenEnv: block.tokenEnv ?? 'SONAR_TOKEN',
+    url: block.url ?? null,
+    whenBranchesRefused: when,
+    timeoutSeconds: block.timeoutSeconds ?? 600,
+  };
 }
 
 
@@ -783,50 +929,64 @@ async function readUsage(config) {
   if (!config.usageSeconds || !config.runnerId) {
     return;
   }
-  const said = await new Promise((resolve) => {
-    let out = '';
-    const child = spawn(config.agentCommand, ['-p', '/usage', '--output-format', 'text'], {
-      stdio: ['ignore', 'pipe', 'pipe'],
+  
+  const allWindows = [];
+  
+  for (const agentCommand of config.agentCommands) {
+    // Codex has no `-p /usage`: its `-p` is a PROFILE, and the bare command is
+    // an interactive terminal. It reports no windows rather than a guess.
+    if (agentOfCommand(agentCommand) === 'codex') {
+      continue;
+    }
+    const said = await new Promise((resolve) => {
+      let out = '';
+      const child = spawn(agentCommand, ['-p', '/usage', '--output-format', 'text'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      // Bounded, because this runs on a timer for the life of the daemon: a CLI
+      // that hangs here must not accumulate a process per tick.
+      const giveUp = setTimeout(() => {
+        try {
+          child.kill('SIGTERM');
+        } catch { /* already gone */ }
+        resolve('');
+      }, 60_000);
+      giveUp.unref?.();
+      child.stdout.on('data', (chunk) => (out += chunk));
+      child.stderr.on('data', (chunk) => (out += chunk));
+      child.on('error', () => {
+        clearTimeout(giveUp);
+        resolve('');
+      });
+      child.on('close', () => {
+        clearTimeout(giveUp);
+        resolve(out);
+      });
     });
-    // Bounded, because this runs on a timer for the life of the daemon: a CLI
-    // that hangs here must not accumulate a process per tick.
-    const giveUp = setTimeout(() => {
-      try {
-        child.kill('SIGTERM');
-      } catch { /* already gone */ }
-      resolve('');
-    }, 60_000);
-    giveUp.unref?.();
-    child.stdout.on('data', (chunk) => (out += chunk));
-    child.stderr.on('data', (chunk) => (out += chunk));
-    child.on('error', () => {
-      clearTimeout(giveUp);
-      resolve('');
-    });
-    child.on('close', () => {
-      clearTimeout(giveUp);
-      resolve(out);
-    });
-  });
 
-  const windows = parseUsage(said);
-  if (!windows.length) {
+    const windows = parseUsage(said);
+    for (const each of windows) {
+      allWindows.push({
+        provider: agentOfCommand(agentCommand),
+        window: each.kind,
+        model: each.model,
+        percentUsed: each.percent,
+        // The counts stay null. The CLI gives a percentage and no totals, and
+        // inventing `used: 25, limit: 100` would put units on a page that the
+        // provider never stated — R20's rule, one level down.
+        used: null,
+        limit: null,
+        resetsAt: each.resetsAt ? each.resetsAt.toISOString() : null,
+      });
+    }
+  }
+
+  if (!allWindows.length) {
     return;
   }
   await api(config, `/api/runners/${config.runnerId}/limits`, {
     method: 'POST',
-    body: windows.map((each) => ({
-      provider: 'claude',
-      window: each.kind,
-      model: each.model,
-      percentUsed: each.percent,
-      // The counts stay null. The CLI gives a percentage and no totals, and
-      // inventing `used: 25, limit: 100` would put units on a page that the
-      // provider never stated — R20's rule, one level down.
-      used: null,
-      limit: null,
-      resetsAt: each.resetsAt ? each.resetsAt.toISOString() : null,
-    })),
+    body: allWindows,
   }).catch((failure) => log(`  could not report usage: ${failure.message}`));
 }
 
@@ -1269,10 +1429,17 @@ async function resolveSkills(config, run, cwd, baseCommit, asked) {
       notes.push(await prepareSkillIndex(config, skill, local, run, cwd, baseCommit));
     }
     attached.push({ skill, local });
+    // R303. A required server says so where the person is looking, as the
+    // expert line does. Whether a STAGE is actually asked for it is decided at
+    // spawn — a read-only stage cannot call it and is not nudged for it.
+    const must = skill.mode === 'REQUIRED'
+      ? ' This project REQUIRES it: if a stage finishes without calling one of its tools, the '
+        + 'session will be told.'
+      : '';
     notes.push(`${skill.name ?? skill.key} is available to this session as `
       + `${skill.toolPrefix ?? `mcp__${skill.serverName}`}. The first call still asks a person — `
       + `allow ${skill.toolPrefix ?? `mcp__${skill.serverName}`} for the session to cover the `
-      + 'rest.');
+      + `rest.${must}`);
   }
   return { attached, notes };
 }
@@ -1297,9 +1464,13 @@ async function resolveSkills(config, run, cwd, baseCommit, asked) {
  * It does not reproduce on macOS at any output size, so this is not something
  * a local run will ever warn about. Do not put `exit` back.
  */
-function git(cwd, args) {
+function git(cwd, args, { timeoutMs = 0 } = {}) {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('git', args, {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      ...(timeoutMs ? { timeout: timeoutMs } : {}),
+    });
     let out = '';
     let err = '';
     child.stdout.on('data', (chunk) => (out += chunk));
@@ -1467,6 +1638,59 @@ async function stashAfterCancel(config, run, cwd) {
  * request will target the wrong place with nothing saying so. With no
  * `baseBranch` every path here is byte for byte what it was before R260.
  */
+/** Read-only copies in use: path → how many sessions are reading in it. */
+const reading = new Map();
+
+/**
+ * Where a session with no branch reads the code — a plan, a verify, an ask.
+ *
+ * It takes no checkout (R70), so it used to run in the project's FIRST
+ * checkout as that checkout happened to be: on whatever branch the last run
+ * left there, however old — a cancelled CTO Interview left `cto-interview`
+ * checked out two hundred commits behind, and every plan after it read that
+ * code. Moving that checkout is not the answer: a coding run may be working
+ * in it this minute. So a session with no branch reads a copy of its own:
+ * `<first checkout>-read`, a DETACHED worktree of it — sharing its objects,
+ * touching neither its branch nor its tree — brought to origin's default
+ * branch whenever nobody is reading in it. One per project rather than one
+ * per run, because the CLI keys a resumable conversation on its directory
+ * (R69) and an ASK carried on in a different folder would start over.
+ * Detached, because `resetToOrigin` checks the default branch out in the
+ * checkout and git refuses a branch checked out twice. Anything failing here
+ * leaves the session where it always ran, and says why.
+ */
+async function readingCopy(source, defaultBranch) {
+  const main = defaultBranch || 'main';
+  const tip = `origin/${main}`;
+  const read = `${source.replace(/\/+$/, '')}-read`;
+  const inUse = reading.get(read) ?? 0;
+  try {
+    const there = await access(join(read, '.git')).then(() => true, () => false);
+    await git(source, ['fetch', '--quiet', 'origin', main]).catch(() => undefined);
+    if (!there) {
+      await git(source, ['worktree', 'prune']).catch(() => undefined);
+      await git(source, ['worktree', 'add', '--quiet', '--detach', read, tip]);
+    } else if (!inUse) {
+      await git(read, ['checkout', '--quiet', '--force', '--detach', tip]);
+    }
+    reading.set(read, inUse + 1);
+    const at = (await git(read, ['rev-parse', '--short', 'HEAD'])).trim();
+    return {
+      path: read,
+      said: inUse
+        ? `reading ${read} at ${at} — another session is reading there, so it was not moved`
+        : `reading ${tip} at ${at}, in ${read}`,
+      release: () => reading.set(read, Math.max(0, (reading.get(read) ?? 1) - 1)),
+    };
+  } catch (failure) {
+    return {
+      path: source,
+      said: `reading ${source} as it is — no reading copy: ${failure.message.split('\n')[0]}`,
+      release: () => undefined,
+    };
+  }
+}
+
 async function prepareWorkingCopy(path, branch, defaultBranch, allowDirty, baseBranch = null) {
   await access(join(path, '.git')).catch(() => {
     throw new Error(`${path} is not a git repository.`);
@@ -1732,11 +1956,12 @@ const SURVEY_FILE_CAP = 20;
  * arrive at the console as the same answer.
  *
  * **The order of this list matters, and it is `project.workspaces` order.**
- * R71 has the console work out which checkout a run would be given by taking
- * the first entry here that nothing is holding — the queue gate's
- * `workspaces.find((path) => !held.has(path))`, read from the other side of
- * the wire. Sorting or de-duplicating this on the way out would move the
- * warning onto a checkout the run is not headed for, and nothing would fail.
+ * R71/i258 has the console work out which checkout a run would be given by
+ * taking the first free entry here whose `dirty` is 0, falling back to the
+ * first free entry if none is known clean — the queue gate's `pickWorkspace`,
+ * read from the other side of the wire. Sorting or de-duplicating this on the
+ * way out would move the warning onto a checkout the run is not headed for,
+ * and nothing would fail.
  */
 /**
  * One porcelain line, split into its status and its path.
@@ -1764,6 +1989,16 @@ async function surveyWorkingCopies(config) {
   for (const [slug, project] of Object.entries(config.projects)) {
     for (const path of project.workspaces) {
       const held = heldBy(path);
+      const problem = await workspaceProblem(path).catch(() => null);
+      if (problem) {
+        survey.push({
+          project: slug,
+          path,
+          runId: held ?? null,
+          unreadable: workspaceProblemSaid(slug, problem, { first: project.workspaces[0] }),
+        });
+        continue;
+      }
       try {
         await access(join(path, '.git'));
         const porcelain = await git(path, ['status', '--porcelain']);
@@ -1790,6 +2025,77 @@ async function surveyWorkingCopies(config) {
   return survey;
 }
 
+/** Bounds the claim-time `git status` probe — see `looksClean`. */
+const CLEAN_PROBE_MS = 5000;
+
+/**
+ * Is `path`'s tree clean, read fresh, right now — i258.
+ *
+ * Three-valued on purpose: `true` clean, `false` dirty, `null` could not
+ * tell (no `.git`, a timeout, any failure). `null` is grouped with dirty by
+ * every caller — "I could not look" is not "it was clean" — so a probe that
+ * cannot answer degrades to the old first-free behaviour rather than
+ * starving the queue on a wedged filesystem.
+ *
+ * This does not reuse `surveyWorkingCopies`'s reading. That one runs on the
+ * heartbeat and is not kept anywhere; caching it here would add a second
+ * source of truth for a fact `pickWorkspace` is about to establish anyway,
+ * and a 30-second-old reading reproduces R71/i258 in a smaller window.
+ * `prepareWorkingCopy` runs the identical `git status --porcelain` seconds
+ * after this one.
+ */
+async function looksClean(path) {
+  const porcelain = await git(path, ['status', '--porcelain'], { timeoutMs: CLEAN_PROBE_MS })
+    .catch(() => null);
+  return porcelain === null ? null : porcelain === '';
+}
+
+/**
+ * `workspaceProblem` for `path`, asked once per `problems` Map. The Map lives
+ * for one poll pass, so a folder cloned meanwhile is picked up without a restart.
+ */
+async function problemOf(problems, path) {
+  if (!problems.has(path)) problems.set(path, await workspaceProblem(path));
+  return problems.get(path);
+}
+
+/**
+ * The checkout a question about the project is read from — R377. The first
+ * workspace nobody holds and that can be used; else null, and the caller
+ * falls back to `project.path` as it always did. A missing `workspaces[0]` must not make the project read as
+ * broken while `[1]` is fine.
+ */
+async function usableWorkspace(project, held, problems, { reading = false } = {}) {
+  const usable = [];
+  for (const path of project.workspaces) {
+    const trouble = await problemOf(problems, path);
+    // A reader has always been able to run in a folder with no `.git` — it
+    // reads the files as they are (`readingCopy`) — so only a folder that is
+    // not there at all stops it.
+    if (!trouble || (reading && trouble.kind === 'not-git')) usable.push(path);
+  }
+  return usable.find((path) => !held.has(path)) ?? null;
+}
+
+/**
+ * One log line per workspace that cannot be used — R377. Said at boot and on
+ * SIGHUP so the operator hears it before a run is queued behind it.
+ * Returns how many there were.
+ */
+async function sayWhichWorkspacesCannotBeUsed(config) {
+  let found = 0;
+  for (const [slug, project] of Object.entries(config.projects)) {
+    for (const path of project.workspaces) {
+      const problem = await workspaceProblem(path).catch(() => null);
+      if (problem) {
+        found += 1;
+        log(`  ${workspaceProblemSaid(slug, problem, { first: project.workspaces[0] })}`);
+      }
+    }
+  }
+  return found;
+}
+
 /**
  * What every checkout on this machine holds — R87.
  *
@@ -1811,6 +2117,15 @@ async function surveyWorkspaces(config) {
   const readings = [];
   for (const [slug, project] of Object.entries(config.projects)) {
     for (const path of project.workspaces) {
+      const problem = await workspaceProblem(path).catch(() => null);
+      if (problem) {
+        readings.push({
+          path,
+          projectSlug: slug,
+          error: workspaceProblemSaid(slug, problem, { first: project.workspaces[0] }),
+        });
+        continue;
+      }
       try {
         await access(join(path, '.git'));
         const branch = (await git(path, ['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
@@ -2167,9 +2482,10 @@ async function surveyGit(config) {
     // session's branch with its work uncommitted. Reading the pool's spare
     // gives the honest picture of the default branch instead.
     const held = heldWorkspaces();
-    const free = project.workspaces.find((candidate) => !held.has(candidate));
+    const free = await usableWorkspace(project, held, new Map());
     const path = free ?? resolve(project.path);
-    const busy = free === undefined;
+    // Busy means no free USABLE workspace.
+    const busy = free === null;
 
     const reading = await surveyProjectGit(path, { fetch: !busy }).catch((failure) => ({
       error: failure.message.split('\n')[0],
@@ -2201,6 +2517,376 @@ async function surveyGit(config) {
     await reportBrief(config, slug, path, reading.headSha ?? null,
         reading.defaultBranch ?? 'main');
   }
+}
+
+/**
+ * Scans the run's branch with SonarQube and tells the platform — R300.
+ *
+ * Runs AFTER the TEST stage settles and BEFORE the next stage begins, on the
+ * workspace the run just wrote, and it is the DAEMON that runs it: a session
+ * that reported its own gate could lie about it (RunnerLimit's argument), so
+ * the scanner is a subprocess this process starts and nothing the spawned
+ * `claude` can call. Only a staged run with a TEST stage gets here — a
+ * lifecycle without one, an unstaged run, a run whose gate refused TEST twice
+ * or one that reported done inside TEST is not scanned, because there was no
+ * settled TEST stage to scan after.
+ *
+ * The shape is `surveyGit`'s: every failure is CAUGHT and reported as an
+ * `error` reading, never thrown to the walk — a failed scan never fails a
+ * run. The two silent exits are the two ways the feature is off: no `quality`
+ * block on this machine (nothing is logged; the operator never asked), and no
+ * key on the project (logged, because the machine did ask and the project is
+ * what is missing). Everything after that reports SOMETHING, so that "could
+ * not scan" and "did not scan" never reach the page as the same answer.
+ *
+ * What is scanned is the WORKING TREE, which after TEST may hold edits the
+ * session had not committed; `headSha` is HEAD, and says where the tree
+ * started rather than that the tree equals it.
+ *
+ * The scanner's working directory is a temp dir OUTSIDE the checkout,
+ * passed as `-Dsonar.working.directory=`: `.scannerwork/` inside it would
+ * show up in the working-copy watcher and in `resetWorkspace`'s `git clean`
+ * list — R76's `.codegraph` lesson, see `excludeLocally`. The token goes in
+ * the child's ENVIRONMENT and never on its argv, which `ps` would show.
+ *
+ * R316: when the project SAYS its server refuses branches (`run.sonarBranches
+ * === 'REFUSED'`, and only when this machine scans the same server the claim
+ * names — see `trimSlash`), the branch attempt is skipped outright and the
+ * machine's `whenBranchesRefused` runs straight away. Otherwise the branch
+ * attempt still runs first and the refusal is still learnt from its failure,
+ * exactly as before R316 — a project that has not said, or a machine
+ * scanning a different server, gets today's behaviour unchanged.
+ */
+async function scanQuality(config, run, cwd, branch) {
+  const slug = run.projectSlug;
+  const quality = config.projects[slug]?.quality;
+  if (!quality) return;
+  if (!run.sonarProjectKey) {
+    log(`  quality: ${slug} has no SonarQube key — not scanned`);
+    return;
+  }
+  const key = run.sonarProjectKey;
+  const report = async (reading) => {
+    await api(config, `/api/runners/${config.runnerId}/quality/${slug}`, {
+      method: 'POST',
+      body: { runId: run.id, branch, ...reading },
+    }).catch((failure) => log(`  could not report the quality of ${branch}: ${failure.message}`));
+    if (reading.error) {
+      log(`  quality: could not scan ${branch}: ${reading.error}`);
+    } else {
+      const problems = (reading.newBugs ?? 0) + (reading.newVulnerabilities ?? 0)
+        + (reading.newSecurityHotspots ?? 0) + (reading.newCodeSmells ?? 0);
+      log(`  quality: ${branch} gate ${reading.gate ?? 'NONE'} · ${problems} new problem${problems === 1 ? '' : 's'}`
+        + (reading.warning ? ` · ${reading.warning}` : ''));
+    }
+  };
+
+  const url = quality.url ?? run.sonarUrl;
+  if (!url) {
+    return report({ error: 'No SonarQube server: the platform has none configured and the quality block names no url.' });
+  }
+  const token = process.env[quality.tokenEnv];
+  if (!token) {
+    return report({ error: `The scanner token is not set: export ${quality.tokenEnv} on this machine.` });
+  }
+
+  // R316: the project's own word on whether its server refuses branches is
+  // trusted only when this machine scans THAT server — a machine whose own
+  // `quality.url` names a different one (a LAN hostname the platform cannot
+  // reach) knows nothing about what that server does, and tries the branch
+  // scan first, exactly as if the project had said nothing.
+  const claimSpeaks = !quality.url || trimSlash(quality.url) === trimSlash(run.sonarUrl ?? '');
+  const knownRefused = claimSpeaks && run.sonarBranches === 'REFUSED';
+
+  let headSha = null;
+  let workDir = null;
+  try {
+    headSha = await git(cwd, ['rev-parse', 'HEAD']);
+    workDir = await mkdtemp(join(tmpdir(), 'cawdev-sonar-'));
+    const deadline = Date.now() + quality.timeoutSeconds * 1000;
+    const remaining = () => Math.max(1000, deadline - Date.now());
+    const scannerArgs = (withBranch) => [
+      `-Dsonar.host.url=${url}`,
+      `-Dsonar.projectKey=${key}`,
+      ...(withBranch ? [`-Dsonar.branch.name=${branch}`] : []),
+      `-Dsonar.scm.revision=${headSha}`,
+      `-Dsonar.working.directory=${workDir}`,
+    ];
+    const env = { ...process.env, SONAR_TOKEN: token };
+
+    if (knownRefused) {
+      if (quality.whenBranchesRefused === 'skip') {
+        return report({
+          headSha,
+          error: "This project's SonarQube server does not analyse branches (Community Edition, set on the "
+            + 'project). Set "whenBranchesRefused": "project" (a scratch SonarQube project per branch) or '
+            + '"whenBranchesRefused": "main" in this machine\'s quality block.',
+        });
+      }
+      if (quality.whenBranchesRefused === 'project') {
+        // `await`, not `return`: a rejection has to be caught by THIS
+        // function's own try/catch, which `return somePromise` would skip —
+        // control leaves before the promise settles.
+        return await scanAsScratchProject(
+          { quality, run, cwd, branch, key, url, token, headSha, workDir, deadline, report });
+      }
+      // 'main', and known refused: no reason to run the branch scan first.
+      const ran = await runSkillCommand(quality.command, scannerArgs(false), { cwd, env, timeoutMs: remaining() });
+      if (!ran.ok) {
+        if (/ENOENT/.test(ran.said)) {
+          return report({ headSha, error: `${quality.command} is not installed on this machine (spawn ENOENT).` });
+        }
+        return report({ headSha, error: ran.said.split('\n')[0] || 'the scanner failed and said nothing' });
+      }
+      const reportTask = parseProperties(await readFile(join(workDir, 'report-task.txt'), 'utf8'));
+      const askServer = sonarAsker((reportTask.serverUrl ?? url).replace(/\/$/, ''), token);
+      const settled = await waitForAnalysis(askServer, reportTask.ceTaskId, deadline, quality.timeoutSeconds);
+      return await reportBranchReading({
+        ask: askServer, reportTask, settled, key, branch, analysedAs: 'MAIN',
+        warning: "This server does not analyse branches; the branch was analysed as the project's main analysis.",
+        headSha, report,
+      });
+    }
+
+    // Today's behaviour: try the branch first, and learn what the server is
+    // from a failure.
+    let analysedAs = 'BRANCH';
+    let warning = null;
+    let ran = await runSkillCommand(quality.command, scannerArgs(true),
+      { cwd, env, timeoutMs: remaining() });
+    if (!ran.ok) {
+      if (/ENOENT/.test(ran.said)) {
+        return report({ headSha, error: `${quality.command} is not installed on this machine (spawn ENOENT).` });
+      }
+      if (/sonar\.branch\.name.*(Developer Edition|above is required)/is.test(ran.said)) {
+        if (quality.whenBranchesRefused === 'project') {
+          return await scanAsScratchProject(
+            { quality, run, cwd, branch, key, url, token, headSha, workDir, deadline, report });
+        }
+        if (quality.whenBranchesRefused !== 'main') {
+          return report({
+            headSha,
+            error: 'This SonarQube server does not analyse branches (Community Edition). Set '
+              + '"whenBranchesRefused": "project" (a scratch SonarQube project per branch) or '
+              + '"whenBranchesRefused": "main" in the quality block to analyse it as the main analysis instead '
+              + "— or set this project's SonarQube-branches setting under Settings so this is known before the "
+              + 'scan runs.',
+          });
+        }
+        // The operator opted in: once more, as the project's main analysis.
+        analysedAs = 'MAIN';
+        warning = "This server does not analyse branches; the branch was analysed as the project's main analysis.";
+        ran = await runSkillCommand(quality.command, scannerArgs(false),
+          { cwd, env, timeoutMs: remaining() });
+      }
+    }
+    if (!ran.ok) {
+      return report({ headSha, error: ran.said.split('\n')[0] || 'the scanner failed and said nothing' });
+    }
+
+    // What the scanner left behind: where the server queued the analysis.
+    const reportTask = parseProperties(await readFile(join(workDir, 'report-task.txt'), 'utf8'));
+    const askServer = sonarAsker((reportTask.serverUrl ?? url).replace(/\/$/, ''), token);
+    const settled = await waitForAnalysis(askServer, reportTask.ceTaskId, deadline, quality.timeoutSeconds);
+    await reportBranchReading({ ask: askServer, reportTask, settled, key, branch, analysedAs, warning, headSha, report });
+  } catch (failure) {
+    await report({ headSha, error: failure.message.split('\n')[0] });
+  } finally {
+    if (workDir) {
+      await rm(workDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
+/** Without a trailing slash, so two URLs that differ only by one still compare equal. */
+function trimSlash(url) {
+  return url.replace(/\/$/, '');
+}
+
+/** A GET against the SonarQube server a scan just reported to, authorised with the scanner's own token. */
+function sonarAsker(serverUrl, token) {
+  return async (path) => {
+    const response = await fetch(`${serverUrl}${path}`, { headers: { authorization: `Bearer ${token}` } });
+    if (!response.ok) {
+      throw new Error(`SonarQube answered ${response.status} to ${path.split('?')[0]}`);
+    }
+    return response.json();
+  };
+}
+
+/**
+ * Waits for a queued analysis to settle — shared by every scan path, BRANCH,
+ * MAIN and PROJECT alike. Throws rather than reports: every caller runs
+ * inside `scanQuality`'s own try/catch, which turns it into an error reading.
+ */
+async function waitForAnalysis(ask, ceTaskId, deadline, timeoutSeconds) {
+  let settled = null;
+  while (Date.now() < deadline) {
+    const { task: current } = await ask(`/api/ce/task?id=${encodeURIComponent(ceTaskId)}`);
+    if (['SUCCESS', 'FAILED', 'CANCELED'].includes(current?.status)) {
+      settled = current;
+      break;
+    }
+    await new Promise((wake) => setTimeout(wake, 3000));
+  }
+  if (!settled) {
+    throw new Error(`SonarQube had not finished analysing after ${timeoutSeconds}s.`);
+  }
+  if (settled.status !== 'SUCCESS') {
+    throw new Error(settled.errorMessage ?? `SonarQube ${settled.status.toLowerCase()} the analysis.`);
+  }
+  return settled;
+}
+
+/** The gate and the new-code measures, for a BRANCH or MAIN reading — never for PROJECT, which has neither. */
+async function reportBranchReading({ ask, reportTask, settled, key, branch, analysedAs, warning, headSha, report }) {
+  const { projectStatus } = await ask(`/api/qualitygates/project_status?analysisId=${encodeURIComponent(settled.analysisId)}`);
+  const metrics = 'new_bugs,new_vulnerabilities,new_security_hotspots,new_code_smells,new_coverage';
+  const { component } = await ask(`/api/measures/component?component=${encodeURIComponent(key)}`
+    + `&metricKeys=${metrics}${analysedAs === 'BRANCH' ? `&branch=${encodeURIComponent(branch)}` : ''}`);
+  const measure = (metric) => {
+    const found = (component?.measures ?? []).find((each) => each.metric === metric);
+    // New-code values sit in `period.value` — `periods[0].value` on older servers.
+    const value = found?.period?.value ?? found?.periods?.[0]?.value ?? found?.value;
+    return value === undefined || value === null || value === '' ? null : Number(value);
+  };
+  const integer = (metric) => {
+    const value = measure(metric);
+    return value === null ? null : Math.round(value);
+  };
+
+  await report({
+    headSha,
+    gate: projectStatus?.status ?? 'NONE',
+    analysedAs,
+    newBugs: integer('new_bugs'),
+    newVulnerabilities: integer('new_vulnerabilities'),
+    newSecurityHotspots: integer('new_security_hotspots'),
+    newCodeSmells: integer('new_code_smells'),
+    newCoverage: measure('new_coverage'),
+    dashboardUrl: reportTask.dashboardUrl ?? null,
+    warning,
+  });
+}
+
+/**
+ * SonarQube's own pages, `ps=500` at a time, up to the server's `p × ps`
+ * ceiling worth trying — R313's `LIST_PAGES` argument, in the scanner
+ * instead of the reader. `paging.total` (hotspots) or `total` (issues) is
+ * wherever the server put it.
+ */
+async function pagedSearch(ask, pathWithQuery, itemsKey) {
+  const items = [];
+  for (let page = 1; page <= 20; page += 1) {
+    const body = await ask(`${pathWithQuery}&ps=500&p=${page}`);
+    const list = body[itemsKey] ?? [];
+    items.push(...list);
+    const total = body.paging?.total ?? body.total ?? items.length;
+    if (items.length >= total || list.length === 0) {
+      break;
+    }
+  }
+  return items;
+}
+
+/** `sha1(text)`'s first six hex characters — enough to keep a scratch key readable and still collision-free per branch. */
+function shortHash(text) {
+  return createHash('sha1').update(text).digest('hex').slice(0, 6);
+}
+
+/**
+ * The Community Edition fallback that never touches the project's own
+ * dashboard — R316: the branch is analysed as its own scratch SonarQube
+ * project, `<key>:branch:<branch>-<hash>`, overwritten on each run of the
+ * branch. A fresh project has no new-code period to compare against, so
+ * "new" is redefined as "on a line this branch changed since it left its
+ * base" — {@link changedLines} against the merge-base — and the gate is
+ * always `NONE`: a quality gate over a whole scratch project would judge
+ * code this branch did not write.
+ */
+async function scanAsScratchProject({ quality, run, cwd, branch, key, url, token, headSha, workDir, deadline, report }) {
+  const baseName = run.baseBranch ?? run.defaultBranch ?? 'main';
+  const ref = await firstRef(cwd, [`origin/${baseName}`, baseName]);
+  const mergeBase = ref ? await git(cwd, ['merge-base', 'HEAD', ref]).catch(() => null) : null;
+  if (!mergeBase) {
+    return report({ headSha, error: `could not find where ${branch} left ${baseName}` });
+  }
+
+  const scratchKey = `${key}:branch:${branch.replace(/[^A-Za-z0-9_.-]/g, '_')}-${shortHash(branch)}`;
+  const env = { ...process.env, SONAR_TOKEN: token };
+  const args = [
+    `-Dsonar.host.url=${url}`,
+    `-Dsonar.projectKey=${scratchKey}`,
+    `-Dsonar.projectName=${key} · ${branch}`,
+    `-Dsonar.scm.revision=${headSha}`,
+    `-Dsonar.working.directory=${workDir}`,
+  ];
+  const ran = await runSkillCommand(quality.command, args,
+    { cwd, env, timeoutMs: Math.max(1000, deadline - Date.now()) });
+  if (!ran.ok) {
+    if (/ENOENT/.test(ran.said)) {
+      throw new Error(`${quality.command} is not installed on this machine (spawn ENOENT).`);
+    }
+    throw new Error(ran.said.split('\n')[0] || 'the scanner failed and said nothing');
+  }
+
+  const reportTask = parseProperties(await readFile(join(workDir, 'report-task.txt'), 'utf8'));
+  const ask = sonarAsker((reportTask.serverUrl ?? url).replace(/\/$/, ''), token);
+  await waitForAnalysis(ask, reportTask.ceTaskId, deadline, quality.timeoutSeconds);
+
+  const changed = await changedLines(cwd, mergeBase);
+  const counted = (component, line) => {
+    const path = component.slice(scratchKey.length + 1);
+    const entry = changed.get(path);
+    if (!entry) return false;
+    if (entry === 'ALL') return true;
+    // A file-level finding (no line) counts when the file itself changed.
+    if (line === undefined || line === null) return true;
+    return entry.has(line);
+  };
+
+  const encodedKey = encodeURIComponent(scratchKey);
+  const issues = await pagedSearch(ask,
+    `/api/issues/search?componentKeys=${encodedKey}&resolved=false&types=BUG,VULNERABILITY,CODE_SMELL`, 'issues');
+  const hotspots = await pagedSearch(ask,
+    `/api/hotspots/search?projectKey=${encodedKey}&status=TO_REVIEW`, 'hotspots');
+
+  let newBugs = 0;
+  let newVulnerabilities = 0;
+  let newCodeSmells = 0;
+  for (const issue of issues) {
+    if (!counted(issue.component, issue.line)) continue;
+    if (issue.type === 'BUG') newBugs += 1;
+    else if (issue.type === 'VULNERABILITY') newVulnerabilities += 1;
+    else if (issue.type === 'CODE_SMELL') newCodeSmells += 1;
+  }
+  const newSecurityHotspots = hotspots.filter((hotspot) => counted(hotspot.component, hotspot.line)).length;
+
+  await report({
+    headSha,
+    gate: 'NONE',
+    analysedAs: 'PROJECT',
+    newBugs,
+    newVulnerabilities,
+    newSecurityHotspots,
+    newCodeSmells,
+    newCoverage: null,
+    dashboardUrl: reportTask.dashboardUrl ?? null,
+    warning: 'This server does not analyse branches; the branch was analysed as its own SonarQube project, '
+      + 'counting problems on the lines it changed. No gate was computed.',
+  });
+}
+
+/** `key=value` lines — the shape of the scanner's `report-task.txt`. */
+function parseProperties(text) {
+  const parsed = {};
+  for (const line of text.split('\n')) {
+    const at = line.indexOf('=');
+    if (at > 0) {
+      parsed[line.slice(0, at).trim()] = line.slice(at + 1).trim();
+    }
+  }
+  return parsed;
 }
 
 /**
@@ -2409,7 +3095,10 @@ at what they might want next.
 ${briefLine(run)}
 If a decision is genuinely theirs, use the cawdev MCP tool \`ask_user\` and wait.
 
-Their instruction:
+${run.branch ? `When what they asked is done, commit it on ${run.branch} — work left
+uncommitted is work nothing can push or propose. Never commit to or push main.
+
+` : ''}Their instruction:
 
 ${run.openingPrompt}`;
   }
@@ -2777,7 +3466,7 @@ async function perform(config, run, cwd, action) {
     ({ ok, result } = await openPullRequest(cwd, run, action.message));
   } else if (action.kind === 'MERGE') {
     log(`  MERGING ${run.branch} into ${run.baseBranch ?? 'the default branch'}${byRule(action)} — nobody is reading this diff`);
-    ({ ok, result } = await mergePullRequest(cwd, run.branch));
+    ({ ok, result } = await mergePullRequest(cwd, run.branch, { declared: run.gitHost ?? null }));
   } else {
     result = `This runner does not know how to ${action.kind}.`;
   }
@@ -3055,11 +3744,16 @@ async function performWorkspaceRequest(config, request, afterTheTreeMoved = null
     if (!branch) {
       result = 'A merge has to name a branch. Nothing was merged.';
     } else {
-      log(`  MERGING ${branch} — asked for from the console`);
+      // R306: whose idea it was. A rule's merge lands with nobody reading
+      // the diff, and the log is where an operator sees that happen.
+      log(`  MERGING ${branch} — ${request.requestedByRule
+        ? `by ${request.requestedByRule}, nobody is reading this diff`
+        : 'asked for from the console'}`);
       // R261. A sprint's branch lands with a merge commit; every other branch
       // squashes as it always did. The claim says which.
       ({ ok, result, failure: failureKind } = await mergePullRequest(cwd, branch, {
         method: request.mergeMethod ?? null,
+        declared: request.gitHost ?? null,
       }));
     }
   } else if (request.kind === 'TAG') {
@@ -3087,13 +3781,36 @@ async function performWorkspaceRequest(config, request, afterTheTreeMoved = null
     } else {
       const base = request.baseBranch ?? request.defaultBranch ?? 'main';
       log(`  OPENING a pull request for ${branch} → ${base} — asked for from the console`);
-      ({ ok, result } = await openPullRequestFor(cwd, {
-        branch,
-        base,
-        title: request.title?.trim() || branch,
-        body: `Opened by cawdev for the sprint branch \`${branch}\`${request.title ? ` — ${request.title.trim()}` : ''}.\n\n`
-          + `Merging it lands every card of the sprint on ${base}.`,
-      }));
+      // A card's branch may never have left this machine — a session whose
+      // project does not push, which is why somebody is asking for the pull
+      // request by hand. A sprint's is on origin already and this is a no-op.
+      const empty = await nothingToPropose(cwd, branch, base);
+      if (empty) {
+        ok = false;
+        result = empty;
+      }
+      const pushed = empty ? { failed: empty } : await pushIfOriginLacks(cwd, branch);
+      if (pushed.failed) {
+        ok = false;
+        result = pushed.failed;
+      } else {
+        ({ ok, result } = await openPullRequestFor(cwd, {
+          declared: request.gitHost ?? null,
+          branch,
+          base,
+          title: request.title?.trim() || branch,
+          // A sprint's title is its ref and name ("S1 Notifications"); a
+          // card's is "R3 — …" (RunnerController reads either at claim).
+          body: /^S\d+ /.test(request.title ?? '')
+            ? `Opened by cawdev for the sprint branch \`${branch}\` — ${request.title.trim()}.\n\n`
+              + `Merging it lands every card of the sprint on ${base}.`
+            : `Opened by cawdev for \`${branch}\`${request.title ? ` — ${request.title.trim()}` : ''}.`,
+        }));
+        // The URL stays the FIRST line: the platform reads it off there.
+        if (ok && pushed.said) {
+          result = `${result}\n${pushed.said}`;
+        }
+      }
     }
   } else if (request.kind === 'CUT_BRANCH') {
     // R260. Put the sprint's branch on origin, from the default's tip. A branch
@@ -3106,6 +3823,19 @@ async function performWorkspaceRequest(config, request, afterTheTreeMoved = null
     } else {
       log(`  cutting ${name} on origin from ${request.defaultBranch || 'main'}`);
       ({ ok, result } = await cutBranchOnOrigin(cwd, name, request.defaultBranch));
+    }
+  } else if (request.kind === 'CREATE_BRANCH') {
+    // R379. Put a named branch on origin, cut from another branch's tip. Unlike
+    // CUT_BRANCH an existing name is a REFUSAL: the person asked for a new
+    // branch, and one that is already there may be somebody else's work.
+    // Touches no working tree: the push names two refs and HEAD is neither.
+    const name = (request.message ?? '').trim();
+    const from = (request.fromBranch ?? '').trim();
+    if (!name || !from) {
+      result = 'A new branch has to name itself and the branch to cut it from. Nothing was created.';
+    } else {
+      log(`  creating ${name} on origin from ${from} — asked for from the console`);
+      ({ ok, result } = await createBranchOnOrigin(cwd, name, from));
     }
   } else {
     result = `This runner does not know how to ${request.kind}.`;
@@ -3152,8 +3882,12 @@ function reportWorkspaceRequest(config, request, ok, result, failure = null) {
  * platform holds the tree as it now is by the time the console hears "done".
  */
 function watchWorkspaceRequests(config, { afterTheTreeMoved = null } = {}) {
-  const served = new Set(
-    Object.values(config.projects).flatMap((project) => project.workspaces),
+  // Read on EVERY request, never captured once: a checkout cloned on demand
+  // (`autoWorkspaces`) joins `project.workspaces` long after this started, and
+  // a set taken at boot refused every request about one — `/pr` on a session
+  // that ran in `saasng-auto-2` came back "This runner does not serve …".
+  const served = () => new Set(
+    Object.values(config.projects).flatMap((project) => project.workspaces ?? []),
   );
 
   const poll = async () => {
@@ -3169,7 +3903,7 @@ function watchWorkspaceRequests(config, { afterTheTreeMoved = null } = {}) {
     // The same guard, for the same reason: this poll is on an interval, so a
     // throw becomes an unhandled rejection and the daemon stops.
     for (const request of Array.isArray(requests) ? requests : []) {
-      if (!served.has(request.path)) {
+      if (!served().has(request.path)) {
         await reportWorkspaceRequest(config, request, false,
           `This runner does not serve ${request.path}.`);
         continue;
@@ -3269,27 +4003,30 @@ async function readPushState(cwd, branch) {
  * already holds the credentials, so the runner answers and the platform never
  * needs a token of its own.
  */
-async function findPullRequest(cwd, branch) {
-  const viaGh = await new Promise((resolvePromise) => {
-    const child = spawn('gh', ['pr', 'view', branch, '--json', 'url', '--jq', '.url'], {
-      cwd,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    let out = '';
-    child.stdout.on('data', (chunk) => (out += chunk));
-    child.on('error', () => resolvePromise(null));
-    // `close`, not `exit` — see git() above.
-    child.on('close', (code) => resolvePromise(code === 0 ? out.trim() : null));
-  });
-  if (viaGh) {
-    return viaGh;
+async function findPullRequest(cwd, branch, { declared = null, base = null } = {}) {
+  const { host, adapter, originUrl } = await hostOf(cwd, declared);
+  const viaCli = await adapter.find(cwd, branch);
+  if (viaCli) {
+    return viaCli;
   }
 
-  // No gh, or no PR yet. A compare URL is honest: it is where you would go to
+  // No CLI, or no PR yet. A compare URL is honest: it is where you would go to
   // open one, and it is obviously not a claim that one exists.
-  const origin = await git(cwd, ['remote', 'get-url', 'origin']).catch(() => '');
-  const github = /github\.com[:/](.+?)(?:\.git)?$/.exec(origin.trim());
-  return github ? `https://github.com/${github[1]}/compare/${encodeURIComponent(branch)}` : null;
+  const repo = repoOf(originUrl);
+  const against = host === 'gitlab' && !base ? await defaultBranchOf(cwd) : base;
+  return adapter.fallbackLink(repo, against, branch);
+}
+
+/**
+ * Which host this checkout's origin is on, and the adapter that talks to it —
+ * R379. `declared` is the project's own word (`GITHUB`/`GITLAB`), from the claim
+ * or the request; with none, a GitLab-looking host is GitLab and everything else
+ * is GitHub, as it has always been.
+ */
+async function hostOf(cwd, declared) {
+  const originUrl = (await git(cwd, ['remote', 'get-url', 'origin']).catch(() => '')).trim();
+  const host = hostFor({ declared, originUrl });
+  return { host, adapter: adapterFor(host), originUrl };
 }
 
 // --- what a project's rules asked for (R40) ----------------------------------
@@ -3325,8 +4062,10 @@ function announceRules(rules) {
   if (!on.length) return;
   log(`  this project's rules: ${on.join(', ')}`);
   if (rules.autoMerge) {
-    log('  !! auto_merge is ON: when this run finishes, its branch will be merged '
-      + 'with nobody reading it');
+    // R306: not "when this run finishes" any more — the platform asks for the
+    // merge when the branch reaches Done on the development board.
+    log('  !! auto_merge is ON: its branch will be merged when it reaches Done on the '
+      + 'board, with nobody reading it');
   }
 }
 
@@ -3336,25 +4075,6 @@ async function firstRemote(cwd) {
   return remotes.split('\n')[0]?.trim() || null;
 }
 
-/** Runs `gh` and hands back everything it said, including on failure. */
-function gh(cwd, args) {
-  return new Promise((resolvePromise) => {
-    const child = spawn('gh', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '';
-    let err = '';
-    child.stdout.on('data', (chunk) => (out += chunk));
-    child.stderr.on('data', (chunk) => (err += chunk));
-    child.on('error', (failure) => resolvePromise({
-      code: -1,
-      out: '',
-      err: failure.code === 'ENOENT'
-        ? 'gh is not installed on this machine, so it cannot talk to the git host.'
-        : failure.message,
-    }));
-    // `close`, not `exit` — see git() above.
-    child.on('close', (code) => resolvePromise({ code, out: out.trim(), err: err.trim() }));
-  });
-}
 
 /**
  * The branch, on the remote.
@@ -3392,6 +4112,35 @@ async function pushBranch(cwd, branch) {
  * An existing pull request is a success, not a conflict — the rule wanted one
  * to exist, and one does.
  */
+/**
+ * Why there is nothing to open a pull request FOR, or null when there is.
+ *
+ * A branch with no commit beyond its base is not a pull request — GitHub says
+ * "There isn't anything to compare" — and before this `/pr` pushed it anyway
+ * and handed back the compare link, so the person went to GitHub to learn
+ * what this machine already knew. The usual reason is work sitting
+ * UNCOMMITTED in the checkout, so that is counted and said, with where.
+ *
+ * Asked BEFORE anything is pushed, on the OPEN_PR a person asks for (`/pr`).
+ * Not on the `auto_pr` rule: a finished run that committed nothing gets gh's
+ * own refusal there, as it always has. A count that cannot be made (no such
+ * ref, no origin) is not a verdict: null, and the old path decides as it did.
+ */
+async function nothingToPropose(cwd, branch, base) {
+  const has = (ref) => git(cwd, ['rev-parse', '--verify', '--quiet', ref]).then(() => true, () => false);
+  const tip = (await has(branch)) ? branch : (await has(`origin/${branch}`)) ? `origin/${branch}` : null;
+  const against = base ? `origin/${base}` : 'origin/HEAD';
+  if (!tip || !(await has(against))) return null;
+  const ahead = Number(await git(cwd, ['rev-list', '--count', `${against}..${tip}`]).catch(() => 'x'));
+  if (!Number.isFinite(ahead) || ahead > 0) return null;
+  const dirty = (await git(cwd, ['status', '--porcelain']).catch(() => '')).split('\n').filter(Boolean).length;
+  const onIt = (await git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => '')) === branch;
+  return `${branch} has no commit beyond ${against.replace(/^origin\//, '')}, so there is nothing to propose.`
+    + (dirty && onIt
+      ? ` ${dirty} file(s) are uncommitted in ${cwd} — commit them, then ask again.`
+      : ' Nothing was pushed.');
+}
+
 async function openPullRequest(cwd, run, title) {
   const state = await readPushState(cwd, run.branch).catch(() => null);
   if (state === 'NO_REMOTE') {
@@ -3405,6 +4154,7 @@ async function openPullRequest(cwd, run, title) {
   }
 
   return openPullRequestFor(cwd, {
+    declared: run.gitHost ?? null,
     branch: run.branch,
     // R260. The sprint's branch, when the claim carried one; otherwise the
     // argv is byte for byte what it was and the host picks its own default.
@@ -3430,24 +4180,85 @@ async function openPullRequest(cwd, run, title) {
  * `--base` only when one is given: with no base the argv is byte for byte what
  * it was before R260 and the host picks its own default.
  */
-async function openPullRequestFor(cwd, { branch, base, title, body }) {
-  const existing = await findPullRequest(cwd, branch).catch(() => null);
+/**
+ * Pushes `branch` to origin when origin does not have it, or has an older
+ * commit of it — and never otherwise.
+ *
+ * Before a pull request is opened for a branch a session wrote on this
+ * machine: `gh pr create --head` names a branch on the HOST, and one that only
+ * exists here fails with a message about the head that says nothing of why.
+ * Only a fast-forward is pushed. Origin ahead, or diverged, is somebody else's
+ * work on the branch, and pushing over it is not what "open the pull request"
+ * asked for — that case goes to gh as it is and gh says what is wrong. Nothing
+ * here moves the checkout: it is `<branch>:<branch>`, not the current HEAD.
+ *
+ * @returns `{ said }` when it pushed, `{}` when there was nothing to push, and
+ *   `{ failed }` when a push was needed and git refused it.
+ */
+async function pushIfOriginLacks(cwd, branch) {
+  const local = await git(cwd, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])
+    .catch(() => null);
+  if (!local) {
+    return {};
+  }
+  const listed = await git(cwd, ['ls-remote', '--heads', 'origin', branch]).catch(() => null);
+  if (listed === null) {
+    return {};
+  }
+  const remote = listed.split(/\s+/)[0] || null;
+  if (remote === local) {
+    return {};
+  }
+  if (remote) {
+    const behind = await git(cwd, ['merge-base', '--is-ancestor', remote, local])
+      .then(() => true, () => false);
+    if (!behind) {
+      return {};
+    }
+  }
+  try {
+    await git(cwd, ['push', 'origin', `refs/heads/${branch}:refs/heads/${branch}`], { timeoutMs: 120_000 });
+    log(`  pushed ${branch} to origin first`);
+    return { said: `pushed ${branch} to origin first` };
+  } catch (failure) {
+    return { failed: `Could not push ${branch} before opening its pull request: ${failure.message}` };
+  }
+}
+
+async function openPullRequestFor(cwd, { branch, base, title, body, declared = null }) {
+  const { adapter } = await hostOf(cwd, declared);
+  const existing = await findPullRequest(cwd, branch, { declared, base }).catch(() => null);
   if (existing && !existing.includes('/compare/')) {
     return { ok: true, result: existing };
   }
 
-  const opened = await gh(cwd, [
-    'pr', 'create',
-    '--head', branch,
-    ...(base ? ['--base', base] : []),
-    '--title', title,
-    '--body', body,
-  ]);
+  // R379: `gh pr create` or `glab mr create`; for GitHub it is the argv it always was.
+  const opened = await adapter.create(cwd, { branch, base, title, body });
   if (opened.code === 0 && opened.out) {
-    // gh prints the URL and nothing else on success.
-    return { ok: true, result: opened.out.split('\n').pop().trim() };
+    // The CLI prints the URL and the host is then asked whether it is really
+    // there, because "asked for" is not "made", and a URL on the card that
+    // 404s is worse than an honest failure.
+    const printed = adapter.urlOf(opened);
+    const confirmed = await findPullRequest(cwd, branch, { declared, base }).catch(() => null);
+    if (confirmed && !confirmed.includes('/compare/')) {
+      return { ok: true, result: confirmed };
+    }
+    return {
+      ok: false,
+      result: `${adapter.bin} said it opened ${printed}, but the host does not show a ${adapter.noun} for ${branch}.`,
+    };
   }
-  return { ok: false, result: opened.err || opened.out || 'gh pr create failed without saying why.' };
+  // The one failure somebody can fix in a minute, said with the fix — and the
+  // link to open it by hand meanwhile, which `findPullRequest` builds without the CLI.
+  if (opened.code === -1 && /not installed/.test(opened.err)) {
+    const compare = await findPullRequest(cwd, branch, { declared, base }).catch(() => null);
+    return {
+      ok: false,
+      result: `${opened.err} Install it and sign in (${adapter.installHint}), `
+        + `then ask again${compare ? ` — or open it yourself: ${compare}` : '.'}`,
+    };
+  }
+  return { ok: false, result: opened.err || opened.out || `${adapter.bin} ${adapter.name === 'gitlab' ? 'mr' : 'pr'} create failed without saying why.` };
 }
 
 /**
@@ -3478,18 +4289,47 @@ async function openPullRequestFor(cwd, { branch, base, title, body }) {
  * convention wants a merge commit for a release branch too, for the same
  * reason; release branches are not worked through the development board
  * today, and if that changes this is the line that has to change with it.)
+ *
+ * **It waits out GitHub's not-yet-computed mergeability — R306.** The host
+ * computes whether a pull request can merge lazily, and `gh pr merge` seconds
+ * after `gh pr create` — which is exactly when a rule's merge arrives on a
+ * project nobody reads first — can fail for no reason a person can act on.
+ * So before merging, `gh pr view --json mergeable` is asked, and while it says
+ * `UNKNOWN` this waits, bounded (`MERGEABILITY_POLLS` × `mergeabilityWaitMs()`),
+ * for the rule, the board's button and a person's press alike. Any other
+ * answer — `MERGEABLE`, `CONFLICTING`, an error, something that is not JSON —
+ * proceeds at once: the merge itself is what says whether it could, and
+ * `classifyMergeFailure` is unchanged.
  */
-async function mergePullRequest(cwd, branch, { method = null } = {}) {
-  const url = await findPullRequest(cwd, branch).catch(() => null);
+const MERGEABILITY_POLLS = 6;
+
+/** Between two mergeability questions. Five seconds, unless the environment says otherwise — `gateTimeoutSeconds`'s shape. */
+function mergeabilityWaitMs() {
+  const configured = Number(process.env.CAWDEV_MERGEABILITY_WAIT_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : 5000;
+}
+
+async function mergePullRequest(cwd, branch, { method = null, declared = null } = {}) {
+  const { adapter } = await hostOf(cwd, declared);
+  const url = await findPullRequest(cwd, branch, { declared }).catch(() => null);
   if (!url || url.includes('/compare/')) {
+    // R379. On GitLab a missing `glab` looks exactly like "no merge request" —
+    // the lookup that would have found it never ran. Said as what it is.
+    if (adapter.name === 'gitlab') {
+      const probe = await adapter.run(cwd, ['--version']);
+      if (probe.code === -1) {
+        return { ok: false, failure: 'UNREACHABLE', result: probe.err };
+      }
+    }
     return {
       ok: false,
       failure: 'NO_PULL_REQUEST',
       result: 'There is no pull request for this branch to merge. Nothing was merged.',
     };
   }
+  await waitOutUnknownMergeability(cwd, url, branch, adapter);
   const mergeCommit = method === 'MERGE_COMMIT';
-  const merged = await gh(cwd, ['pr', 'merge', url, mergeCommit ? '--merge' : '--squash', '--delete-branch']);
+  const merged = await adapter.merge(cwd, url, { mergeCommit });
   if (merged.code === 0) {
     // The URL on its own FIRST LINE — R134. The platform reads that line as the
     // evidence a merge happened and puts it on the card as the card's `merge`
@@ -3506,11 +4346,31 @@ async function mergePullRequest(cwd, branch, { method = null } = {}) {
     ok: false,
     // R155. WHICH kind of failure, so the console can offer Merge with an agent
     // on the one an agent can fix and stay quiet on the three it cannot.
-    failure: await classifyMergeFailure(cwd, url, merged),
+    failure: await classifyMergeFailure(cwd, url, merged, adapter),
     // Unchanged: `gh`'s own words still reach the card. The classification is a
     // word beside them, never a replacement for them.
-    result: merged.err || merged.out || 'gh pr merge failed without saying why.',
+    result: merged.err || merged.out || `${adapter.bin} ${adapter.name === 'gitlab' ? 'mr' : 'pr'} merge failed without saying why.`,
   };
+}
+
+/**
+ * While the host has not yet said whether the pull request can merge, wait —
+ * bounded. See `mergePullRequest`. One log line if it waited at all, so a
+ * merge that took thirty seconds says why.
+ */
+async function waitOutUnknownMergeability(cwd, url, branch, adapter) {
+  let waited = 0;
+  for (let poll = 0; poll < MERGEABILITY_POLLS; poll++) {
+    // `UNKNOWN` is the only answer worth waiting out; an error, something that
+    // is not JSON or any other word proceeds at once (the adapter says which).
+    if ((await adapter.mergeability(cwd, url)) !== 'UNKNOWN') {
+      if (waited) log(`  ${branch}: mergeability known after ${waited}s`);
+      return;
+    }
+    await sleep(mergeabilityWaitMs());
+    waited += mergeabilityWaitMs() / 1000;
+  }
+  log(`  ${branch}: the host still has not computed mergeability after ${waited}s; merging anyway`);
 }
 
 /**
@@ -3608,6 +4468,67 @@ async function cutBranchOnOrigin(cwd, name, defaultBranch) {
 }
 
 /**
+ * Creates a branch on origin, cut from another — R379's `CREATE_BRANCH`.
+ *
+ * Order matters: the name is checked before anything is asked of the remote,
+ * an existing name is refused whatever it points at, and the source is read
+ * from `origin/<from>` after a fetch — what everyone else has, not this
+ * checkout's idea of it. The sha is the FIRST LINE of an ok result, the way a
+ * tag check reports it, because the platform does not take a machine's word.
+ */
+async function createBranchOnOrigin(cwd, name, from) {
+  await git(cwd, ['fetch', '--prune', 'origin']).catch((failure) => {
+    log(`  fetch skipped: ${failure.message.split('\n')[0]}`);
+  });
+  try {
+    await git(cwd, ['check-ref-format', '--branch', name]);
+    // `@{-1}` passes check-ref-format --branch (it expands), but is no name.
+    if (/[~^@]/.test(name)) throw new Error('not a name');
+  } catch {
+    return { ok: false, result: `\`${name}\` is not a branch name git accepts. Nothing was created.` };
+  }
+
+  const ref = `refs/heads/${name}`;
+  let there;
+  try {
+    there = await git(cwd, ['ls-remote', '--heads', 'origin', ref]);
+  } catch (failure) {
+    return { ok: false, result: `Could not ask the remote about ${name}: ${failure.message}` };
+  }
+  const already = there.split('\n').map((each) => each.trim()).filter(Boolean)
+    .find((each) => each.endsWith(`\t${ref}`));
+  if (already) {
+    return {
+      ok: false,
+      result: `\`${name}\` is already on origin at ${already.split(/\s+/)[0].slice(0, 7)}. Nothing was created.`,
+    };
+  }
+
+  // `from` is a branch NAME: `main~3` or `main@{1}` would resolve and be pushed.
+  try {
+    await git(cwd, ['check-ref-format', '--branch', from]);
+  } catch {
+    return { ok: false, result: `\`${from}\` is not a branch name git accepts. Nothing was created.` };
+  }
+  if (/[~^@]/.test(from)) {
+    return { ok: false, result: `\`${from}\` is not a branch name. Nothing was created.` };
+  }
+  const source = `origin/${from}`;
+  let tip;
+  try {
+    tip = (await git(cwd, ['rev-parse', '--verify', `${source}^{commit}`])).trim();
+  } catch {
+    return { ok: false, result: `${source} is not on origin, so there is nothing to create \`${name}\` from.` };
+  }
+  try {
+    await git(cwd, ['push', 'origin', `${source}:${ref}`]);
+  } catch (failure) {
+    return { ok: false, result: `Could not push ${name}: ${failure.message}` };
+  }
+  return { ok: true, result: `${tip}\n${name} created from ${from} at ${tip.slice(0, 7)}.` };
+}
+
+/**
  * Why `gh pr merge` said no — R155, in one of five words.
  *
  * <p>**On the runner, deliberately.** `WorkspaceRequestService`'s javadoc
@@ -3623,9 +4544,9 @@ async function cutBranchOnOrigin(cwd, name, defaultBranch) {
  * as OTHER, and the console offers the action for OTHER for the same reason it
  * offers it for a null — the cost of being wrong is one `git fetch`.
  */
-async function classifyMergeFailure(cwd, url, merged) {
-  // No process at all, or the host was unreachable. `gh()` reports a spawn
-  // error as code -1, which covers "gh is not installed" as well.
+async function classifyMergeFailure(cwd, url, merged, adapter) {
+  // No process at all, or the host was unreachable. The CLI runner reports a
+  // spawn error as code -1, which covers "gh/glab is not installed" as well.
   if (merged.code === -1 || /ENOTFOUND|ECONNREFUSED|ETIMEDOUT|could not resolve host|network is unreachable/i
       .test(`${merged.err} ${merged.out}`)) {
     return 'UNREACHABLE';
@@ -3635,24 +4556,10 @@ async function classifyMergeFailure(cwd, url, merged) {
     return 'NOT_PERMITTED';
   }
 
-  // The house style for asking gh a question — the same `--json` shape the merge
-  // pass already parses. A failure to answer is not an answer, so it falls
-  // through to OTHER rather than inventing one.
-  const asked = await gh(cwd, ['pr', 'view', url, '--json', 'mergeable,mergeStateStatus']);
-  if (asked.code === 0) {
-    try {
-      const view = JSON.parse(asked.out || '{}');
-      if (view.mergeable === 'CONFLICTING' || view.mergeStateStatus === 'DIRTY') {
-        return 'CONFLICT';
-      }
-      if (view.mergeStateStatus === 'BLOCKED') {
-        return 'NOT_PERMITTED';
-      }
-    } catch {
-      // gh answered with something that is not JSON. Nothing to read.
-    }
-  }
-  return 'OTHER';
+  // Asked of the host's own CLI (R379: through the adapter). A failure to
+  // answer is not an answer, so it falls through to OTHER rather than
+  // inventing one.
+  return (await adapter.refusal(cwd, url)) ?? 'OTHER';
 }
 
 /**
@@ -3752,6 +4659,63 @@ async function askGitHub(cwd, branch, prUrl) {
     state,
     mergeCommit: parsed.mergeCommit?.oid ?? null,
     mergedAt: parsed.mergedAt ?? null,
+  };
+}
+
+/**
+ * What `gh` says about a hand-taken branch's pull request — R346.
+ *
+ * `pr list --head`, not `pr view <branch>`: the latter stops finding the pull
+ * request once the branch is deleted, and this matches on the pull request's own
+ * head branch name, which does not change. Fork pull requests are dropped: a
+ * fork's branch of the same name is not this branch.
+ *
+ * A merged pull request opened-after `openedAt` wins (latest merge first); a
+ * reused branch name can bring back an older one, which the platform also
+ * refuses. Otherwise the highest-numbered row speaks.
+ */
+async function askGitHubForBranch(cwd, branch, openedAt) {
+  if (!branch) {
+    return null;
+  }
+  const out = await new Promise((resolvePromise) => {
+    const child = spawn(
+      'gh',
+      ['pr', 'list', '--head', branch, '--state', 'all', '--limit', '10', '--json',
+        'number,url,state,mergedAt,mergeCommit,baseRefName,headRefName,isCrossRepository'],
+      { cwd, stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    let text = '';
+    child.stdout.on('data', (chunk) => (text += chunk));
+    child.on('error', () => resolvePromise(null));
+    child.on('close', (code) => resolvePromise(code === 0 ? text.trim() : null));
+  });
+  const parsed = out ? safeJson(out) : null;
+  if (!Array.isArray(parsed)) {
+    return null;
+  }
+  const own = parsed.filter((row) => row && !row.isCrossRepository && row.headRefName === branch);
+  if (!own.length) {
+    return null;
+  }
+  const since = openedAt ? Date.parse(openedAt) : Number.NEGATIVE_INFINITY;
+  const merged = own
+    .filter((row) => row.state === 'MERGED' && Date.parse(row.mergedAt) >= since)
+    .sort((a, b) => Date.parse(b.mergedAt) - Date.parse(a.mergedAt));
+  const chosen = merged[0] ?? [...own].sort((a, b) => b.number - a.number)[0];
+  if (chosen.state === 'MERGED' && !merged.length) {
+    return null; // Only a merge from before the item existed: not this item's.
+  }
+  const state = { OPEN: 'OPEN', MERGED: 'MERGED', CLOSED: 'CLOSED' }[chosen.state];
+  if (!state) {
+    return null;
+  }
+  return {
+    state,
+    prUrl: chosen.url ?? null,
+    mergeCommit: chosen.mergeCommit?.oid ?? null,
+    mergedAt: chosen.mergedAt ?? null,
+    baseRefName: chosen.baseRefName ?? null,
   };
 }
 
@@ -3872,13 +4836,18 @@ async function checkMerges(config) {
     log(`could not ask which branches to check: ${failure.message}`);
     return null;
   });
-  if (!pending?.length) {
-    return;
-  }
-
   // One fetch per project, not one per branch: twenty-five branches in one
   // repository are twenty-five questions about the same set of refs.
   const fetched = new Set();
+  if (pending?.length) {
+    await checkRunMerges(config, pending, fetched);
+  }
+  // R346: the hand-taken items, even when no run is pending.
+  await checkWorkItemMerges(config, fetched);
+}
+
+/** The run pass of `checkMerges`: one reading per pending run branch. */
+async function checkRunMerges(config, pending, fetched) {
   const readings = [];
 
   for (const branch of pending) {
@@ -3888,7 +4857,7 @@ async function checkMerges(config) {
     }
     // Same argument as the git survey: read a checkout nobody is working in.
     const heldNow = heldWorkspaces();
-    const cwd = project.workspaces.find((candidate) => !heldNow.has(candidate))
+    const cwd = (await usableWorkspace(project, heldNow, new Map()))
       ?? resolve(project.path);
 
     try {
@@ -3929,6 +4898,64 @@ async function checkMerges(config) {
   }
 }
 
+/**
+ * R346: the hand-taken items. A squash or rebase merge leaves no head on the
+ * default branch for the git reading to find, so ask `gh` about the pull
+ * request. An older platform answers 404 and this returns in silence.
+ */
+async function checkWorkItemMerges(config, fetched) {
+  const pending = await api(config, `/api/runners/${config.runnerId}/work-item-branches`)
+    .catch(() => null);
+  if (!Array.isArray(pending) || !pending.length) {
+    return;
+  }
+  const readings = [];
+  for (const item of pending) {
+    const project = config.projects[item.projectSlug];
+    if (!project) {
+      // Not ours, but say so: an UNKNOWN only stamps the platform's rotation,
+      // and silence would leave these rows first in the queue for ever.
+      readings.push({ workItemId: item.workItemId, state: 'UNKNOWN' });
+      continue;
+    }
+    const heldNow = heldWorkspaces();
+    const cwd = (await usableWorkspace(project, heldNow, new Map()))
+      ?? resolve(project.path);
+    try {
+      await access(join(cwd, '.git'));
+    } catch {
+      readings.push({ workItemId: item.workItemId, state: 'UNKNOWN' });
+      continue;
+    }
+    if (!fetched.has(cwd)) {
+      fetched.add(cwd);
+      await git(cwd, ['fetch', '--prune', 'origin']).catch(() => null);
+    }
+    const reading = await askGitHubForBranch(cwd, item.branch, item.openedAt).catch(() => null);
+    readings.push({
+      workItemId: item.workItemId,
+      state: reading?.state ?? 'UNKNOWN',
+      prUrl: reading?.prUrl ?? null,
+      mergeCommit: reading?.mergeCommit ?? null,
+      mergedAt: reading?.mergedAt ?? null,
+      baseRefName: reading?.baseRefName ?? null,
+    });
+  }
+  if (!readings.length) {
+    return;
+  }
+  const recorded = await api(config, `/api/runners/${config.runnerId}/work-item-merges`, {
+    method: 'POST',
+    body: { readings },
+  }).catch((failure) => {
+    log(`could not record what became of the hand-taken branches: ${failure.message}`);
+    return null;
+  });
+  if (recorded?.merged?.length) {
+    log(`${recorded.merged.length} hand-taken branch(es) have merged`);
+  }
+}
+
 /** Reads the run's history out of git and tells the platform. */
 async function reportCommits(config, run, cwd, base) {
   const commits = await readCommits(cwd, base).catch((failure) => {
@@ -3942,7 +4969,7 @@ async function reportCommits(config, run, cwd, base) {
   // Only worth looking for a PR once something has been pushed: a branch that
   // has never left the machine cannot have one.
   const prUrl = pushState === 'PUSHED' || pushState === 'AHEAD'
-    ? await findPullRequest(cwd, run.branch).catch(() => null)
+    ? await findPullRequest(cwd, run.branch, { declared: run.gitHost ?? null, base: run.baseBranch ?? null }).catch(() => null)
     : null;
 
   await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/commits`, {
@@ -4236,8 +5263,11 @@ const PROFILE_TOOLS = {
   // R198: a plan run on an ISSUE (a confirm) is handed exactly this list. What
   // differs is one paragraph of prompt, not a tool — the "ended without a plan"
   // note on the issue is the platform's to write, for the reason above.
+  // R302. Less the reads that need the work to exist — `quality_get` — the
+  // same narrowing `toolsForStage` applies to a walk's PLAN stage, by the same
+  // name: a plan run spawned as one process comes through here and not there.
   PLAN: (run) => [
-    ...READ_ONLY_CAWDEV,
+    ...beforeTheWorkExists(READ_ONLY_CAWDEV),
     ...READ_FILES,
     ...GIT_READS,
     ...(run?.entryNumber ? [] : [CARD_WRITE]),
@@ -4454,21 +5484,76 @@ function argsForProfile(agentArgs, profile, run, expertAgents = [], skills = [])
  * re-derived the plan from a précis would be planning again, which is the one
  * thing the gate exists to stop it doing after somebody approved the first one.
  */
-function stagePrompt(stage, carried) {
+/** Longer than ask_user's own ten-minute wait — see the cawdev server of spawnCodex. */
+const CAWDEV_TOOL_TIMEOUT_SEC = 660;
+
+/**
+ * R368. cawdev reads a plan's `**Done when:**` list into the card's review
+ * checklist, numbered in order, so a plan has to end in one that can be ticked.
+ */
+const DONE_WHEN_PLAN = 'End the plan with a `**Done when:**` list of `- [ ]` items, each one '
+  + 'condition somebody could check on its own — cawdev turns that list into the card\'s '
+  + 'review checklist, numbered in order.';
+
+/** R368. The other half: the session that builds it says which items it built. */
+const DONE_WHEN_TICK = 'When an item under the plan\'s **Done when** is built and you have '
+  + 'checked it, call `done_when_tick` with its number and one line of evidence. Do not tick '
+  + 'what you did not check.';
+
+/**
+ * A decision that is the person's is ASKED, and the stage goes on with the
+ * answer. R19 and R24 (Codex) each met one — a plan the code had moved away
+ * from, a plan whose review left the scope open — and ended the stage saying
+ * so, the run FINISHED with nothing built and the question in a summary
+ * nobody was asked. Claude asked; the wording let Codex stop instead.
+ */
+const ASK_DONT_STOP = 'If a decision is genuinely the person\'s — a scope the card leaves open, '
+  + 'a plan that no longer matches the code, a trade-off with no right answer — ASK it with '
+  + '`ask_user` (a round of questions if there are several), wait for the answer, and carry on '
+  + 'with it. Never end this stage on an open question: a question left in your report is one '
+  + 'nobody was asked.';
+
+/**
+ * A stage is ONE turn, and it ends the moment the turn does — so a command left
+ * running in the background is a result lost (background-shells.mjs).
+ */
+const WAIT_FOR_COMMANDS = 'This stage ends when your turn ends: run every command in the '
+  + 'foreground and wait for it to finish — a build or a test suite left running in the '
+  + 'background is lost, and the stage is run again. The same goes for delegating: call '
+  + '`Agent` with `run_in_background: false` and wait for its answer — an agent still '
+  + 'working when your turn ends has its work lost, and the stage is run again.';
+
+/**
+ * @param hasPlan whether the card has a plan of record — the same test
+ *   harnessPrompt uses to draw "The plan for this card" (`plan?.body`), so the
+ *   instruction and the block it points at cannot disagree
+ */
+function stagePrompt(stage, carried, hasPlan = true) {
   const asked = {
     PLAN: 'Work out what to do and WRITE THE PLAN. Do not change anything — you have no '
       + 'tool that can, so do not spend turns discovering that. Read what you need, then say, '
       + 'concretely: which files, what change in each, and how you will know it worked. '
       + 'What you report becomes the card\'s plan, and a DIFFERENT session — another '
       + 'process, with none of your context — will be handed it and told to carry it out. '
-      + 'Write it for them.',
+      + 'Write it for them — with every decision in it already made. ' + DONE_WHEN_PLAN + ' '
+      + ASK_DONT_STOP,
     VERIFY: 'Check the plan against what is actually there. Does every file it names exist? '
       + 'Does every interface it assumes still look like that? You cannot change anything — '
       + 'say what is wrong with the plan, or say plainly that it holds.',
-    IMPLEMENT: 'Do the work in the plan — it is under "The plan for this card" above, '
-      + 'written by the plan phase and agreed. If it turns out to be wrong, say so and stop '
-      + 'rather than improvising a different change: somebody approved that plan, and a '
-      + 'different one has not been approved.',
+    // With a plan, the plan is the task. Without one — `/new dev R21` on a
+    // card nobody planned — the CARD is: the old wording pointed at a plan
+    // section that was not there, and a careful session read "stop rather than
+    // improvise" as "stop", ending R21 with nothing built and nothing to push.
+    IMPLEMENT: (hasPlan
+      ? 'Do the work in the plan — it is under "The plan for this card" above, '
+        + 'written by the plan phase and agreed. Do not quietly improvise a different change: '
+        + 'somebody approved that plan. If it turns out to be wrong or incomplete, ask what to '
+        + 'do instead of stopping — and stop only if the answer is to stop. ' + DONE_WHEN_TICK + ' '
+      : 'This card has no plan, and it does not need one: it was started straight into '
+        + 'development, so the CARD\'s text is the task. Work out what it asks — read the code '
+        + 'it touches first — build it, and commit it on this branch. Never stop because a plan '
+        + 'is missing. ')
+      + ASK_DONT_STOP + ' ' + WAIT_FOR_COMMANDS,
     // R129. Two honest ways to do this stage, and the project chose one. The
     // TESTBOOK wording says "you have no tool that could" for the PLAN
     // prompt's reason: a session that has to discover a refusal spends turns
@@ -4484,7 +5569,12 @@ function stagePrompt(stage, carried) {
         + '`git diff` to find out what the work actually changed. A test you could not run is '
         + 'a line in the testbook, not a failure of this stage.'
       : 'Run what proves the work. Report what passed and what did not, with the output. A '
-        + 'failing test is a result, not a failure of this stage.',
+        + 'failing test is a result, not a failure of this stage. The branch\'s SonarQube gate '
+        + 'is one call away — `quality_get`, which reads this run\'s branch by default; a red '
+        + 'gate with new vulnerabilities is a finding to report with the output, not a failure '
+        + 'to hide. ' + WAIT_FOR_COMMANDS + ' Then commit the branch\'s changes — no stage '
+        + 'after this one writes code, and work left uncommitted is work nothing can push. '
+        + DONE_WHEN_TICK,
     MEMORY: 'Write what the NEXT session on this branch needs to know: what was done, what was '
       + 'tried and rejected and why, and anything that turned out to matter and would not be '
       + 'obvious from the diff. Be brief and concrete. This is saved as this branch\'s '
@@ -4898,6 +5988,8 @@ card you created a moment ago. cawdev stores what you report as the card's plan 
 record when this phase ends, and that is the only copy anybody wants: two plans in
 two places is how one of them goes stale.
 
+**End with a Done-when list.** ${DONE_WHEN_PLAN}
+
 Then \`report\` kind "done" with the plan itself.${asked}`;
   }
 
@@ -4911,7 +6003,9 @@ matters — and stop there. Do not decide the verdict. That is the person's.
 The findings go on the card and the person decides Done or Not done.
 
 **Read the code.** Start with \`code_map\` and \`file_deps\` — cawdev has already
-mapped this repository. Then read the work with \`git_reads\` tools.
+mapped this repository. Then read the work with \`git_reads\` tools. \`quality_get\`
+gives the branch's SonarQube gate and the project's open findings; a new
+vulnerability belongs in your comment.
 
 **Check against the Build: and Done when:.** Use \`roadmap_get\` to read the
 card's own words, then check the code against them. Point at what is done and
@@ -5002,13 +6096,39 @@ function writeUserMessage(child, text) {
  * and the qualified name is the one thing that must be exact. R147 was five
  * bugs' worth of evidence that a name a session cannot use is a capability it
  * does not have.
+ *
+ * <p>i257. `stillBackgrounded` names the ones that WERE delegated to but only
+ * with a backgrounded `Agent` call — so "has not used it" would be false and
+ * the fix would be wrong: telling a session to call something again that it
+ * already called would read as broken, not as a nudge. Those get the specific
+ * reason instead, because the generic "use it now" is the wrong instruction —
+ * it already did, and doing it the same way again loses the result the same
+ * way.
  */
-function nudgeText(stage, missing) {
-  const names = missing.map((each) => `\`${each}\``).join(', ');
-  return `cawdev: this project requires ${names}, and this ${stage.stage} stage has not `
-    + 'used it.\n\n'
-    + 'Use it now — `Skill` with `skill: "<name>"`, or `Agent` with `subagent_type: "<name>"` '
-    + '— and then say what it changed about your answer.\n\n'
+function nudgeText(stage, missing, stillBackgrounded = []) {
+  const neverUsed = missing.filter((each) => !stillBackgrounded.includes(each));
+  const clauses = [
+    neverUsed.length
+      ? `has not used ${neverUsed.map((each) => `\`${each}\``).join(', ')}`
+      : null,
+  ].filter(Boolean);
+  const opening = clauses.length
+    ? `cawdev: this project requires ${missing.map((each) => `\`${each}\``).join(', ')}, and `
+      + `this ${stage.stage} stage ${clauses.join(', and ')}.`
+    : `cawdev: this project requires ${missing.map((each) => `\`${each}\``).join(', ')}.`;
+  const backgroundedNames = stillBackgrounded.map((each) => `\`${each}\``).join(', ');
+  const backgroundedNote = stillBackgrounded.length
+    ? `\n\n${backgroundedNames} ${stillBackgrounded.length > 1 ? 'were' : 'was'} delegated to `
+      + 'with `Agent`, but in the background, and its result has not come back. This stage is '
+      + 'one process (R112): your turn ending is indistinguishable, to the daemon, from being '
+      + 'finished, so a backgrounded delegation still in flight when that happens is lost along '
+      + 'with anything gated on it. Call it again with `run_in_background: false` and wait for '
+      + 'it in this same turn before finishing.'
+    : '';
+  return `${opening}${backgroundedNote}\n\n`
+    + 'Use it now — `Skill` with `skill: "<name>"`, `Agent` with `subagent_type: "<name>"`, or '
+    + 'for an MCP server a call to one of its tools (`mcp__<server>__…`) — and then say what it '
+    + 'changed about your answer.\n\n'
     + 'If it genuinely does not apply to this work, say so in one sentence and stop. '
     + '**You will not be asked again.**';
 }
@@ -5235,6 +6355,146 @@ function heldWorkspaces() {
   return held;
 }
 
+/**
+ * Which checkout an offered coding run gets, or why it must keep waiting —
+ * R71/i258.
+ *
+ * In order: a NAMED checkout (`offered.workspace`) is the only answer once
+ * the branch is bound to it — served or busy, nothing else is considered. A
+ * PREFERRED checkout (`offered.preferredWorkspace`) is taken when free,
+ * dirty or not: it is the checkout the branch last ran in, so uncommitted
+ * work there is plausibly that branch's own leftovers, and routing away from
+ * it risks abandoning work rather than protecting it. That is pin-shaped
+ * reasoning, and it is deliberate that cleanliness plays no part in this
+ * rung — do not "fix" it in passing.
+ *
+ * The one exception is `offered.waitForClean` — R270. Once the person has
+ * said "don't touch dirty", the idea that the leftovers are probably this
+ * branch's own no longer applies: the preferred checkout is taken only when
+ * it reads clean, and otherwise the run falls through to the free scan below
+ * exactly as if it had no preference at all.
+ *
+ * Below that, a checkout is free game and cleanliness finally matters: the
+ * first free path that reads CLEAN wins, and only when nothing free is known
+ * clean does the first free path win regardless — today's behaviour,
+ * unchanged, so the existing refusal in `prepareWorkingCopy` and the
+ * console's *Start anyway* flow still work exactly as they did. With
+ * `waitForClean` set, that last fallback does not happen: the run keeps
+ * waiting instead of taking a dirty checkout.
+ *
+ * Cleanliness is read fresh, right here, rather than from
+ * `surveyWorkingCopies`'s heartbeat reading — see `looksClean`. `probed` is a
+ * `Map` the caller creates once per poll pass, so several offers of one
+ * project only ask each checkout once.
+ *
+ * `surveyGit` and `checkMerges` use the same `workspaces.find((path) =>
+ * !held.has(path))` idiom this replaces, and must NOT be unified with this:
+ * they read refs, never the tree, so which checkout they pick is a different
+ * question and dirtiness does not bear on it.
+ */
+async function pickWorkspace(slug, project, offered, held, probed, autoMax = 0, problems = new Map()) {
+  const pinned = offered.workspace ?? null;
+  if (pinned) {
+    if (!project.workspaces.includes(pinned)) {
+      // Not one of ours. The platform pins a machine as well as a path, so
+      // this means the config changed under a live branch — which is a
+      // thing to say out loud rather than quietly ignore.
+      return { workspace: null, why: `its branch is in ${pinned}, which this machine does not serve` };
+    }
+    // Before the busy check, so the reason is the folder's own sentence and not
+    // prepareWorkingCopy's raw error.
+    const trouble = await problemOf(problems, pinned);
+    if (trouble) {
+      return {
+        workspace: null,
+        why: workspaceProblemSaid(slug, trouble, { first: project.workspaces[0] }),
+      };
+    }
+    if (held.has(pinned)) {
+      return {
+        workspace: null,
+        why: `waiting for ${pinned}, which is busy — the branch has work only that checkout holds`,
+      };
+    }
+    return { workspace: pinned, why: null };
+  }
+
+  const waitForClean = offered.waitForClean === true;
+  const preferred = offered.preferredWorkspace ?? null;
+  if (preferred && project.workspaces.includes(preferred) && !held.has(preferred)
+      && !(await problemOf(problems, preferred))) {
+    if (!waitForClean) {
+      return { workspace: preferred, why: null };
+    }
+    if (!probed.has(preferred)) probed.set(preferred, await looksClean(preferred));
+    if (probed.get(preferred) === true) return { workspace: preferred, why: null };
+  }
+
+  const broken = [];
+  for (const path of project.workspaces) {
+    const trouble = await problemOf(problems, path);
+    if (trouble) broken.push(trouble);
+  }
+  const first = project.workspaces[0];
+  const usable = project.workspaces.filter((path) => !broken.some((each) => each.path === path));
+  if (!usable.length && broken.length) {
+    // Nothing here can be used at all — said before "all busy", and without
+    // trying to clone: `createAutoWorkspace` clones FROM the first workspace.
+    return { workspace: null, why: workspaceProblemSaid(slug, broken[0], { first }) };
+  }
+  const free = usable.filter((path) => !held.has(path));
+  if (!free.length) {
+    // Every checkout is busy. Where the machine allows it, make one more
+    // rather than wait — the second coding session on a project starting at
+    // once is the whole point of `autoWorkspaces`.
+    // A deleted clone must not use up the quota until `syncAutoWorkspaces` runs.
+    const made = usable.filter((path) => isAutoWorkspace(first, path));
+    const firstTrouble = broken.find((each) => each.path === first);
+    if (firstTrouble && made.length < autoMax) {
+      return { workspace: null, why: workspaceProblemSaid(slug, firstTrouble, { first }) };
+    }
+    if (made.length < autoMax) {
+      try {
+        log(`every checkout of ${slug} is busy — cloning another beside ${first}`);
+        const path = await createAutoWorkspace(first, project.workspaces);
+        project.workspaces.push(path);
+        log(`  made ${path} (${made.length + 1} of ${autoMax} on demand)`);
+        return { workspace: path, why: null };
+      } catch (failure) {
+        log(`  could not make another checkout of ${slug}: ${failure.message}`);
+        return { workspace: null, why: `no free workspace in ${slug}, and cloning another failed` };
+      }
+    }
+    return {
+      workspace: null,
+      why: autoMax
+        ? `no free workspace in ${slug} (${project.workspaces.length} here, all busy, `
+          + `and the ${autoMax} this machine may make are made)`
+        : `no free workspace in ${slug} (${project.workspaces.length} here, all busy)`,
+    };
+  }
+  for (const path of free) {
+    if (!probed.has(path)) probed.set(path, await looksClean(path));
+    if (probed.get(path) === true) return { workspace: path, why: null };
+  }
+  // Nothing free reads clean — including anything `looksClean` could not read
+  // at all, which groups with dirty rather than clean.
+  if (waitForClean) {
+    // R270: the person said to wait rather than go ahead on top of somebody
+    // else's work. Keep waiting instead of falling back to the old
+    // first-free rule below.
+    return {
+      workspace: null,
+      why: `waiting for a clean checkout in ${slug} — every free one has uncommitted work or `
+        + 'could not be read; stash or commit in one, or wait for a running session to finish',
+    };
+  }
+  // Fall back to the old first-free rule verbatim, so the refusal and *Start
+  // anyway* flow still apply to exactly this workspace.
+  log(`every free checkout in ${slug} has uncommitted work — taking ${free[0]}`);
+  return { workspace: free[0], why: null };
+}
+
 function noteQueued(run, why) {
   // Once per REASON, not once per run — R70, now that there are two gates a run
   // can be held by. A run refused by the machine's cap and then, when a session
@@ -5276,6 +6536,10 @@ function snapshotRuns() {
       // Which checkout it is in — R47. On a machine serving three, the label
       // alone no longer says where the work is.
       workspace: child.cawdevWorkspace ?? null,
+      // Which CLI, and which model it is on — per STAGE on a walked run,
+      // since each stage is its own process with its own model (R112).
+      agent: child.cawdevAgent ?? null,
+      model: child.cawdevModel ?? null,
       startedAt: child.cawdevStartedAt ?? null,
     });
   }
@@ -5310,12 +6574,12 @@ function snapshotRuns() {
   return runs;
 }
 
-async function startRun(config, offered, workspace) {
+async function startRun(config, offered, workspace, source = null) {
   const run = offered.run;
   const project = config.projects[run.projectSlug];
   // The workspace this run was given, or — for a run that takes none — the
   // first, which is where a question about the project gets read from.
-  const path = workspace ?? project?.path;
+  const path = workspace ?? source ?? project?.path;
   let runToken;
   let defaultBranch;
   let allowDirty = false;
@@ -5356,6 +6620,19 @@ async function startRun(config, offered, workspace) {
     defaultBranch = claimed.defaultBranch;
     // Whether somebody was shown the uncommitted work and started anyway.
     allowDirty = claimed.allowDirty === true;
+    // Or whether the uncommitted work is THIS BRANCH'S OWN: the platform named
+    // the checkout (R86/R87 — a carried-on run's held workspace, or the next
+    // run of a pinned work item) and it is already on the run's branch. R80
+    // holds a failed run's checkout precisely so its work survives, and
+    // refusing that work as "yours, commit it first" turned every Carry on
+    // into a second failure with nothing in the console able to break the loop.
+    if (!allowDirty && offered.workspace && path && writesCodeProfile(run) && run.branch) {
+      const on = await git(resolve(path), ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => '');
+      if (on.trim() === run.branch) {
+        allowDirty = true;
+        log(`  ${path} is on ${run.branch} already — its uncommitted work is this branch's, kept`);
+      }
+    }
     // And what this project has decided happens when the run ends — R40. The
     // daemon does not act on this: the platform queues the push, the pull
     // request and the merge as actions and `settleActions` performs them. It is
@@ -5373,9 +6650,22 @@ async function startRun(config, offered, workspace) {
     // a reset, the code map and the brief read. Null on every run until a
     // sprint has a branch — and then everything below is what it was.
     run.baseBranch = claimed.baseBranch ?? null;
+    // R379. The project's declared git host (GITHUB/GITLAB), or null to detect it.
+    run.gitHost = claimed.gitHost ?? null;
     if (run.baseBranch) {
       log(`  cut from ${run.baseBranch} (the sprint's branch)`);
     }
+    // R300. Which SonarQube project this is and where — two FACTS the
+    // scanner needs on its command line, learnt with the claim because
+    // reading a project is session-only. No token comes with them; the
+    // scanner runs with this machine's own, from the variable the `quality`
+    // block names. Stored on the run the way `baseBranch` is, so the walk
+    // reads them off `run` after TEST rather than through another parameter.
+    run.sonarProjectKey = claimed.sonarProjectKey ?? null;
+    run.sonarUrl = claimed.sonarUrl ?? null;
+    // R316. Whether the project SAYS its server refuses branches — null is
+    // "not sure, try the branch scan first", today's behaviour.
+    run.sonarBranches = claimed.sonarBranches ?? null;
     // R69. Whether this is the same conversation picked back up, and which one.
     // Null on an ordinary claim, which is nearly all of them.
     resume = claimed.resume ?? null;
@@ -5442,13 +6732,32 @@ async function startRun(config, offered, workspace) {
     return;
   }
 
+  // Where the session runs: the checkout, or for a session with no branch
+  // the project's reading copy (`readingCopy`).
+  let cwd = path ? resolve(path) : path;
+  let reader = null;
   try {
+    // R377. The folder was fine when the run was offered; it may not be now.
+    // Checked before anything is prepared, so the run says what is wrong with
+    // the folder instead of `is not a git repository` or `spawn claude ENOENT`.
+    // One check covers every walked stage, which reuse this `cwd`.
+    const trouble = path ? await workspaceProblem(resolve(path)) : null;
+    if (trouble && !(trouble.kind === 'not-git' && !writesCodeProfile(run))) {
+      throw new Error(workspaceProblemSaid(run.projectSlug, trouble, {
+        first: project?.workspaces?.[0] ?? null,
+      }));
+    }
     let branch = run.branch;
     if (!writesCodeProfile(run)) {
       // Nothing is prepared. It cuts no branch, and a dirty tree does not stop
       // it, because it is not going to write to one — refusing here would make
       // "what is R12 about?" unanswerable while somebody has edits open.
-      log(`  a ${run.profile.toLowerCase()} session: no branch, nothing prepared`);
+      log(`  a ${run.profile.toLowerCase()} session: no branch, nothing cut`);
+      if (path) {
+        reader = await readingCopy(resolve(path), defaultBranch);
+        cwd = reader.path;
+        log(`  ${reader.said}`);
+      }
     } else {
       // Cleared BEFORE the checkout, and never when somebody deliberately
       // started on top of their own uncommitted work — there the untracked
@@ -5486,7 +6795,7 @@ async function startRun(config, offered, workspace) {
         }).catch((failure) => log(`  could not report the merge: ${failure.message}`));
       }
     }
-    log(`  working copy ${path} is on ${branch}`);
+    log(`  working copy ${cwd ?? path} is on ${branch ?? 'no branch of its own'}`);
 
     await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/transition`, {
       method: 'POST',
@@ -5508,7 +6817,7 @@ async function startRun(config, offered, workspace) {
       return;
     }
 
-    const said = await walkLifecycle(config, run, runToken, resolve(path), baseCommit, workspace,
+    const said = await walkLifecycle(config, run, runToken, cwd, baseCommit, workspace,
         resume, mcpServers, expertAgents, skills, instincts, briefing, plan, lifecycle, shield);
 
     if (merge) {
@@ -5527,6 +6836,7 @@ async function startRun(config, offered, workspace) {
       body: { state: 'FAILED', summary: failure.message },
     }).catch((second) => log(`  could not record the failure: ${second.message}`));
   } finally {
+    reader?.release();
     running.delete(run.id);
     taken.delete(run.id);
     // The transcript of a run that is over is on the platform, where it belongs.
@@ -5616,9 +6926,9 @@ async function skipRest(config, run, lifecycle, from, why) {
 
 async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, resume,
     projectServers, expertAgents, skills, instincts, briefing, plan, lifecycle, shield) {
-  const spawn = (stage, carried) => spawnAgent(config, run, runToken, cwd, baseCommit, workspace,
-    resume, projectServers, expertAgents, skills, instincts, briefing, plan, lifecycle, shield,
-    stage, carried);
+  const spawn = (stage, carried, usage) => spawnAgent(config, run, runToken, cwd, baseCommit,
+    workspace, resume, projectServers, expertAgents, skills, instincts, briefing, plan, lifecycle,
+    shield, stage, carried, usage);
 
   // No lifecycle, or a resume: one process, exactly as before.
   //
@@ -5635,8 +6945,50 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
   const carried = {};
   let last = null;
 
+  // R305. What the RUN has been credited with so far. Each stage is its own
+  // process with its own cumulative counter, so the base the next child adds
+  // to must move — read once from the claim, it stayed at zero and the platform
+  // ignored every stage after the first as a reading that went backwards, so a
+  // five-stage run's stored total was its largest stage rather than the sum.
+  const spent = { tokensIn: Number(run.tokensIn) || 0, tokensOut: Number(run.tokensOut) || 0 };
+  // And what each STAGE was already credited with, for the same reason. A run
+  // walked a second time in a fresh session — handed off to another machine,
+  // or one that died before the CLI said its session id — re-walks the same
+  // `run_stage` rows, and the claim's total already holds the first walk; a
+  // stage counted from zero here would be kept as max(walk) by the platform
+  // while the run kept the sum. Read once; an older platform, or a stub,
+  // answers without the fields and the base is zero, which is today's number.
+  const stored = await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/stages`)
+    .catch(() => []);
+  const creditedTo = (name) => {
+    const row = Array.isArray(stored) ? stored.find((each) => each?.stage === name) : null;
+    return { tokensIn: Number(row?.tokensIn) || 0, tokensOut: Number(row?.tokensOut) || 0 };
+  };
+
+  const storedRow = (name) => (Array.isArray(stored)
+    ? stored.find((each) => each?.stage === name) : null);
+
   for (let at = 0; at < lifecycle.length; at++) {
     const stage = lifecycle[at];
+    // Where a carried-on run resumes, and what its DONE stages said, is the
+    // platform's (R263, `WorkflowService.resumeFrom`): the claim's lifecycle
+    // starts at the first stage not DONE. What only the daemon knows is WHY
+    // the stage about to run stopped last time — so that is handed to it.
+    const before = storedRow(stage.stage);
+    if (before?.state === 'FAILED' && before.outcome) {
+      // The attempt that stopped, handed to the one about to run.
+      carried[`${stage.stage} (the attempt that stopped)`] = `${before.outcome}\n\n`
+        + 'This stage is being run again to finish that. Run the commands — and the agents — '
+        + 'it left running again IN THE FOREGROUND — not with run_in_background — wait for '
+        + 'each one to end and read its output, then finish the stage properly. Check the '
+        + 'checkout first: a background agent may have left part of its work there.';
+    }
+    // R305. What THIS stage's processes have used, across its attempts. Outside
+    // the attempt loop on purpose: `run_stage` is one row per stage and keeps
+    // the larger reading, so a second attempt after a refused gate must report
+    // the first attempt's total plus its own, or the row would show
+    // max(attempt) and the stages would no longer sum to the run.
+    const stageSpent = creditedTo(stage.stage);
     // Two attempts at most, and the second only exists because a REFUSED gate
     // should cost one cheap stage rather than a whole run. A third would be a
     // loop nobody asked for.
@@ -5645,7 +6997,19 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
       log(`  ${stage.stage}${stage.model ? ` on ${stage.model}` : ''}`
         + `${attempt ? ' (again, after the gate refused it)' : ''}`);
 
-      last = await spawn(stage, carried);
+      // Both handed BY REFERENCE and moved below once the child is over. Safe
+      // only because stages run one at a time: the child reads them at each
+      // `result` event, and nothing else touches them while it lives.
+      last = await spawn(stage, carried, { run: spent, stage: stageSpent });
+
+      // Credited before the exit is judged, so a stage that was killed or
+      // skipped still counts what its `result` events said it used.
+      if (last?.usage) {
+        spent.tokensIn += last.usage.input;
+        spent.tokensOut += last.usage.output;
+        stageSpent.tokensIn += last.usage.input;
+        stageSpent.tokensOut += last.usage.output;
+      }
 
       // A clean exit, OR a turn that ended. The second half is the half that
       // matters now: `endSession` closes a stage's input when its turn is over
@@ -5729,6 +7093,21 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
         return;
       }
 
+      // The turn ended, but with commands it started in the background still
+      // running, or finished and never read. Not done: the result is what the
+      // stage was for. FAILED keeps the checkout and the session (R80), so
+      // /continue picks the run up HERE — the stages behind it stay pending.
+      if (last?.unfinishedShells?.length) {
+        const listed = last.unfinishedShells.map((command) => `\`${command.slice(0, 120)}\``).join(', ');
+        const why = `The ${stage.stage} stage ended with ${last.unfinishedShells.length} command(s) or agent(s) `
+          + `still running in the background, or finished and never read: ${listed}. `
+          + 'Nothing they proved was recorded — /continue runs this stage again and waits for them.';
+        log(`  ${why}`);
+        await reportStage(config, run, stage.stage, 'report', { state: 'FAILED', outcome: why });
+        await finish(config, run, 'FAILED', `${why}\n\n${last.text ?? ''}`.trim());
+        return;
+      }
+
       await reportStage(config, run, stage.stage, 'report', {
         state: 'DONE',
         // The PLAN's text IS the plan — the artefact R109 exists to store, and
@@ -5745,13 +7124,22 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
       if (decision.allowed) {
         break;
       }
+      if (decision.expired) {
+        // R339. Unread is not refused: re-running the stage would spend a
+        // second stage on a plan nobody has looked at yet.
+        const why = `Stopped at the ${stage.stage} gate: ${decision.reason}. Nothing was `
+          + 'refused — start the run again when somebody can read it.';
+        await skipRest(config, run, lifecycle, at + 1, why);
+        await finish(config, run, 'FINISHED', why, cwd);
+        return;
+      }
       if (attempt === 1) {
         const why = `Stopped at the ${stage.stage} gate: ${decision.reason ?? 'refused twice.'}`;
         // The same trail R122 came from: a run that ends here never reaches the
         // stages after it, and stages left PENDING on a run that is over read
         // as a lifecycle still going.
         await skipRest(config, run, lifecycle, at + 1, why);
-        await finish(config, run, 'FINISHED', why);
+        await finish(config, run, 'FINISHED', why, cwd);
         return;
       }
       // Refused once: the reason is the point of refusing, so it goes into the
@@ -5761,6 +7149,15 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
     }
 
     carried[stage.stage] = last.text;
+
+    // R300. The scanner, after TEST settles and before the next stage — on
+    // the tree the tests just ran against, by the daemon and not the session.
+    // AWAITED: the workspace is released in `perform`'s finally, and a
+    // scanner still reading files when the next run's reset runs is the
+    // hazard; the block's `timeoutSeconds` bounds the wait. It never throws.
+    if (stage.stage === 'TEST' && run.branch && writesAnythingProfile(run)) {
+      await scanQuality(config, run, cwd, run.branch);
+    }
 
     // R108. The MEMORY stage's output IS the briefing, saved by the DAEMON
     // rather than by the session calling a tool. One less thing to trust, and
@@ -5779,7 +7176,7 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
   const current = await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}`)
     .catch(() => null);
   if (current?.live) {
-    await finish(config, run, 'FINISHED', last?.text ?? 'The lifecycle finished.');
+    await finish(config, run, 'FINISHED', last?.text ?? 'The lifecycle finished.', cwd);
   }
   await settleActions(config, run, cwd);
 }
@@ -5839,6 +7236,11 @@ async function awaitGate(config, run, runToken, stage, text) {
   }
 
   log(`  waiting at the ${stage.stage} gate`);
+  // R339: no deadline of its own by default. A gate is a person reading the
+  // plan, the platform never expires one, and a run waiting on it is never
+  // swept — a timer here turned "not read yet" into a refusal and re-ran the
+  // stage, which is spend nobody asked for. An older platform that does
+  // expire it still answers EXPIRED, which is handled below.
   const deadline = Date.now() + gateTimeoutSeconds() * 1000;
   while (Date.now() < deadline) {
     const remaining = Math.ceil((deadline - Date.now()) / 1000);
@@ -5850,6 +7252,12 @@ async function awaitGate(config, run, runToken, stage, text) {
       // the transport — a 204 and a `{state: 'PENDING'}` both mean "not yet",
       // and depending on which one the platform chose would be depending on
       // something nobody promised.
+      if (decision?.state === 'EXPIRED') {
+        // A platform from before R339. Nobody said no, so this is not a
+        // refusal to re-run the stage over: the run stops at the gate.
+        log(`  the ${stage.stage} gate expired unread`);
+        return { allowed: false, expired: true, reason: 'nobody read it in time' };
+      }
       if (decision && decision.state && decision.state !== 'PENDING') {
         const allowed = decision.state === 'ALLOWED';
         log(`  the ${stage.stage} gate was ${allowed ? 'allowed' : 'refused'}`);
@@ -5860,19 +7268,39 @@ async function awaitGate(config, run, runToken, stage, text) {
       return { allowed: false, reason: `waiting failed (${failure.message})` };
     }
   }
-  return { allowed: false, reason: 'nobody answered in time' };
+  return { allowed: false, expired: true, reason: 'nobody answered in time' };
 }
 
-/** A little past the platform's own expiry, like the MCP server's. */
+/**
+ * How long a gate waits before the daemon gives up on it: for ever, unless a
+ * test says otherwise — R339. The platform decides when nobody is coming.
+ */
 function gateTimeoutSeconds() {
   const configured = Number(process.env.CAWDEV_GATE_TIMEOUT_SECONDS);
-  return Number.isFinite(configured) && configured > 0 ? configured : 960;
+  return Number.isFinite(configured) && configured > 0 ? configured : Infinity;
+}
+
+/**
+ * An agent session, spawned under the machine's memory ceiling when it has
+ * one — R339. `systemd-run --scope` execs in place, so the pid, the group and
+ * the pipes are the agent's own. `cawdevCommand` is what the next daemon reads
+ * off the driving note to tell this session's orphan from a reused pid.
+ */
+function spawnScoped(config, command, args, options) {
+  const line = scoped(command, args, config.sessionScope);
+  const child = spawn(line.command, line.args, options);
+  child.cawdevCommand = command;
+  return child;
 }
 
 async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, resume,
     projectServers, expertAgents, skills, instincts, briefing, plan, lifecycle, shield,
     stage = null,
-    carried = null) {
+    carried = null,
+    // R305. `{ run, stage }`: what the run and this stage had already used
+    // before this child, as the walk counted them. Null on an unstaged run or
+    // a resume, where the claim's own figure is the base and there is no stage.
+    usage = null) {
   // R51: what this machine will let a STORED rule cover. The project's rules
   // are filtered through it before they go anywhere near a spawn, so the
   // platform can narrow what runs here and never widen it.
@@ -5888,6 +7316,48 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   // narrowed by what the laptop already allows, and this is the laptop being
   // told — by its own operator, through a page it opted in to — to allow more.
   const granted = await machineRules(config);
+
+  // R147. Which of the run's experts THIS process may reach — moved ahead of
+  // the agy branch below (R279) so BOTH spawn paths narrow the same way: a
+  // read-only stage is handed only the experts that can change nothing.
+  // `readOnlyExpert` judges by the frontmatter the plugin is written from, so
+  // the plugin loaded, the delegation tool allowed, and the list the session
+  // is told about all agree. Everything else, and every process with no
+  // lifecycle, gets them all.
+  const readOnlyStage = Boolean(stage) && ['PLAN', 'VERIFY', 'MEMORY'].includes(stage.stage);
+  const stageExperts = readOnlyStage ? expertAgents.filter(readOnlyExpert) : expertAgents;
+  // R161. From `stageExperts` and NEVER from `expertAgents` — see the note
+  // above; an expert a read-only stage cannot reach must not be required here.
+  const cannotDelegate = readOnlyStage && expertAgents.length && !stageExperts.length
+    ? [`The ${stage.stage} stage holds nothing that can change anything, and none of this `
+      + "project's experts is read-only, so none can be reached from it. They are reached "
+      + 'from IMPLEMENT and TEST.']
+    : undefined;
+
+  // Which CLI answers this run — R276's follow-on made real. A staged run
+  // carries the resolved choice on its stage (`stage.agent`, from
+  // `WorkflowService.forRun`); anything else carries it on the run itself
+  // now (`run.agent`, from `RunService.agentFor`) — both fall back to Claude
+  // Code, exactly as every run did before either existed. Antigravity's
+  // shape differs enough (no --mcp-config, no --allowedTools, no --resume —
+  // checked against the real CLI by hand) that it is not this function's
+  // Claude-specific machinery with a different binary name; it is
+  // `spawnAntigravity`, entirely.
+  // Codex's own shape — a real sandbox and a per-server tool list, but no
+  // allow-list for the shell — is `spawnCodex`, for the same reason.
+  if ((stage?.agent ?? run.agent) === 'codex') {
+    const codexCmd = config.agentCommands.find((each) => agentOfCommand(each) === 'codex') ?? 'codex';
+    return spawnCodex(config, run, runToken, cwd, baseCommit, resume, projectServers,
+      skills, stageExperts, readOnlyStage, instincts, briefing, plan, lifecycle, stage, carried,
+      codexCmd, granted, shield, usage);
+  }
+  if ((stage?.agent ?? run.agent) === 'agy') {
+    const agyCmd = config.agentCommands.find((each) => agentOfCommand(each) === 'agy') ?? 'agy';
+    return spawnAntigravity(config, run, runToken, cwd, baseCommit, resume, projectServers,
+      skills, stageExperts, cannotDelegate, instincts, briefing, plan, lifecycle, stage, carried,
+      agyCmd, granted, usage);
+  }
+
   const ceiling = [
     ...(config.grantable ?? []),
     ...(config.projects[run.projectSlug]?.grantable ?? []),
@@ -5992,13 +7462,8 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   };
   await writeFile(mcpConfigPath, JSON.stringify({ mcpServers }, null, 2));
 
-  // R147. Which of the run's experts THIS process may reach. A read-only stage
-  // is handed only the experts that can change nothing — `readOnlyExpert`
-  // judges by the frontmatter the plugin below is written from — so the plugin
-  // it loads, the `Agent` it is allowed and the list it is told about all
-  // agree. Everything else, and every process with no lifecycle, gets them all.
-  const readOnlyStage = Boolean(stage) && ['PLAN', 'VERIFY', 'MEMORY'].includes(stage.stage);
-  const stageExperts = readOnlyStage ? expertAgents.filter(readOnlyExpert) : expertAgents;
+  // R147/R279. `readOnlyStage` and `stageExperts` are computed once, ahead of
+  // the agy branch above, so both spawn paths narrow the same way.
 
   // R161. What this project said had to be used, by the name a transcript line
   // carries.
@@ -6008,10 +7473,31 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   // required HERE: requiring what the stage was deliberately not given is how
   // this would come to widen what a run may do, which is the one thing it must
   // not do. The mode is read after the narrowing, always.
+  //
+  // R303. An MCP server can be required too, and the entry comes from
+  // `attached` — what this machine actually spawned — and NEVER from the
+  // claim's list, for exactly the reason above: a server the machine refused
+  // cannot be required of a session that has no such tool. And only when the
+  // stage can reach it: a read-only stage is spawned with `listOnly`, which
+  // strips the permission prompt, and `mcp__<server>__*` is never on its list —
+  // so a PLAN stage told it MUST call `mcp__codegraph__…` would be nudged for
+  // something it was deliberately not given. IMPLEMENT and TEST, and a run
+  // with no lifecycle, keep the prompt and can answer the first call.
+  //
+  // Keyed `<kind>:<name>` on both sides — here and where `used` is filled —
+  // so a server named like a skill cannot satisfy the other's requirement.
+  const serversCanBeReached = !readOnlyStage;
   const mustUse = new Set([
-    ...stageExperts.filter((each) => each.mode === 'REQUIRED').map((each) => qualified(each.key)),
-    ...skills.filter((each) => each.mode === 'REQUIRED').map((each) => qualified(each.key)),
+    ...stageExperts.filter((each) => each.mode === 'REQUIRED')
+      .map((each) => `EXPERT:${qualified(each.key)}`),
+    ...skills.filter((each) => each.mode === 'REQUIRED')
+      .map((each) => `SKILL:${qualified(each.key)}`),
+    ...(serversCanBeReached ? attached : [])
+      .filter(({ skill }) => skill.mode === 'REQUIRED')
+      .map(({ skill }) => `MCP_SERVER:${skill.serverName}`),
   ]);
+  /** The transcript's name for a requirement — what the nudge and the log say. */
+  const nameOf = (entry) => entry.slice(entry.indexOf(':') + 1);
 
   // R104/R105. The experts and skills the project turned on, as one plugin in
   // the daemon's own directory — see writeRunPlugin for why not the checkout.
@@ -6151,11 +7637,15 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       description: each.description ?? each.name ?? each.key,
       required: each.mode === 'REQUIRED',
     })),
-    cannotDelegate: readOnlyStage && expertAgents.length && !stageExperts.length
-      ? [`The ${stage.stage} stage holds nothing that can change anything, and none of this `
-        + "project's experts is read-only, so none can be reached from it. They are reached "
-        + 'from IMPLEMENT and TEST.']
-      : undefined,
+    // R303. Only a REQUIRED server changes the prompt, and only where the
+    // stage can reach it — the same gate `mustUse` applies, so the prompt and
+    // the nudge never disagree about what a stage owes.
+    mcpServers: attached.map(({ skill }) => ({
+      name: skill.name ?? skill.key,
+      prefix: skill.toolPrefix ?? `mcp__${skill.serverName}`,
+      required: serversCanBeReached && skill.mode === 'REQUIRED',
+    })),
+    cannotDelegate,
     // R124. Null on everything but an implementation phase whose card has been
     // planned, which the PLATFORM decides — the runner does not work out which
     // runs deserve a plan, it carries the one it was handed.
@@ -6196,6 +7686,14 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
           writesItsOwnCard: writesItsOwnCard(run) })]
     : null;
 
+  // Reaching here at all means Claude Code answers this run — the branch at
+  // the top of this function sent Antigravity to spawnAntigravity instead.
+  // Matched against what this machine actually lists (`config.agentCommands`)
+  // by `agentOfCommand`, the rule `readUsage` uses too, so a machine whose list
+  // is agy- or codex-first still gets Claude Code's own command.
+  const agentCmd = config.agentCommands.find((each) => agentOfCommand(each) === 'claude')
+    ?? 'claude';
+
   const args = [
     '--mcp-config',
     mcpConfigPath,
@@ -6210,10 +7708,10 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
           skills)]
       : argsForProfile(agentArgs, run.profile, run, expertAgents, skills))),
   ];
-  log(`  spawning: ${config.agentCommand} ${args.join(' ')} (prompt on stdin)`);
+  log(`  spawning: ${agentCmd} ${args.join(' ')} (prompt on stdin)`);
 
   return new Promise((resolvePromise) => {
-    const child = spawn(config.agentCommand, args, {
+    const child = spawnScoped(config, agentCmd, args, {
       cwd,
       // Its own process group, so cancelling can take down the whole tree
       // rather than leaving orphaned children behind.
@@ -6229,6 +7727,11 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     });
 
     child.cawdevProjectSlug = run.projectSlug;
+    // Which CLI and which model — what advanced mode puts in a window's title.
+    // The model asked for now; the one the CLI says it is on replaces it at
+    // `init` (below), which is also the only answer when none was asked.
+    child.cawdevAgent = 'claude';
+    child.cawdevModel = model ?? null;
     // The checkout this child holds, and what the queue serialises on. Null for
     // a run that took none, which is what lets an ASK session run alongside
     // three coding ones.
@@ -6273,9 +7776,12 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     // sending it again is a repeat wearing a resume's clothes — R69's rule about
     // the opening prompt, applied to the thing that now travels with it.
     writeUserMessage(child, resume?.prompt
-      ?? (promptFor(run) + harness + (stage ? stagePrompt(stage, carried) : '')));
+      ?? (promptFor(run) + harness + (stage ? stagePrompt(stage, carried, Boolean(plan?.body)) : '')));
 
     let lastText = '';
+    // R305. This child's own last reading, handed back to the walk so the next
+    // stage's base can move.
+    let childTotals = null;
     // Whether the CLI ever said its turn was over. This, and not the exit code,
     // is what says a STAGE did its work — see the failure branch in
     // walkLifecycle, and endSession above for why the two came apart.
@@ -6285,6 +7791,21 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     // asked of the platform: the answer is needed at the `result` event, and a
     // question that has to cross the network cannot be answered in time.
     const used = new Set();
+    // i257. A required expert's `Agent(...)` line is written the instant the
+    // call is MADE (R130), not when its result comes back — so `used` alone
+    // cannot tell "delegated and waited" from "delegated and moved on". This
+    // holds the qualified name of every required expert whose most recent
+    // `Agent`/`Task` call was NOT `run_in_background: false` — added on that
+    // call, and removed the moment the same name is called again WITH it. A
+    // stage is one process and gets one turn (R112); a session that ends its
+    // turn with a name still in here dispatched the delegation and did not
+    // wait for it, which is exactly the shape that loses it when `endSession`
+    // closes stdin below.
+    const backgrounded = new Set();
+    // Shell commands this child started in the background and never saw end
+    // — the walk will not call a stage done with any of them left (see
+    // background-shells.mjs).
+    const shells = new BackgroundShells();
     // The last of what the CLI said on stderr, for the exit decision below.
     // The usage-limit notice is written there, and a decision made on stdout
     // alone would call every window a crash.
@@ -6384,7 +7905,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       // R161. A required one says so where the person is looking. Only when the
       // stage can actually reach it: `cannot` and this are mutually exclusive
       // by construction, because `mustUse` is built from `stageExperts`.
-      const must = mustUse.has(qualified(agent.key))
+      const must = mustUse.has(`EXPERT:${qualified(agent.key)}`)
         ? ' This project REQUIRES it: if this stage finishes without using it, the session '
           + 'will be told.'
         : '';
@@ -6395,7 +7916,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     }
 
     for (const skill of skills) {
-      const must = mustUse.has(qualified(skill.key))
+      const must = mustUse.has(`SKILL:${qualified(skill.key)}`)
         ? ' This project REQUIRES it: if this stage finishes without using it, the session '
           + 'will be told.'
         : '';
@@ -6427,8 +7948,10 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
 
     // R76. What this run had already used before this child started. Zero on an
     // ordinary run; on a resume it is what the earlier session spent, which the
-    // claim carries on the run itself.
-    const usageBase = {
+    // claim carries on the run itself. R305: on a staged run the walk keeps the
+    // count, because the claim's figure never moves and every stage after the
+    // first would otherwise report from zero again.
+    const usageBase = usage?.run ?? {
       tokensIn: Number(run.tokensIn) || 0,
       tokensOut: Number(run.tokensOut) || 0,
     };
@@ -6444,6 +7967,71 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
         buffer = buffer.slice(newline + 1);
         if (!line) continue;
         const event = safeJson(line);
+        if (event) shells.observe(event);
+
+        // i257. Read off the RAW event, before `linesOf` flattens it to a
+        // string: `describeCall` (`../lib/tool-line.mjs`) never carries
+        // `run_in_background` into the TOOL line it writes — deliberately not
+        // extended for it, because that line is a parsing contract three
+        // implementations share (`CapabilityUse.java`, `capability-tag.ts`),
+        // and this is a daemon-internal question none of the three need
+        // answered. So this is the one place that can still see the field.
+        // Record-then-decide, ahead of the loop below that reacts to
+        // `result`, so a `result` on this same line always sees this line's
+        // own dispatches first.
+        //
+        // Only tracked for a REQUIRED expert. An optional one backgrounded is
+        // the session's own call and nothing here gates on it.
+        //
+        // Known consequence of not extending the shared line: the platform's
+        // own ledger (`RunCapabilityService.used`, called from
+        // `RunService.appendOutput` on the same TOOL line and read by the run
+        // panel) increments `RunCapability.uses` the instant the line is
+        // written, exactly like `used` below — it has no way to learn a
+        // dispatch was backgrounded, so a stage this nudge caught and that
+        // then corrected itself still reads as an ordinary "required,
+        // delegated to 1×" on the panel afterwards. That is this card's
+        // trade-off, made on purpose: the daemon is the one place that can
+        // still leave with the delegation unfinished, so it is the one place
+        // that has to catch it before it does. Making the panel say so too is
+        // a different card, not a reason to read it as ground truth here.
+        //
+        // The default-background assumption this rests on is not a guess:
+        // i249 and i250 are both a `Agent(...)` call with no
+        // `run_in_background` at all whose result never came back — this
+        // project's own Agent tool backgrounds unless told `false`. If a
+        // spawned CLI's `Agent` were ever synchronous by default, this would
+        // nudge a stage that did nothing wrong — loud, not silent, and capped
+        // at one wasted turn by `child.cawdevNudged` below.
+        //
+        // Keyed `EXPERT:<name>`, matching `mustUse`/`used`: a Set of bare
+        // names would let a REQUIRED skill and a REQUIRED expert that share a
+        // qualified name mark each other's requirement backgrounded.
+        //
+        // The last call to a name wins. A session that is awaited once and
+        // backgrounded again later is reported missing on the second call —
+        // "requirement met" and "something is in flight" are conflated on
+        // purpose, because the second call is the one whose result this
+        // stage's turn is actually at risk of losing.
+        if (event?.type === 'assistant') {
+          for (const part of event.message?.content ?? []) {
+            if (part?.type !== 'tool_use' || (part.name !== 'Agent' && part.name !== 'Task')) {
+              continue;
+            }
+            const who = typeof part.input?.subagent_type === 'string'
+              ? part.input.subagent_type : null;
+            const entry = who ? `EXPERT:${who}` : null;
+            if (!entry || !mustUse.has(entry)) {
+              continue;
+            }
+            if (part.input?.run_in_background === false) {
+              backgrounded.delete(entry);
+            } else {
+              backgrounded.add(entry);
+            }
+          }
+        }
+
         if (event?.type === 'result') {
           if (typeof event.result === 'string') {
             lastText = event.result;
@@ -6509,7 +8097,18 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
             // lifecycle never reaches here — `endSession` is deliberately not
             // called for one — so REQUIRED is prompt wording and a console row
             // on ASK, ROADMAP and AUDIT, and nothing more.
-            const missing = [...mustUse].filter((name) => !used.has(name));
+            // i257. `used` alone says "the name appeared in a TOOL line",
+            // which is true the instant a required expert is DISPATCHED —
+            // backgrounded or not. An entry still in `backgrounded` was
+            // delegated but never waited for, so it counts as missing here
+            // too. `stillBackgroundedEntries` keeps the `EXPERT:` prefix so it
+            // can only ever match the Set it was built from; only its NAMES
+            // (`nameOf`) are for display.
+            const stillBackgroundedEntries = [...mustUse].filter((entry) => backgrounded.has(entry));
+            const trulyMissingEntries = [...mustUse].filter((entry) => !used.has(entry));
+            const missing = [...new Set([...trulyMissingEntries, ...stillBackgroundedEntries])]
+              .map(nameOf);
+            const stillBackgrounded = stillBackgroundedEntries.map(nameOf);
             // Whether the input stays open for one more turn. NOT an early
             // return out of this handler, which the obvious shape would be:
             // this is the stdout reader's `while`, and returning from it would
@@ -6520,8 +8119,24 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
               // Once per process. A model that has decided cannot be looped:
               // this is a nudge, not an argument.
               child.cawdevNudged = true;
-              const line = `cawdev: this stage has not used ${missing.join(', ')}, `
-                + 'which this project requires. Asking it once.';
+              // i257. "has not used" is not true of `stillBackgrounded` — it
+              // WAS called, just not waited for — and this line is the half
+              // of the nudge a person actually reads (`nudgeText` below goes
+              // to the child's stdin, never to the transcript). This card
+              // exists because a run once said nothing was done when work
+              // really happened; a nudge that misdescribes its own trigger
+              // would be the same mistake at smaller scale.
+              const trulyMissingNames = trulyMissingEntries.filter((entry) => !backgrounded.has(entry))
+                .map(nameOf);
+              const clauses = [
+                trulyMissingNames.length ? `has not used ${trulyMissingNames.join(', ')}` : null,
+                stillBackgrounded.length
+                  ? `delegated to ${stillBackgrounded.join(', ')} only in the background and never `
+                    + 'waited for it'
+                  : null,
+              ].filter(Boolean);
+              const line = `cawdev: this stage ${clauses.join(', and ')}, which this project `
+                + 'requires. Asking it once.';
               log(`  ${line}`);
               transcript.push({ kind: 'SYSTEM', body: line });
               // The return value is load-bearing. It is false when stdin is
@@ -6529,7 +8144,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
               // through to `endSession` is what stops a dead session from never
               // being dismissed. That is R22's forty-three minutes arriving
               // through a new door.
-              nudged = writeUserMessage(child, nudgeText(stage, missing));
+              nudged = writeUserMessage(child, nudgeText(stage, missing, stillBackgrounded));
               if (nudged) {
                 // The turn runs again and the next `result` closes the input.
                 // This timer is the whole defence against the one deadlock this
@@ -6554,6 +8169,9 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
         if (event?.type === 'system' && event.subtype === 'init' && event.session_id) {
           reportSessionId(config, run, event.session_id);
         }
+        if (event?.type === 'system' && event.subtype === 'init' && event.model) {
+          child.cawdevModel = event.model;
+        }
         // R76. What the session has consumed, recorded rather than only
         // printed. Caught here for the reason the session id is: the CLI says
         // it on a `result` event and nowhere else.
@@ -6566,10 +8184,19 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
         if (event?.type === 'result') {
           const totals = totalsOf(event);
           if (totals) {
+            childTotals = totals;
             reportUsage(config, run, {
               tokensIn: usageBase.tokensIn + totals.input,
               tokensOut: usageBase.tokensOut + totals.output,
             });
+            // R305. The same reading, filed on the stage: its own base plus
+            // this child, absolute for the stage across its attempts.
+            if (stage && usage?.stage) {
+              reportStageUsage(config, run, stage.stage, {
+                tokensIn: usage.stage.tokensIn + totals.input,
+                tokensOut: usage.stage.tokensOut + totals.output,
+              });
+            }
           }
         }
         // R113. Anything at all counts as alive.
@@ -6613,7 +8240,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
             // already being walked. See ../lib/tool-line.mjs.
             const reached = capabilityIn(recorded.body);
             if (reached) {
-              used.add(reached.key);
+              used.add(`${reached.kind}:${reached.key}`);
             }
           }
           if (stage && recorded.kind === 'TOOL') {
@@ -6645,7 +8272,12 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       prompts.stop();
       workingCopy.stop();
       await transcript.flush();
-      await finish(config, run, 'FAILED', `Could not spawn the agent: ${failure.message}`);
+      // Under a memory ceiling (`sessionScope`) the child is `systemd-run`, so a
+      // missing `claude` arrives as its exit code and never as an ENOENT here.
+      await finish(config, run, 'FAILED', spawnFailureSaid({
+        failure, command: agentCmd, cwd, slug: run.projectSlug, label: 'the agent',
+        first: config.projects[run.projectSlug]?.workspaces?.[0],
+      }));
       await rm(mcpDirectory, { recursive: true, force: true });
       clearTimeout(idleTimer);
       // A spawn that never happened has no exit code. The run is already
@@ -6700,7 +8332,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
           const summary = signal
             ? `The agent was terminated (${signal}).`
             : `The agent exited with code ${code} without reporting. ${lastText}`.trim();
-          await finish(config, run, code === 0 ? 'FINISHED' : 'FAILED', summary);
+          await finish(config, run, code === 0 ? 'FINISHED' : 'FAILED', summary, cwd);
         }
         // R112. A STAGE ending is not the RUN ending. The loop decides that —
         // it is the only thing that knows whether there is another stage — and
@@ -6746,7 +8378,928 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       // R112. A stage hands its result back so the loop can store the plan,
       // gate on it, and carry it into the next stage. A run with no lifecycle
       // resolves with nothing, exactly as it always did.
-      resolvePromise(stage ? { code, signal, text: lastText, turnEnded } : undefined);
+      resolvePromise(stage
+        ? { code, signal, text: lastText, turnEnded, usage: childTotals,
+          unfinishedShells: shells.unfinished() }
+        : undefined);
+    });
+  });
+}
+
+// --- Antigravity ('agy') ------------------------------------------------------
+
+// Serializes agy's global registry mutations — MCP servers AND, since R279,
+// installed plugins. Claude Code's --mcp-config and --plugin-dir are each a
+// file or directory this daemon writes and hands to one process; agy has no
+// per-invocation equivalent for either, only two machine-wide registries
+// (`agy mcp add/remove` and `agy plugin install/uninstall`, both under
+// ~/.gemini) shared by every agy call on this machine. Both are
+// re-registered before each spawn — the MCP token is fresh per run, and a
+// different project may have turned different experts on — and ONE lock
+// serializes both, because they are the same kind of hazard: two concurrent
+// agy spawns racing on the same machine-wide state, v1's answer to a problem
+// Claude Code's own design does not have.
+let agyRegistryLock = Promise.resolve();
+function withAgyRegistryLock(work) {
+  const next = agyRegistryLock.then(work, work);
+  agyRegistryLock = next.then(() => {}, () => {});
+  return next;
+}
+
+/** One `agy` subcommand, run to completion. Not a session — just its exit and output. */
+function runAgyCli(agyCmd, args) {
+  return new Promise((resolve) => {
+    let out = '';
+    const child = spawn(agyCmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    child.stdout.on('data', (chunk) => (out += chunk));
+    child.stderr.on('data', (chunk) => (out += chunk));
+    child.on('error', () => resolve({ code: -1, out }));
+    child.on('close', (code) => resolve({ code, out }));
+  });
+}
+
+/**
+ * What Antigravity currently has registered, read rather than asked for:
+ * `agy mcp list` has no machine-readable form, and the registry is one
+ * small JSON file at a fixed, undocumented path. Read-only, and tolerant of
+ * that path changing under a future CLI version — an empty list here costs
+ * a stale entry left behind, never a wrong removal.
+ */
+async function currentAntigravityMcpNames() {
+  try {
+    const raw = await readFile(join(homedir(), '.gemini', 'config', 'mcp_config.json'), 'utf8');
+    return Object.keys(JSON.parse(raw)?.mcpServers ?? {});
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Registers cawdev's own MCP server, this checkout's own (its `.mcp.json`),
+ * and R76's registry entries this run was handed — R278, the same three
+ * Claude Code's `--mcp-config` carries. R105's skills are NOT here: those
+ * are not servers, see `inlinedSkillsFor`. Experts are NOT here either, but
+ * for the opposite reason R278 first claimed — that card said agy "has
+ * nothing shaped like `--plugin-dir`, only its own, unrelated subagent
+ * system", and that was wrong, unverified when it was written. Checked by
+ * hand for R279: `agy plugin install <directory>` reads the very same
+ * `agents/*.md` shape, and `invoke_subagent` really does reach one — see
+ * `registerAntigravityExperts`, which does for experts what this does for
+ * servers, under the same lock.
+ *
+ * Every name but `cawdev` itself is prefixed `cawdev-server-` — on two
+ * sides of the same reason: this must never touch an MCP server Dali
+ * registered with agy himself for something unrelated, and a stale entry
+ * an EARLIER run left behind (a different project, a different registry)
+ * has to be findable by that same prefix so it can be removed before the
+ * new set goes in. Confirmed by hand that this is safe to do at all: a
+ * registered server inherits the daemon's own environment (`PATH`, `HOME`,
+ * ...) same as any spawned child, so `--env` only has to carry what a
+ * server adds on top of that — not `...process.env` the way the
+ * file-based `--mcp-config` write does.
+ */
+function registerAntigravityMcp(agyCmd, {
+  url, token, projectSlug, cwd, serverPath, repoServers, attachedServers,
+}) {
+  return withAgyRegistryLock(async () => {
+    const wanted = new Map();
+    wanted.set('cawdev', {
+      command: process.execPath,
+      args: [serverPath],
+      env: {
+        CAWDEV_URL: url, CAWDEV_TOKEN: token, CAWDEV_PROJECT: projectSlug, CAWDEV_WORKSPACE: cwd,
+      },
+    });
+    // This checkout's own `.mcp.json`.
+    for (const [name, def] of Object.entries(repoServers ?? {})) {
+      wanted.set(`cawdev-server-${name}`, {
+        command: def.command, args: def.args ?? [], env: def.env ?? {},
+      });
+    }
+    // R76's registry, via `resolveSkills` — `skill` here is what that
+    // function calls its own parameter, from a rename that came after it
+    // was written; the shape is `RunMcpServerView`, a server, not a SKILL.md.
+    for (const { skill, local } of attachedServers ?? []) {
+      wanted.set(`cawdev-server-${skill.key}`, {
+        command: skill.command, args: skill.args, env: local.env ?? {},
+      });
+    }
+
+    const stale = (await currentAntigravityMcpNames()).filter((name) => (
+      name === 'cawdev' || name.startsWith('cawdev-server-')
+    ) && !wanted.has(name));
+    for (const name of stale) {
+      await runAgyCli(agyCmd, ['mcp', 'remove', name]);
+    }
+
+    let ok = true;
+    for (const [name, def] of wanted) {
+      // Removed first — agy mcp add UPDATES an existing name in place, but
+      // a run's token changes every time and "updates" is exactly the kind
+      // of word worth not trusting without having watched it happen.
+      await runAgyCli(agyCmd, ['mcp', 'remove', name]);
+      // Flags before <name> or agy silently absorbs them into the spawned
+      // command's own argv instead of its env — confirmed by hand: the same
+      // --env flags placed after the name landed in mcp_config.json's
+      // `args`, never in an `env` object. `agy mcp add --help`'s own note
+      // ("Flags must come before <name>") says this; it just doesn't reject
+      // the wrong order, it mis-files it.
+      const envArgs = Object.entries(def.env).flatMap(([key, value]) => ['--env', `${key}=${value}`]);
+      const added = await runAgyCli(agyCmd,
+        ['mcp', 'add', ...envArgs, name, def.command, ...def.args]);
+      if (added.code !== 0) {
+        ok = false;
+      }
+    }
+    return ok;
+  });
+}
+
+/**
+ * What Antigravity currently has installed, read the same way
+ * `currentAntigravityMcpNames` reads its registrations: `agy plugin list`
+ * has no machine-readable form either, and `import_manifest.json` is the
+ * file it renders from (confirmed by hand: installing and listing a probe
+ * plugin round-tripped through exactly this file). Tolerant of the same
+ * failure for the same reason — an empty list here costs a stale plugin
+ * left behind, never a wrong uninstall.
+ */
+async function currentAntigravityPluginNames() {
+  try {
+    const raw = await readFile(join(homedir(), '.gemini', 'config', 'import_manifest.json'), 'utf8');
+    const imports = JSON.parse(raw)?.imports;
+    return Array.isArray(imports) ? imports.map((each) => each.name).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Installs this run's experts as an Antigravity plugin — R279, doing for
+ * `agents/*.md` what `registerAntigravityMcp` does for servers, and under
+ * the SAME lock: `agy plugin install` is machine-wide state exactly like
+ * `agy mcp add` is, one project's experts at a time on this machine.
+ *
+ * <p>Always removes whatever `ANTIGRAVITY_EXPERTS_PLUGIN` currently holds
+ * first — never trusting `agy plugin install` to update a name in place,
+ * the same caution `registerAntigravityMcp` already takes with `agy mcp
+ * add`, unverified here and not worth finding out the hard way — then
+ * installs fresh only when this run was handed experts at all. Takes
+ * `stageExperts`, never raw `expertAgents`: R147's read-only-stage
+ * narrowing has to hold for Antigravity exactly as it does for Claude Code,
+ * and the caller is where that narrowing already happened.
+ *
+ * <p>Failing to install is NOT failed the way a failed MCP registration is
+ * — an expert is optional delegation, not plumbing a report/ask_user call
+ * depends on, so the caller logs it and carries on without one rather than
+ * failing the run.
+ */
+function registerAntigravityExperts(agyCmd, { expertAgents }) {
+  return withAgyRegistryLock(async () => {
+    const stale = (await currentAntigravityPluginNames())
+      .filter((name) => name === ANTIGRAVITY_EXPERTS_PLUGIN);
+    for (const name of stale) {
+      await runAgyCli(agyCmd, ['plugin', 'uninstall', name]);
+    }
+    if (!expertAgents.length) {
+      return true;
+    }
+    const pluginDir = await mkdtemp(join(tmpdir(), 'cawdev-agy-experts-'));
+    try {
+      const root = await writeAntigravityExpertsPlugin(pluginDir, expertAgents);
+      const installed = await runAgyCli(agyCmd, ['plugin', 'install', root]);
+      return installed.code === 0;
+    } finally {
+      await rm(pluginDir, { recursive: true, force: true });
+    }
+  });
+}
+
+/**
+ * The prompt's half of R279 — telling the session which experts it has and
+ * how to reach one, the way `harnessPrompt`'s own experts section does for
+ * Claude Code. NOT folded into `harnessPrompt` itself: that function's
+ * wording ("delegate with the `Agent` tool, `subagent_type` exactly as
+ * written") names a Claude Code tool, and agy's is `invoke_subagent` — the
+ * same split `inlinedSkillsFor` already makes for skills, for the same
+ * reason.
+ *
+ * <p>`experts` here must already be `stageExperts` — narrowed for a
+ * read-only stage — and, when nothing was installed for this run
+ * (`registerAntigravityExperts` failed, or there was nothing to install),
+ * an empty list: advertising an expert the plugin step could not actually
+ * install would tell the session it can reach something it cannot.
+ */
+function expertsBlockFor(experts, cannotDelegate) {
+  const list = Array.isArray(experts) ? experts : [];
+  if (!list.length) {
+    return cannotDelegate?.length ? `\n\n## Experts\n\n${cannotDelegate.join(' ')}` : '';
+  }
+  const must = list.filter((each) => each.mode === 'REQUIRED');
+  const may = list.filter((each) => each.mode !== 'REQUIRED');
+  const entry = (each) => `- **${each.key}** — ${each.description ?? each.name ?? each.key}`;
+  const section = (heading, rows) => rows.length
+    ? `## ${heading}\n\n${rows.map(entry).join('\n')}`
+    : '';
+  return '\n\n' + [
+    section('Experts you MUST use — delegate with `invoke_subagent`, naming it exactly as '
+      + 'written below, before this stage is finished', must),
+    section("Experts — delegate with `invoke_subagent` whenever one's description fits the "
+      + 'step you are on', may),
+  ].filter(Boolean).join('\n\n');
+}
+
+/**
+ * R105's skills, whole, for a CLI with no `Skill` tool to fetch one lazily.
+ *
+ * <p>Claude Code sees a name and a description in its harness prompt and
+ * loads the `body` — the actual SKILL.md instructions — only if the model
+ * invokes it, through a plugin directory this agent has no equivalent way
+ * to be handed. There is nothing to invoke here, so the body is INLINED
+ * up front instead: every skill this run was handed, whether or not the
+ * model ends up needing it. Larger prompt, no lazy loading — the honest
+ * trade for a CLI with no mechanism to defer it.
+ */
+function inlinedSkillsFor(skills) {
+  const list = Array.isArray(skills) ? skills : [];
+  if (!list.length) {
+    return '';
+  }
+  const must = list.filter((each) => each.mode === 'REQUIRED');
+  const may = list.filter((each) => each.mode !== 'REQUIRED');
+  const entry = (each) => `### ${each.name ?? each.key}\n\n${each.description ?? ''}\n\n${each.body ?? ''}`
+    .trim();
+  const section = (heading, rows) => rows.length
+    ? `## ${heading}\n\n${rows.map(entry).join('\n\n')}`
+    : '';
+  return '\n\n' + [
+    section('Skills you MUST use — this project requires each of these; use one before this '
+      + 'stage is finished', must),
+    section('Skills — use one when its description fits the work', may),
+  ].filter(Boolean).join('\n\n');
+}
+
+/**
+ * Antigravity's shape — one-shot per turn, not a long-lived process.
+ *
+ * Checked against the real CLI by hand rather than guessed at: no
+ * `--mcp-config` (`flags provided but not defined`), no `--allowedTools` (no
+ * per-tool allow-list exists at all), no `--resume <id>` (`--conversation
+ * <id>` instead). `--mode plan` denies MCP tool calls outright — including
+ * calls to cawdev's own `report`/`ask_user` — so even a read-only run needs
+ * `--dangerously-skip-permissions` just to talk to the platform. There is no
+ * narrower option on this CLI today.
+ *
+ * So: this refuses to run at all unless the machine has granted "everything"
+ * — R126, the same switch Claude Code's `bypassPermissions` already stands
+ * behind — and every call that does run gets `--dangerously-skip-permissions`
+ * unconditionally, coding or not. No per-project tool-rule narrowing, and no
+ * live mid-run prompting (R22's "keep stdin open" assumes a process that
+ * stays up between turns; agy's `-p` exits after one). A STAGE is already
+ * one process per R112, so stages fit this shape without changing it — a
+ * follow-up typed into a RUNNING session does not reach it yet, and that gap
+ * is not silently papered over: `sendPrompt` still only writes to a live
+ * child's stdin, which this never opens.
+ *
+ * R278: this checkout's own MCP servers and R76's registry ARE reached now,
+ * the way `registerAntigravityMcp` describes, and R105's skills are
+ * inlined whole (`inlinedSkillsFor`) rather than reached at all — there is
+ * nothing on this CLI shaped like Claude Code's `Skill` tool to fetch one
+ * lazily.
+ *
+ * R279: expert agents ARE reached too, now — R278's claim that agy "has
+ * nothing shaped like `--plugin-dir`" was wrong, and unverified when it was
+ * written. `agy plugin install <directory>` reads the same `agents/*.md`
+ * shape Claude Code's plugin does; `registerAntigravityExperts` installs
+ * this run's `stageExperts` under it, and `invoke_subagent` is the real
+ * tool a session delegates through — confirmed end-to-end by hand, a probe
+ * agent installed, invoked by name, and its answer returned correctly.
+ */
+/** This machine, as a refusal names it: what it is called, where its config and console are. */
+function thisMachine(config) {
+  return {
+    name: config.name,
+    acceptsConsoleRules: config.acceptsRulesFromConsole === true,
+    configPath: config.configPath ?? null,
+    consoleUrl: config.url,
+  };
+}
+
+/**
+ * A refusal said on the run's own transcript, where the terminal and the run
+ * page show it — the run's summary alone left a window reading "failed" and
+ * nothing else, with the reason one page away.
+ */
+async function sayOnTheRun(config, run, text) {
+  await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/output`, {
+    method: 'POST',
+    body: { lines: text.split('\n').filter((body) => body.trim()).map((body) => ({ kind: 'ERROR', body })) },
+  }).catch((failure) => log(`  could not say it on the run: ${failure.message}`));
+}
+
+async function spawnAntigravity(config, run, runToken, cwd, baseCommit, resume, projectServers,
+    skills, stageExperts, cannotDelegate, instincts, briefing, plan, lifecycle, stage, carried,
+    agyCmd, granted, usage = null) {
+  if (!granted.everything) {
+    // Antigravity needs it even to read: no per-tool allow-list exists on it.
+    const summary = needsEverything('agy', thisMachine(config), run, { readsWithout: false });
+    log(`  refusing to spawn Antigravity: ${summary.split('\n')[0]}`);
+    await sayOnTheRun(config, run, summary);
+    await finish(config, run, 'FAILED', summary);
+    return stage ? { code: -1, signal: null, text: summary, turnEnded: false } : undefined;
+  }
+
+  // Created here rather than down with the spawn — the notes below (what
+  // attached, what a project asked for that this machine refused, what an
+  // index build said) belong on the run the moment they are known, same as
+  // Claude Code's path: a person watching should not have to wait for the
+  // one-shot call to finish before finding out something never loaded.
+  const transcript = new Transcript(config, run);
+
+  // Two DIFFERENT things cawdev calls capabilities, reached two different
+  // ways even for Claude Code — R278 gives Antigravity both, each the way
+  // its own shape allows:
+  //
+  // `projectServers` (R76's registry, `claimed.mcpServers` — the parameter
+  // is misleadingly named after an old rename, not this checkout's own
+  // `.mcp.json`) and `repoServers` (that actual file, read fresh) are both
+  // real MCP SERVERS — a command line cawdev already knows how to run.
+  // `resolveSkills` (despite its name — R76 called these "skills" before
+  // R105 split the word) turns the registry half into the same shape.
+  // Both go through `registerAntigravityMcp`, the same way cawdev's own
+  // server does.
+  //
+  // `skills` (R105, `claimed.skills`) is NOT a server at all — it is a
+  // SKILL.md's `body`, markdown Claude Code loads lazily through its own
+  // `Skill` tool when the model invokes it by name, bundled into a plugin
+  // directory this agent has no equivalent way to be handed
+  // (`--plugin-dir`, same gap experts have). There is nothing to invoke
+  // here to fetch it later, so it is not offered as something reachable —
+  // it is INLINED below, in full, up front.
+  const serverPath = config.mcpServerPath ?? new URL('../mcp/server.mjs', import.meta.url).pathname;
+  const repoServers = await projectMcpServers(cwd);
+  const { attached: attachedServers, notes: serverNotes } =
+    await resolveSkills(config, run, cwd, baseCommit, projectServers);
+  if (attachedServers.length) {
+    log(`  loading ${attachedServers.length} MCP server(s)`);
+  }
+  for (const line of serverNotes) {
+    log(`  ${line}`);
+    transcript.push({ kind: 'SYSTEM', body: line });
+  }
+  const registered = await registerAntigravityMcp(agyCmd, {
+    url: config.url, token: runToken, projectSlug: run.projectSlug, cwd, serverPath,
+    repoServers, attachedServers,
+  });
+  if (!registered) {
+    const summary = 'Could not register this session\'s MCP servers with Antigravity (`agy mcp '
+      + 'add` failed) — without cawdev\'s own this session cannot report, ask a question, or '
+      + 'read the roadmap.';
+    log(`  ${summary}`);
+    await finish(config, run, 'FAILED', summary);
+    return stage ? { code: -1, signal: null, text: summary, turnEnded: false } : undefined;
+  }
+
+  // R279. Unlike the MCP registration above, a failed expert install does
+  // NOT fail the run — an expert is optional delegation, not the plumbing a
+  // report/ask_user call depends on. `usableExperts` drops to empty so the
+  // prompt below never advertises an expert that was not actually
+  // installed; `stageExperts` itself already carries R147's read-only-stage
+  // narrowing from the caller.
+  if (stageExperts.length) {
+    log(`  loading ${stageExperts.length} expert(s)`);
+  }
+  const expertsRegistered = await registerAntigravityExperts(agyCmd, { expertAgents: stageExperts });
+  if (!expertsRegistered && stageExperts.length) {
+    const note = 'Could not install this project\'s experts into Antigravity (`agy plugin '
+      + 'install` failed) — continuing without delegation.';
+    log(`  ${note}`);
+    transcript.push({ kind: 'SYSTEM', body: note });
+  }
+  const usableExperts = expertsRegistered ? stageExperts : [];
+
+  // Same assembly as Claude Code's — promptFor, harnessPrompt, stagePrompt
+  // are all agent-agnostic. Both experts and skills are kept OUT of
+  // harnessPrompt's own `experts`/`skills` params and handled entirely
+  // below instead — its wording ("the `Agent` tool", "the `Skill` tool")
+  // names tools this CLI does not have. `expertsBlockFor` and
+  // `inlinedSkillsFor` are agy's own wording for the same two ideas.
+  const harness = harnessPrompt({
+    instincts, briefing, experts: [], skills: [], plan, lifecycle,
+    repoConfig: await readRepoConfig(cwd),
+  });
+  const skillsBlock = inlinedSkillsFor(skills);
+  const expertsBlock = expertsBlockFor(usableExperts, cannotDelegate);
+  const resuming = Boolean(resume?.agentSessionId);
+  const promptText = resuming
+    ? resume.prompt
+    : (promptFor(run) + harness + skillsBlock + expertsBlock
+      + (stage ? stagePrompt(stage, carried, Boolean(plan?.body)) : ''));
+
+  const args = ['-p', promptText, '--output-format', 'stream-json', '--dangerously-skip-permissions'];
+  if (run.model) {
+    args.push('--model', run.model);
+  }
+  if (resuming) {
+    args.push('--conversation', resume.agentSessionId);
+  }
+
+  log(`  spawning: ${agyCmd} -p <prompt omitted, ${promptText.length} chars> --output-format `
+    + `stream-json --dangerously-skip-permissions${resuming ? ` --conversation ${resume.agentSessionId}` : ''}`);
+
+  // The same live view Claude Code gets — none of this existed before, and a
+  // run that writes nothing here is a run the console and the CLI's attach
+  // both draw as a black box until the one-shot call finally returns.
+  // Confirmed by hand against the real CLI: `--output-format stream-json`
+  // gives `init` (once, carries the conversation id), `step_update` (an
+  // `agent_response` step's `text_delta` is an INCREMENTAL chunk to append,
+  // not the text so far; a `tool` step is ACTIVE with the call and DONE with
+  // `tool_info.output`), and one final `result` — the same shape
+  // `--output-format json` returns whole, just arriving a piece at a time.
+
+  return new Promise((resolvePromise) => {
+    let result = null;
+    // R76 / R305: what the run had already used before this process, and what
+    // this process itself reported — see the same pair on the Claude Code path.
+    const usageBase = usage?.run ?? {
+      tokensIn: Number(run.tokensIn) || 0,
+      tokensOut: Number(run.tokensOut) || 0,
+    };
+    let childTotals = null;
+    let err = '';
+    let buffer = '';
+    const child = spawnScoped(config, agyCmd, args, {
+      cwd,
+      // Its own process group — see the same choice on the Claude Code path.
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.cawdevProjectSlug = run.projectSlug;
+    child.cawdevAgent = 'agy';
+    child.cawdevModel = run.model ?? null;
+    // The existing cancellation sweep (`reapCancelled`) reads this map by
+    // run id and SIGTERMs whatever is in it — true for any child, so a
+    // cancelled Antigravity run stops exactly the way a cancelled Claude
+    // Code one does, with no code of its own.
+    running.set(run.id, child);
+
+    // What the console can see of the checkout, and the commits as they land —
+    // the same watcher as the Claude Code path. Without it the platform never
+    // hears of this run's commits, so the finish rules (R40) see a run that
+    // wrote nothing and queue no push and no pull request.
+    const workingCopy = watchWorkingCopy(config, run, cwd, baseCommit);
+
+    // stream-json arrives in chunks that split mid-line, same as Claude
+    // Code's — buffer until a full line rather than assuming one chunk is
+    // one event.
+    child.stdout.on('data', (chunk) => {
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (!line.trim()) continue;
+        let event;
+        try {
+          event = JSON.parse(line);
+        } catch {
+          // A stray non-protocol line on stdout — shown rather than dropped,
+          // the same call `linesOf` makes for Claude Code's unparseable ones.
+          transcript.push({ kind: 'SYSTEM', body: line.slice(0, 4000) });
+          continue;
+        }
+        if (event.event === 'init') {
+          if (event.conversation_id) {
+            reportSessionId(config, run, event.conversation_id);
+          }
+          transcript.push({
+            kind: 'SYSTEM',
+            body: `session ${short(event.conversation_id)} started`
+              + (run.model ? ` on ${run.model}` : ''),
+          });
+        } else if (event.event === 'step_update') {
+          const step = event.step_update ?? {};
+          if (step.step_type === 'agent_response' && step.text_delta) {
+            transcript.push({ kind: 'ASSISTANT', body: step.text_delta });
+          } else if (step.step_type === 'tool' && step.state === 'ACTIVE') {
+            transcript.push({
+              kind: 'TOOL',
+              body: `${step.tool_name}(${JSON.stringify(step.tool_info?.parameters ?? {})})`,
+            });
+          } else if (step.step_type === 'tool' && step.state === 'DONE') {
+            transcript.push({
+              kind: 'TOOL_RESULT',
+              body: String(step.tool_info?.output ?? '(no output)').slice(0, 4000),
+            });
+          } else if (step.step_type === 'subagent' && step.state === 'ACTIVE') {
+            // R279. Delegation is its OWN step_type, `subagent` — confirmed
+            // by hand it is not `tool`, which is why this needed its own
+            // branch rather than falling into the one above by accident.
+            // No `tool_info` here, only `subagent_info.subagents[]`; the
+            // sub-conversation's own transcript is a local file this
+            // process never reads, so the parent's own narration (an
+            // ordinary `agent_response`) is what carries the answer back to
+            // this transcript, same as it already did in the run that
+            // proved this end to end.
+            const who = (step.subagent_info?.subagents ?? [])
+              .map((each) => each.type_name).filter(Boolean).join(', ') || 'a subagent';
+            const prompt = step.subagent_info?.subagents?.[0]?.initial_prompt ?? '';
+            transcript.push({ kind: 'TOOL', body: `invoke_subagent(${who}): ${prompt}` });
+          } else if (step.step_type === 'subagent' && step.state === 'DONE') {
+            const who = (step.subagent_info?.subagents ?? [])
+              .map((each) => each.type_name).filter(Boolean).join(', ') || 'a subagent';
+            transcript.push({ kind: 'TOOL_RESULT', body: `${who} finished` });
+          }
+          // user_input steps carry no text of their own — the prompt is
+          // already shown as "What it was asked", from run.openingPrompt.
+        } else if (event.event === 'result') {
+          result = event.result;
+          if (result?.usage) {
+            // R305. On the same base as the Claude Code path: what the run had
+            // already used before this process. Reported with no base until
+            // now, so a resume or a second stage here counted from zero.
+            childTotals = {
+              input: Number(result.usage.input_tokens) || 0,
+              output: Number(result.usage.output_tokens) || 0,
+            };
+            reportUsage(config, run, {
+              tokensIn: usageBase.tokensIn + childTotals.input,
+              tokensOut: usageBase.tokensOut + childTotals.output,
+            });
+            if (stage && usage?.stage) {
+              reportStageUsage(config, run, stage.stage, {
+                tokensIn: usage.stage.tokensIn + childTotals.input,
+                tokensOut: usage.stage.tokensOut + childTotals.output,
+              });
+            }
+          }
+        }
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      const text = String(chunk).trim();
+      if (text) {
+        log(`  agent stderr: ${text.slice(0, 400)}`);
+      }
+      err += chunk;
+    });
+
+    child.on('error', async (failure) => {
+      workingCopy.stop();
+      running.delete(run.id);
+      const summary = spawnFailureSaid({
+        failure, command: agyCmd, cwd, slug: run.projectSlug, label: 'Antigravity',
+        first: config.projects[run.projectSlug]?.workspaces?.[0],
+      });
+      await transcript.flush();
+      await finish(config, run, 'FAILED', summary);
+      resolvePromise(
+        stage ? { code: -1, signal: null, text: summary, turnEnded: false } : undefined);
+    });
+
+    child.on('close', async (code) => {
+      workingCopy.stop();
+      running.delete(run.id);
+      await transcript.flush();
+      const text = result?.response
+        || (result?.denied_actions?.length
+          ? `Antigravity denied an action it needed and stopped: `
+            + result.denied_actions.map((each) => each.display_name ?? each.action).join(', ')
+          : null)
+        || err.trim() || 'Antigravity produced no output.';
+      // Whether the CLI ever gave back a parseable turn — this agent has no
+      // separate "the turn ended" signal the way Claude Code's stream does;
+      // getting the `result` event at all IS the turn ending, one way or
+      // the other.
+      const turnEnded = Boolean(result);
+
+      // The agent normally ends the run itself with report(done|blocked),
+      // through the same cawdev MCP server Claude Code calls — this only
+      // catches a call that produced nothing report could act on.
+      const current = await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}`)
+        .catch(() => null);
+      if (current?.live && !stage) {
+        await finish(config, run, code === 0 && result?.status === 'SUCCESS' ? 'FINISHED' : 'FAILED',
+          text, cwd);
+      }
+      // R112: not between stages — see the same line on the Claude Code path.
+      if (!stage) {
+        await settleActions(config, run, cwd);
+      }
+      // The last reading, as on the Claude Code path: after the agent has
+      // stopped and after anything the rules did.
+      await reportCommits(config, run, cwd, baseCommit);
+
+      resolvePromise(stage
+        ? { code, signal: null, text, turnEnded, usage: childTotals }
+        : undefined);
+    });
+  });
+}
+
+/**
+ * The cawdev tools a Codex process may call — the SAME list Claude Code's
+ * `--allowedTools` would hold for this run and stage, without the prefix.
+ *
+ * <p>`enabled_tools` on cawdev's server is the one narrowing this CLI does as
+ * precisely as Claude Code: a tool left out is not offered at all (checked by
+ * hand). So the list is derived from `PROFILE_TOOLS` and `toolsForStage`
+ * rather than chosen here — a second place deciding what a profile may do is
+ * how the two agents would drift. Above all, `toolsForStage` takes `report`
+ * away from every STAGE, whose "done" would end the run in the middle of the
+ * walk.
+ *
+ * <p>Null — every tool the server has — only for a coding run with no
+ * lifecycle, which can only be spawned where the machine allowed everything.
+ */
+function codexCawdevTools(run, stage, mayWrite) {
+  const profile = PROFILE_TOOLS[run.profile];
+  const profileList = profile ? (typeof profile === 'function' ? profile(run) : profile) : null;
+  if (stage) {
+    return cawdevToolNames(toolsForStage(stage.stage, profileList ?? CAWDEV_TOOLS, stage.testMode,
+      { writesItsOwnCard: writesItsOwnCard(run) }));
+  }
+  if (profileList) {
+    return cawdevToolNames(profileList);
+  }
+  return mayWrite ? null : cawdevToolNames(READ_ONLY_CAWDEV);
+}
+
+/**
+ * OpenAI's Codex CLI — one `codex exec` per turn, like Antigravity, and the
+ * command line, the stream and every flag's behaviour are `../lib/codex.mjs`,
+ * checked against the real CLI.
+ *
+ * <p>What it has that Antigravity lacks is a SANDBOX the operating system
+ * enforces, and that decides the permission question:
+ *
+ * <ul>
+ * <li>A session that must change nothing — every profile but the coding
+ *   ones, and PLAN, VERIFY and MEMORY of any run — is spawned with
+ *   `--sandbox read-only`. Its shell can read and cannot write, and it does
+ *   not need the machine to have allowed anything: "cannot" is the kernel's
+ *   word here, not the prompt's. Only cawdev's server is attached, narrowed
+ *   to the profile's list by `codexCawdevTools`.
+ * <li>A session that writes — CODE, INTERVIEW, MERGE, RELEASE, and their
+ *   IMPLEMENT and TEST — has to commit and push, which the workspace sandbox
+ *   refuses (`.git` and the network are outside it). There is no allow-list
+ *   for the shell on this CLI, so it runs with the sandbox bypassed, and
+ *   ONLY where the machine allowed everything (R126) — Antigravity's rule.
+ * </ul>
+ *
+ * <p>Not reached: experts (nothing on this CLI loads cawdev's `agents/*.md`,
+ * so the session is told it cannot delegate rather than shown names it cannot
+ * call), R51's permission prompt and R110's command shield (both live in
+ * `approve`, which Codex never calls) and R22's live prompting (the process
+ * ends with its turn; a follow-up is a resume). Skills are inlined whole, as
+ * for Antigravity. The transcript half of R110 — secrets taken out of a tool
+ * result — does apply, since it runs here and not in the CLI.
+ */
+async function spawnCodex(config, run, runToken, cwd, baseCommit, resume, projectServers,
+    skills, stageExperts, readOnlyStage, instincts, briefing, plan, lifecycle, stage, carried,
+    codexCmd, granted, shield, usage = null) {
+  const failedBeforeSpawn = async (summary) => {
+    log(`  ${summary.split('\n')[0]}`);
+    await sayOnTheRun(config, run, summary);
+    await finish(config, run, 'FAILED', summary);
+    return stage ? { code: -1, signal: null, text: summary, turnEnded: false } : undefined;
+  };
+
+  const mayWrite = writesCodeProfile(run) && !readOnlyStage;
+  if (mayWrite && !granted.everything) {
+    // It must commit and push, which its sandbox refuses, and there is no
+    // allow-list for its shell — so everything, or nothing. Read-only runs
+    // and stages need nothing.
+    return failedBeforeSpawn(needsEverything('codex', thisMachine(config), run));
+  }
+  if (mayWrite) {
+    log('  !! this machine allows EVERYTHING: this Codex session runs without a sandbox');
+  }
+
+  const transcript = new Transcript(config, run);
+  const serverPath = config.mcpServerPath ?? new URL('../mcp/server.mjs', import.meta.url).pathname;
+
+  // The token reaches cawdev's server through `env_vars` — from Codex's own
+  // environment, never its command line — and is blanked for the shell.
+  const cawdevEnv = { CAWDEV_URL: config.url, CAWDEV_TOKEN: runToken, CAWDEV_PROJECT: run.projectSlug };
+  const childEnv = { ...process.env, ...cawdevEnv };
+
+  // By name, so a later server replaces an earlier one whole — the ordering
+  // argument of the Claude Code path: the repository's own first, then R76's
+  // registry, then cawdev's LAST, so nothing can shadow it and take its token.
+  const servers = new Map();
+  if (mayWrite) {
+    for (const [name, server] of Object.entries(await projectMcpServers(cwd))) {
+      if (!server?.command) {
+        transcript.push({ kind: 'SYSTEM',
+          body: `The project's MCP server "${name}" is not a command, and Codex is handed commands only — skipped.` });
+        continue;
+      }
+      servers.set(name, { name, command: server.command, args: server.args, env: server.env });
+    }
+    const { attached, notes } = await resolveSkills(config, run, cwd, baseCommit, projectServers);
+    for (const line of notes) {
+      log(`  ${line}`);
+      transcript.push({ kind: 'SYSTEM', body: line });
+    }
+    for (const { skill, local } of attached) {
+      Object.assign(childEnv, local.env ?? {});
+      servers.set(skill.serverName, {
+        name: skill.serverName, command: skill.command, args: skill.args,
+        envVars: Object.keys(local.env ?? {}),
+      });
+    }
+  }
+  servers.set('cawdev', {
+    name: 'cawdev',
+    command: process.execPath,
+    args: [serverPath],
+    envVars: Object.keys(cawdevEnv),
+    enabledTools: codexCawdevTools(run, stage, mayWrite),
+    // Codex cuts an MCP call off after 60 s unless told otherwise, and
+    // `ask_user` waits up to ten minutes for a person: a question asked from
+    // Codex died before anybody could answer it, so it did not ask — it
+    // stopped. Longer than ask_user's own wait (mcp/server.mjs), so the
+    // question is answered or handed back as pending, never cut off.
+    toolTimeoutSec: CAWDEV_TOOL_TIMEOUT_SEC,
+  });
+
+  const cannotDelegate = stageExperts.length
+    ? ["This project has experts, and Codex has no way to be handed them: nothing on this CLI "
+      + "loads cawdev's expert agents. Do the work yourself; they are reached from Claude Code "
+      + 'and Antigravity runs.']
+    : undefined;
+  if (cannotDelegate) {
+    transcript.push({ kind: 'SYSTEM', body: cannotDelegate[0] });
+  }
+
+  const resuming = Boolean(resume?.agentSessionId);
+  const promptText = resuming
+    ? (resume.prompt ?? '')
+    : (promptFor(run)
+      + harnessPrompt({
+        instincts, briefing, experts: [], skills: [], plan, lifecycle,
+        repoConfig: await readRepoConfig(cwd),
+      })
+      + inlinedSkillsFor(skills)
+      + expertsBlockFor([], cannotDelegate)
+      + (stage ? stagePrompt(stage, carried, Boolean(plan?.body)) : ''));
+
+  const model = stage?.model ?? run.model;
+  const args = codexArgs({
+    model,
+    effort: run.effort,
+    sandbox: mayWrite ? 'bypass' : 'read-only',
+    resumeId: resuming ? resume.agentSessionId : null,
+    servers: [...servers.values()],
+    hideFromShell: Object.keys(cawdevEnv),
+  });
+  log(`  spawning: ${codexCmd} ${args.join(' ')} <prompt on stdin, ${promptText.length} chars>`);
+
+  return new Promise((resolvePromise) => {
+    // R76 / R305: what the run had already used before this process — see the
+    // same pair on the Claude Code path.
+    const usageBase = usage?.run ?? {
+      tokensIn: Number(run.tokensIn) || 0,
+      tokensOut: Number(run.tokensOut) || 0,
+    };
+    let childTotals = null;
+    let ended = false;
+    let failed = null;
+    let lastError = null;
+    let lastSaid = null;
+    let err = '';
+    let buffer = '';
+    const child = spawnScoped(config, codexCmd, args, {
+      cwd,
+      // Its own process group — see the same choice on the Claude Code path.
+      detached: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: childEnv,
+    });
+    child.cawdevProjectSlug = run.projectSlug;
+    child.cawdevAgent = 'codex';
+    child.cawdevModel = model ?? null;
+    // `reapCancelled` SIGTERMs whatever is here, whichever CLI it is.
+    running.set(run.id, child);
+
+    // What the console can see of the checkout, and the commits as they land —
+    // the same watcher as the Claude Code path. Without it the platform never
+    // hears of this run's commits, so the finish rules (R40) see a run that
+    // wrote nothing and queue no push and no pull request.
+    const workingCopy = watchWorkingCopy(config, run, cwd, baseCommit);
+
+    child.stdin.on('error', () => {
+      // A CLI that died before reading its prompt says why on stderr.
+    });
+    child.stdin.end(promptText);
+
+    child.stdout.on('data', (chunk) => {
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (!line.trim()) continue;
+        let event;
+        try {
+          event = JSON.parse(line);
+        } catch {
+          transcript.push({ kind: 'SYSTEM', body: line.slice(0, 4000) });
+          continue;
+        }
+        const read = translateCodexEvent(event);
+        if (read.sessionId) {
+          reportSessionId(config, run, read.sessionId);
+          transcript.push({
+            kind: 'SYSTEM',
+            body: `session ${short(read.sessionId)} started${model ? ` on ${model}` : ''}`
+              + (mayWrite ? '' : ' (read-only sandbox)'),
+          });
+        }
+        for (const recorded of read.lines) {
+          // R110's transcript half, as on the Claude Code path: a credential
+          // that came back from a command is replaced before it is stored.
+          if (shield?.blockSecrets !== false && recorded.kind === 'TOOL_RESULT') {
+            const found = findSecret(recorded.body);
+            if (found) {
+              recorded.body = `[cawdev removed ${found.name} from this result] ${found.redacted}`;
+              api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/blocks`, {
+                method: 'POST',
+                body: { kind: 'SECRET', detail: `${found.name}: ${found.redacted}` },
+              }).catch(() => {});
+            }
+          }
+          if (recorded.kind === 'ASSISTANT') {
+            lastSaid = recorded.body;
+          }
+          transcript.push(recorded);
+        }
+        if (read.error) {
+          lastError = read.error;
+        }
+        if (read.failed) {
+          failed = read.failed;
+        }
+        if (read.ended) {
+          ended = true;
+          childTotals = read.usage;
+          reportUsage(config, run, {
+            tokensIn: usageBase.tokensIn + childTotals.input,
+            tokensOut: usageBase.tokensOut + childTotals.output,
+          });
+          if (stage && usage?.stage) {
+            reportStageUsage(config, run, stage.stage, {
+              tokensIn: usage.stage.tokensIn + childTotals.input,
+              tokensOut: usage.stage.tokensOut + childTotals.output,
+            });
+          }
+        }
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      const text = String(chunk).trim();
+      if (text) {
+        log(`  agent stderr: ${text.slice(0, 400)}`);
+      }
+      err += chunk;
+    });
+
+    child.on('error', async (failure) => {
+      workingCopy.stop();
+      running.delete(run.id);
+      const summary = spawnFailureSaid({
+        failure, command: codexCmd, cwd, slug: run.projectSlug, label: 'Codex',
+        first: config.projects[run.projectSlug]?.workspaces?.[0],
+      });
+      await transcript.flush();
+      await finish(config, run, 'FAILED', summary);
+      resolvePromise(stage ? { code: -1, signal: null, text: summary, turnEnded: false } : undefined);
+    });
+
+    child.on('close', async (code) => {
+      workingCopy.stop();
+      running.delete(run.id);
+      await transcript.flush();
+      const text = failed ?? lastSaid ?? lastError ?? (err.trim() || 'Codex produced no output.');
+      // The agent normally ends the run itself with report(done|blocked); this
+      // only catches a turn that produced nothing report could act on.
+      const current = await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}`)
+        .catch(() => null);
+      if (current?.live && !stage) {
+        await finish(config, run, code === 0 && ended && !failed ? 'FINISHED' : 'FAILED', text, cwd);
+      }
+      // R112: not between stages — see the same line on the Claude Code path.
+      if (!stage) {
+        await settleActions(config, run, cwd);
+      }
+      // The last reading, as on the Claude Code path: after the agent has
+      // stopped and after anything the rules did.
+      await reportCommits(config, run, cwd, baseCommit);
+
+      resolvePromise(stage
+        ? { code, signal: null, text, turnEnded: ended && !failed, usage: childTotals }
+        : undefined);
     });
   });
 }
@@ -6780,7 +9333,45 @@ function reportUsage(config, run, totals) {
   }).catch((failure) => log(`  could not record what the session used: ${failure.message}`));
 }
 
-async function finish(config, run, state, summary) {
+/**
+ * The same reading, for one STAGE — R305. Absolute for the stage across its
+ * attempts, fire and forget for the reason `reportUsage` is, and the platform
+ * keeps the largest reading here too.
+ */
+function reportStageUsage(config, run, stageName, totals) {
+  api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/stages/${stageName}/usage`, {
+    method: 'POST',
+    body: totals,
+  }).catch((failure) =>
+    log(`  could not record what the ${stageName} stage used: ${failure.message}`));
+}
+
+/**
+ * Ends a run on the platform.
+ *
+ * R345: a coding run reaches FINISHED only committed and pushed. Given the
+ * checkout, a FINISHED for a profile that commits its work settles the branch
+ * first — commits what the session left (unless it looks like a credential),
+ * pushes without force — and becomes FAILED, with the reason in the summary
+ * and the checkout held for Carry on (R80), when that cannot be done. Before
+ * this, R325's run finished with a file modified and nothing pushed, and the
+ * next run in that checkout refused to start on top of it.
+ */
+async function finish(config, run, state, summary, cwd = null) {
+  if (state === 'FINISHED' && cwd && run.branch && COMMITS_ITS_WORK.has(run.profile)) {
+    const settled = await settleBranch(cwd, run.branch, {
+      push: pushBranch,
+      label: run.entryRef ?? 'cawdev',
+    }).catch((failure) => ({ ok: false, reason: `Checking the branch failed: ${failure.message}` }));
+    if (!settled.ok) {
+      log(`  not finished: ${settled.reason}`);
+      state = 'FAILED';
+      summary = `${settled.reason}\n\n${summary ?? ''}`.trim();
+    } else if (settled.note) {
+      log(`  ${settled.note}`);
+      summary = `${summary ?? ''}\n\n${settled.note}`.trim();
+    }
+  }
   await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/transition`, {
     method: 'POST',
     body: { state, summary },
@@ -6788,6 +9379,101 @@ async function finish(config, run, state, summary) {
 }
 
 // --- cancellation ------------------------------------------------------------
+
+/**
+ * What the daemon before this one was driving when it died — R339.
+ *
+ * Read off the note it kept (restart.mjs), and only when its writer is dead:
+ * a live writer is a second daemon on this runner id. Each run the platform
+ * still believes in is failed at once as DAEMON_RESTARTED, in words that name
+ * the cause — where the stale sweep would have said, five minutes later, that
+ * the runner "stopped driving it". A session the old daemon left running
+ * unattended is stopped first: two sessions writing one checkout is worse
+ * than either.
+ */
+async function reportWhatARestartKilled(config) {
+  const path = drivingPath(config.runnerId);
+  const previous = await readDriving(path);
+  const behind = leftBehind(previous, process.pid, isAlive);
+  for (const left of behind) {
+    const run = await api(config, `/api/projects/${left.projectSlug}/runs/${left.id}`)
+      .catch((failure) => {
+        log(`could not read ${left.id} after the restart: ${failure.message}`);
+        return null;
+      });
+    if (!killedByRestart(run, config.runnerId)) {
+      continue;
+    }
+    const orphanStopped = await stopOrphan(left);
+    log(`run ${left.id} was being driven when this daemon last died (pid ${previous.pid}); `
+      + 'reporting it');
+    await api(config, `/api/projects/${left.projectSlug}/runs/${left.id}/transition`, {
+      method: 'POST',
+      body: {
+        state: 'FAILED',
+        failureReason: 'DAEMON_RESTARTED',
+        summary: restartSummary({
+          name: config.name, previousPid: previous.pid, pid: process.pid, orphanStopped,
+          stopped: previous.stopped ?? null,
+        }),
+      },
+    }).catch((failure) => log(`  could not report it: ${failure.message}`));
+  }
+  await writeDriving(path, snapshotOf(process.pid, running))
+    .catch((failure) => log(`could not write ${path}: ${failure.message}`));
+}
+
+/**
+ * The old daemon's session, if it outlived it — and only if the pid still
+ * runs the command it was spawned with, because after a reboot that number
+ * may be somebody else's process.
+ */
+async function stopOrphan(left) {
+  if (!left.childPid || !left.command || !isAlive(left.childPid)) {
+    return false;
+  }
+  const command = await new Promise((resolveCommand) => {
+    const ps = spawn('ps', ['-o', 'command=', '-p', String(left.childPid)],
+      { stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    ps.stdout.on('data', (chunk) => (out += chunk));
+    ps.on('error', () => resolveCommand(''));
+    ps.on('close', () => resolveCommand(out));
+  });
+  if (!command.includes(left.command)) {
+    return false;
+  }
+  try {
+    process.kill(-left.childPid, 'SIGTERM');
+    log(`  stopped the session it left running (pid ${left.childPid})`);
+    return true;
+  } catch (failure) {
+    log(`  could not stop the session it left running: ${failure.message}`);
+    return false;
+  }
+}
+
+/**
+ * Keeps the note current: rewritten whenever the set of runs being driven
+ * changes, checked every second. A second is the window in which a death
+ * goes unreported — and the stale sweep still catches that one.
+ */
+function keepTheDrivingNote(config) {
+  const path = drivingPath(config.runnerId);
+  let written = null;
+  const timer = setInterval(() => {
+    const snapshot = snapshotOf(process.pid, running);
+    const text = JSON.stringify(snapshot);
+    if (text === written) return;
+    written = text;
+    writeDriving(path, snapshot).catch((failure) => {
+      written = null;
+      log(`could not write ${path}: ${failure.message}`);
+    });
+  }, 1000);
+  timer.unref?.();
+  return timer;
+}
 
 /**
  * A cancelled run reaches the runner on its next poll, and the child's whole
@@ -6853,7 +9539,7 @@ function capabilities(config) {
     // can read this can say which side refused without waiting for a run to
     // say it in a transcript.
     skills: config.skills ?? [],
-    agent: config.agentCommand,
+    agents: config.agentCommands,
     // R260. This daemon knows a claim can carry `baseBranch` — a sprint's
     // branch to cut from, open the pull request against and merge into. It
     // is the WHOLE of how the platform tells an old daemon from a new one:
@@ -6861,6 +9547,20 @@ function capabilities(config) {
     // offered only to a machine that says this, and a machine that does not
     // is told why on the queue rather than handed a base it would ignore.
     baseBranches: true,
+    // R270. This daemon knows an offer can carry `waitForClean`, and honours it
+    // in `pickWorkspace` — taking the preferred checkout only when clean, and
+    // refusing to fall back to a dirty one at all. The same shape as
+    // `baseBranches`: an older daemon that ignored the flag would take the
+    // dirty checkout and fail a run the person explicitly queued to avoid
+    // that, so the platform tells it apart rather than letting one behave
+    // like the other.
+    waitForClean: true,
+    // R379. This daemon knows `CREATE_BRANCH` (a branch put on origin, cut from
+    // another branch) and can open, find and merge a GitLab merge request with
+    // `glab`. An older daemon would fail the unknown kind, so the platform
+    // hands the request only to a daemon that says so.
+    createBranch: true,
+    gitHosts: ['github', 'gitlab'],
   });
 }
 
@@ -6878,56 +9578,64 @@ function capabilities(config) {
  * message from a CLI it does not own is worse than one that says so and runs.
  */
 async function probePermissionPrompt(config) {
-  const said = await new Promise((done) => {
-    let text = '';
-    let child;
-    try {
-      child = spawn(config.agentCommand, ['-p', '--permission-prompt-tool', 'mcp__cawdev__approve'], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-    } catch (failure) {
-      return done(`could not be run: ${failure.message}`);
+  let allGood = true;
+  for (const agentCommand of config.agentCommands) {
+    // A Claude Code flag. Codex never calls a permission prompt — see
+    // `spawnCodex` — and offering it this one would start its terminal UI.
+    if (agentOfCommand(agentCommand) === 'codex') {
+      continue;
     }
-    const give_up = setTimeout(() => {
+    const said = await new Promise((done) => {
+      let text = '';
+      let child;
       try {
-        child.kill('SIGKILL');
-      } catch {
-        // Already gone.
+        child = spawn(agentCommand, ['-p', '--permission-prompt-tool', 'mcp__cawdev__approve'], {
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+      } catch (failure) {
+        return done(`could not be run: ${failure.message}`);
       }
-      done(text);
-    }, 10_000);
-    give_up.unref?.();
+      const give_up = setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // Already gone.
+        }
+        done(text);
+      }, 10_000);
+      give_up.unref?.();
 
-    child.stdout.on('data', (chunk) => (text += chunk));
-    child.stderr.on('data', (chunk) => (text += chunk));
-    child.on('error', (failure) => {
-      clearTimeout(give_up);
-      done(`could not be run: ${failure.message}`);
+      child.stdout.on('data', (chunk) => (text += chunk));
+      child.stderr.on('data', (chunk) => (text += chunk));
+      child.on('error', (failure) => {
+        clearTimeout(give_up);
+        done(`could not be run: ${failure.message}`);
+      });
+      // `close`, not `exit`: this reads the CLI's own help to decide whether a
+      // flag exists, and a truncated read would answer "no" for a flag that is
+      // there. See git() above.
+      child.on('close', () => {
+        clearTimeout(give_up);
+        done(text);
+      });
+      // Nothing to say: the missing prompt is what we want it to complain about.
+      child.stdin.end();
     });
-    // `close`, not `exit`: this reads the CLI's own help to decide whether a
-    // flag exists, and a truncated read would answer "no" for a flag that is
-    // there. See git() above.
-    child.on('close', () => {
-      clearTimeout(give_up);
-      done(text);
-    });
-    // Nothing to say: the missing prompt is what we want it to complain about.
-    child.stdin.end();
-  });
 
-  if (/unknown option.*permission-prompt-tool/i.test(said)) {
-    log(
-      `WARNING: ${config.agentCommand} does not accept --permission-prompt-tool. Sessions that ` +
-        `need a command nobody allowed in advance will be denied outright rather than asking ` +
-        `you. See R51 and tools/runner/README.md.`,
-    );
-    return false;
+    if (/unknown option.*permission-prompt-tool/i.test(said)) {
+      log(
+        `WARNING: ${agentCommand} does not accept --permission-prompt-tool. Sessions that ` +
+          `need a command nobody allowed in advance will be denied outright rather than asking ` +
+          `you. See R51 and tools/runner/README.md.`,
+      );
+      allGood = false;
+    }
+    if (said.startsWith('could not be run:')) {
+      log(`WARNING: ${agentCommand} ${said}`);
+      allGood = false;
+    }
   }
-  if (said.startsWith('could not be run:')) {
-    log(`WARNING: ${config.agentCommand} ${said}`);
-    return false;
-  }
-  return true;
+  return allGood;
 }
 
 async function main() {
@@ -6935,7 +9643,46 @@ async function main() {
   // right way.
   quiet = attaching;
 
+  // A SIGHUP that arrives while booting — `cawdev config` run a moment after
+  // the daemon started — is held, not fatal: Node's default for an unhandled
+  // SIGHUP is to exit, and the real handler is only installed once
+  // `rereadConfig` exists, well after the first lines are logged. It is
+  // applied as soon as that handler is in place.
+  let hupWhileBooting = false;
+  const holdHup = () => {
+    hupWhileBooting = true;
+  };
+  process.on('SIGHUP', holdHup);
+
   const config = await readConfig();
+  // The checkouts made on demand by an earlier run of this daemon, found
+  // again by their name — nothing about them is in the config.
+  await syncAutoWorkspaces(config.projects);
+  const myVersion = await cliVersion();
+
+  // R283. Checked before registering — a daemon too old to be safe should not
+  // get as far as claiming a run. `/api/health` is unauthenticated, so this
+  // works with the very token `readConfig` just resolved, before it has been
+  // proven good for anything else. Anything BUT "the platform said refuse"
+  // fails open: a health check that cannot be reached is not evidence the
+  // version is wrong, and refusing to boot over a network hiccup would be R2's
+  // failure mode pointed at the wrong target.
+  try {
+    const health = await api(config, '/api/health');
+    if (isBelow(myVersion, health?.minimumCliVersion)) {
+      throw new Error(
+        `This CLI is ${myVersion}; ${config.url} requires at least `
+          + `${health.minimumCliVersion}. Update it (npm i -g ./tools from an `
+          + 'updated checkout, or however this machine installs cawdev) and run '
+          + 'cawdev again.',
+      );
+    }
+  } catch (failure) {
+    if (failure.message.startsWith('This CLI is')) {
+      throw failure;
+    }
+    log(`could not check the minimum CLI version (${failure.message}); continuing`);
+  }
 
   const runner = await api(config, '/api/runners', {
     method: 'POST',
@@ -6948,6 +9695,8 @@ async function main() {
       // would not be a ceiling.
       acceptsConsoleRules: config.acceptsRulesFromConsole === true,
       grantable: JSON.stringify(declaredCeiling(config)),
+      // R283. Own version, on every registration and heartbeat — see cliVersion below.
+      cliVersion: myVersion,
     },
   });
   config.runnerId = runner.id;
@@ -6960,7 +9709,7 @@ async function main() {
   // Skipped when attaching, where the UI takes the screen a moment later and
   // a banner would only flash.
   if (!quiet) {
-    console.log(bannerLines(config, ink).join('\n'));
+    console.log(bannerLines(config, ink, myVersion).join('\n'));
   }
 
   log(`registered as "${runner.name}" (${runner.id})`);
@@ -6968,7 +9717,13 @@ async function main() {
     // The paths still go to the log — the banner says how many, this says
     // which, and "which" is what you need when one of them is wrong.
     log(`serving ${slug}: ${project.workspaces.join(', ')}`);
+    // R300. Said before the first run, so the log says the feature is on
+    // — and which variable the token is read from — before a scan is missed.
+    if (project.quality) {
+      log(`quality: ${slug} scans with ${project.quality.command} after TEST, token from $${project.quality.tokenEnv}`);
+    }
   }
+  await sayWhichWorkspacesCannotBeUsed(config);
   await sayWhichServedProjectsTheTokenCannotReach(config);
 
   // Frozen here, before anything can be claimed. A run that checks this very
@@ -6990,36 +9745,168 @@ async function main() {
   // than buried under a session that then fails for a reason it explains.
   await probePermissionPrompt(config);
 
+  // R339. Whether this machine can put each session under a memory ceiling,
+  // and what an earlier daemon on this runner left behind when it died —
+  // both before anything is claimed: a run reported now is one the queue
+  // must not hand the checkout of to somebody else first.
+  const memoryMax = memoryMaxOf(config.sessionMemoryMax);
+  if (config.sessionMemoryMax && !memoryMax) {
+    log(`sessionMemoryMax "${config.sessionMemoryMax}" is not a size systemd reads (6G, 512M, 75%); ignored`);
+  }
+  const probed = await probeScope(memoryMax);
+  config.sessionScope = probed.scope;
+  if (probed.scope) {
+    log(`each session runs under MemoryMax=${probed.scope.memoryMax} (systemd --${probed.scope.manager} scope)`);
+  } else if (probed.why) {
+    log(`sessionMemoryMax not applied: ${probed.why}`);
+  }
+  await reportWhatARestartKilled(config);
+  const drivingNote = keepTheDrivingNote(config);
+
+  // What this daemon SAYS it is, on every hello — R52's socket, R288's rule
+  // that it describes the current state. One object, sent as-is by
+  // `serveControl` and mutated by the SIGHUP handler below, so a terminal that
+  // attaches after a toggle reads what is true now.
+  const advertised = {
+    id: config.runnerId,
+    name: config.name,
+    url: config.url,
+    // R126. Whether this machine takes rules from the console — so the
+    // terminal only offers `M` when pressing it would do something. A key
+    // that takes an answer the platform then refuses reads as cawdev being
+    // broken, which is R58's rule about `a` applied to this one.
+    acceptsConsoleRules: config.acceptsRulesFromConsole === true,
+    projects: Object.keys(config.projects),
+    // How many checkouts each has — R62. The per-project half of R47's
+    // gate, which the bar shows as `cawdev 1/2`. Added rather than
+    // replacing `projects`: an older attach ignores it and still works,
+    // and a newer one against an older daemon simply shows a count with
+    // nothing to compare it against.
+    workspaces: Object.fromEntries(
+      Object.entries(config.projects).map(([slug, p]) => [slug, p.workspaces.length]),
+    ),
+    // R288: which agents this machine spawns, and the file it booted from,
+    // so the attached terminal's config screen can show the state of each
+    // toggle and write to the right file. `configPath` is null for a daemon
+    // run from the environment alone, and the screen says so rather than
+    // inventing a file.
+    agents: [...config.agentCommands],
+    configPath: config.configPath,
+    // R294: the keys the file has moved on from since boot that only a restart
+    // would apply — nothing, at boot, by definition — and when the file was
+    // last read, so a door that just signalled can wait for a fresh answer.
+    restartNeeded: [],
+    configReadAt: new Date().toISOString(),
+    // R81. `cawdev` starts a daemon for you when it finds none, and
+    // quitting the UI leaves it running — it is driving sessions. A
+    // background process you did not know you started is the cost of that
+    // choice, so the goodbye has to name it precisely enough to stop, and
+    // this is the only place the number is known.
+    pid: process.pid,
+  };
+
+  // R283. `cawdev config agent enable/disable` and `cawdev config rules
+  // on/off` write the file and, if a daemon is running on it, send SIGHUP — NOT
+  // a control-socket command. `control.mjs` is deliberately read-only ("no
+  // command can" change anything, so a person acting through it never gets
+  // more than their own HTTPS session already grants); SIGHUP is a unix
+  // convention for "re-read your config", asked of a process this operator
+  // already owns, so it does not open that door. Only the settings that are
+  // genuinely safe to hot-swap — `HOT_SWAPPABLE`, in lib/runner-config.mjs,
+  // the ONE spelling of that list — are applied: `agentCommands`, `grantable`
+  // and `acceptsRulesFromConsole` are read fresh from `config` on every use
+  // (spawn, or the next heartbeat), never captured once at boot, so mutating
+  // them here is enough, with no further plumbing.
+  //
+  // R294: and the daemon SAYS what it could not apply. Everything else in the
+  // file is read once at boot, and until this a project added to the file was
+  // logged as "nothing changed" — the handler diffed only the three keys it
+  // could swap. `rereadConfig` compares the whole file against the one this
+  // process BOOTED with (not the last one read, so an edit reverted by hand
+  // clears the notice by itself) and publishes the keys only a restart would
+  // apply as `restartNeeded` on the hello, with `configReadAt` so a door that
+  // just signalled can tell a fresh answer from the old one. A notice, never a
+  // restart — R113's rule: the daemon says so, and a person decides. Two
+  // triggers, one function: the signal, and the heartbeat noticing the file's
+  // mtime moved, which is what covers a hand edit with no door at all.
+  let configSeenAt = null;
+  const rereadConfig = async (why) => {
+    const path = config.configPath ?? configPathFromArgv();
+    try {
+      // The mtime first, so a re-read on a signal is not followed by a second
+      // one on the next beat for the same write.
+      configSeenAt = (await stat(path).catch(() => null))?.mtimeMs ?? configSeenAt;
+      const file = JSON.parse(await readFile(path, 'utf8'));
+      // What the three keys RESOLVE to, defaults filled in as `readConfig`
+      // fills them, so a key the file omits is not reported as a change.
+      const resolved = {
+        acceptsRulesFromConsole: file.acceptsRulesFromConsole ?? DEFAULTS.acceptsRulesFromConsole,
+        grantable: file.grantable ?? DEFAULTS.grantable,
+        autoWorkspaces: autoWorkspacesOf(file.autoWorkspaces),
+        agentCommands: file.agentCommands
+          ?? (file.agentCommand ? [file.agentCommand] : null)
+          ?? DEFAULTS.agentCommands,
+      };
+      const applied = reloadableFor({
+        agentCommands: config.agentCommands,
+        grantable: config.grantable,
+        acceptsRulesFromConsole: config.acceptsRulesFromConsole,
+        autoWorkspaces: config.autoWorkspaces,
+      }, resolved);
+      // A checkout made on demand may have been dropped — the attached
+      // terminal's `/drop` deletes the directory and sends this signal.
+      await syncAutoWorkspaces(config.projects, heldWorkspaces());
+      if (await sayWhichWorkspacesCannotBeUsed(config)) {
+        log('  (the project list itself is read at start — restart the daemon after changing "workspaces")');
+      }
+      Object.assign(config, resolved);
+      // R288: the hello describes the current state, not the booted one — an
+      // attach opened after a toggle would otherwise offer to turn on what is
+      // already on. The same object `serveControl` sends, mutated in place.
+      advertised.acceptsConsoleRules = config.acceptsRulesFromConsole === true;
+      advertised.agents = [...config.agentCommands];
+      advertised.restartNeeded = config.bootedFile ? restartNeededFor(config.bootedFile, file) : [];
+      advertised.configReadAt = new Date().toISOString();
+      const said = [
+        applied.length ? `applied: ${applied.join(', ')}` : null,
+        advertised.restartNeeded.length ? `needs restart: ${advertised.restartNeeded.join(', ')}` : null,
+      ].filter(Boolean);
+      log(`re-read ${path} on ${why} — ${said.length ? said.join('; ') : 'nothing changed'}`);
+    } catch (failure) {
+      log(`${why} re-read of ${path} failed: ${failure.message}`);
+    }
+    // A terminal already attached got its hello before this; the daemon tells
+    // it rather than waiting for the next attach. An older client ignores an
+    // event type it does not know.
+    control?.publish({ type: 'runner', runner: advertised });
+  };
+  process.off('SIGHUP', holdHup);
+  process.on('SIGHUP', () => rereadConfig('SIGHUP'));
+  if (hupWhileBooting) {
+    void rereadConfig('SIGHUP (sent while booting)');
+  }
+
+  // The heartbeat's half of R294: the file's mtime, read once per beat, and a
+  // re-read when it moved. `stat` and nothing more when it did not, which is
+  // what makes this affordable every thirty seconds. Skipped for a daemon
+  // booted from the environment alone — there is no file to have changed.
+  configSeenAt = config.configPath ? (await stat(config.configPath).catch(() => null))?.mtimeMs ?? null : null;
+  const noticeConfigEdits = async () => {
+    if (!config.configPath) return;
+    const seen = (await stat(config.configPath).catch(() => null))?.mtimeMs ?? null;
+    if (seen === null || seen === configSeenAt) return;
+    // `rereadConfig` records the mtime before it reads: a file caught
+    // mid-write fails to parse, and the write that finishes it moves the
+    // mtime again.
+    await rereadConfig('edit');
+  };
+
   // R52. Nothing here is load-bearing for running an agent, so a daemon that
   // cannot open a socket says so and carries on: trading the ability to run
   // work for the ability to watch it would be the wrong way round.
   try {
     control = await serveControl({
-      runner: {
-        id: config.runnerId,
-        name: config.name,
-        url: config.url,
-        // R126. Whether this machine takes rules from the console — so the
-        // terminal only offers `M` when pressing it would do something. A key
-        // that takes an answer the platform then refuses reads as cawdev being
-        // broken, which is R58's rule about `a` applied to this one.
-        acceptsConsoleRules: config.acceptsRulesFromConsole === true,
-        projects: Object.keys(config.projects),
-        // How many checkouts each has — R62. The per-project half of R47's
-        // gate, which the bar shows as `cawdev 1/2`. Added rather than
-        // replacing `projects`: an older attach ignores it and still works,
-        // and a newer one against an older daemon simply shows a count with
-        // nothing to compare it against.
-        workspaces: Object.fromEntries(
-          Object.entries(config.projects).map(([slug, p]) => [slug, p.workspaces.length]),
-        ),
-        // R81. `cawdev` starts a daemon for you when it finds none, and
-        // quitting the UI leaves it running — it is driving sessions. A
-        // background process you did not know you started is the cost of that
-        // choice, so the goodbye has to name it precisely enough to stop, and
-        // this is the only place the number is known.
-        pid: process.pid,
-      },
+      runner: advertised,
       snapshot: snapshotRuns,
     });
     log(`watchable at ${control.path} — attach with: node runner.mjs attach`);
@@ -7099,6 +9986,10 @@ async function main() {
         // without anybody having to revoke anything.
         acceptsConsoleRules: config.acceptsRulesFromConsole === true,
         grantable: JSON.stringify(declaredCeiling(config)),
+        // R283. Sent on every beat, not only at registration, for
+        // `acceptsConsoleRules`' own reason: a daemon reconfigured or
+        // reinstalled reports what is true NOW.
+        cliVersion: myVersion,
       },
     }).then((me) => {
       // R73/R80. The heartbeat's answer is what the platform decided about
@@ -7116,7 +10007,7 @@ async function main() {
           : [];
       }
     }).catch((failure) => log(`heartbeat failed: ${failure.message}`));
-    await Promise.all([workspacesReported, heartbeatAnswered]);
+    await Promise.all([workspacesReported, heartbeatAnswered, noticeConfigEdits()]);
   };
 
   await beat();
@@ -7166,6 +10057,12 @@ async function main() {
       }
       log('stopping; leaving any live run to the platform’s staleness sweep');
       stopping = true;
+      // R339. Said in the note before the sessions go, so the next daemon
+      // tells a stop somebody asked for from a kill nobody did.
+      clearInterval(drivingNote);
+      await writeDriving(drivingPath(config.runnerId),
+        { ...snapshotOf(process.pid, running), stopped: signal })
+        .catch(() => undefined);
       clearInterval(heartbeat);
       clearInterval(gitSurvey);
       clearInterval(workspaceRequests);
@@ -7208,8 +10105,13 @@ async function main() {
   // to lose three hours of work by leaning on the keyboard.
   if (attaching) {
     const { attach } = await import('./attach.mjs');
-    void attach(process.argv.slice(2), {
+    const argv = process.argv.slice(2);
+    const typed = argv.includes('--url') ? argv[argv.indexOf('--url') + 1] : null;
+    void attach(argv, {
       socketPath: control?.path,
+      // Where the person signs in: `--url`, else what this daemon is called —
+      // `cawdev.mjs`'s `signInUrl` order. `urlFrom` alone never sees the config.
+      url: (typed ?? config.url).replace(/\/+$/, ''),
       // Its own daemon, so quitting means stopping: raised as a signal rather
       // than an exit, so the run goes through the same goodbye and the same
       // termination of children as a Ctrl-C would.
@@ -7242,6 +10144,22 @@ async function main() {
         `/api/runners/${config.runnerId}/queue?wait=${config.pollSeconds}`,
       );
 
+      // Checked again HERE, not only at the top. The poll blocks for up to
+      // pollSeconds, and a Ctrl-C during it flips `stopping` and begins the
+      // goodbye — which is bounded but not instant. A poll that returns inside
+      // that window would otherwise walk on to claim a run and spawn a
+      // detached agent that outlives the exiting daemon, orphaned with a live
+      // claim. The gap after this point is startRun's own: it reads `stopping`
+      // nowhere, and a Ctrl-C between its claim and its spawn is still open.
+      //
+      // Also the loop's exit an analyser can see. The header's condition IS one
+      // at runtime — `stopping` is a closed-over `let` read every iteration —
+      // but its only writer is the signal handler, and i247 (S2189) is what a
+      // loop with no visible way out looks like from outside.
+      if (stopping) {
+        break;
+      }
+
       // ONE gate — R109. There were two; `maxSessions` bounded this machine
       // and is gone, for the reason written where it used to be applied.
       //
@@ -7264,6 +10182,11 @@ async function main() {
       // was when the wait began — and a run that started during the wait was
       // invisible. Two agents went into one checkout that way.
       const held = heldWorkspaces();
+      // One `git status` per checkout per pass, not per offer — i258.
+      // Several offers of one project ask `looksClean` on a shared checkout
+      // only once.
+      const probed = new Map();
+      const problems = new Map();
 
       let claimable = 0;
       let skipped = 0;
@@ -7322,46 +10245,38 @@ async function main() {
         // the local ref already is. Taken when free, passed over when not: a
         // busy preferred checkout is not worth waiting for, because origin has
         // everything and prepareWorkingCopy brings a stale ref up to it.
+        //
+        // Below pinned and preferred, which checkout a free-for-the-taking
+        // run gets now also weighs whether its tree is clean — R71/i258. The
+        // `await` here can only make `held` more conservative while it waits:
+        // claims are added by this loop alone, sequentially, and a run
+        // finishing only frees a path. The one optimistic case — a heartbeat
+        // adding to `told.heldWorkspaces` mid-loop — is the same window that
+        // already exists between this poll and `startRun`'s own claim.
         let workspace = null;
+        let source = null;
         if (writes) {
-          const pinned = offered.workspace ?? null;
-          if (pinned) {
-            if (!config.projects[slug].workspaces.includes(pinned)) {
-              // Not one of ours. The platform pins a machine as well as a
-              // path, so this means the config changed under a live branch —
-              // which is a thing to say out loud rather than quietly ignore.
-              noteQueued(
-                offered.run,
-                `its branch is in ${pinned}, which this machine does not serve`,
-              );
-              skipped += 1;
-              continue;
-            }
-            if (held.has(pinned)) {
-              noteQueued(
-                offered.run,
-                `waiting for ${pinned}, which is busy — the branch has work only that checkout holds`,
-              );
-              skipped += 1;
-              continue;
-            }
-            workspace = pinned;
-          } else {
-            const preferred = offered.preferredWorkspace ?? null;
-            if (preferred && config.projects[slug].workspaces.includes(preferred) && !held.has(preferred)) {
-              workspace = preferred;
-            } else {
-              workspace = config.projects[slug].workspaces.find((path) => !held.has(path)) ?? null;
-            }
-            if (!workspace) {
-              const total = config.projects[slug].workspaces.length;
-              noteQueued(
-                offered.run,
-                `no free workspace in ${slug} (${total} here, all busy)`,
-              );
-              skipped += 1;
-              continue;
-            }
+          const picked = await pickWorkspace(slug, config.projects[slug], offered, held, probed,
+            config.autoWorkspaces, problems);
+          if (picked.why) {
+            noteQueued(offered.run, picked.why);
+            skipped += 1;
+            continue;
+          }
+          workspace = picked.workspace;
+        } else {
+          // Reads from a usable folder, and holds none: the source goes to
+          // `startRun` on its own and never into `held` or `taken` (R70).
+          const project = config.projects[slug];
+          source = await usableWorkspace(project, new Set(), problems, { reading: true });
+          if (!source) {
+            const first = project.workspaces[0];
+            const trouble = await problemOf(problems, first);
+            noteQueued(offered.run, trouble
+              ? workspaceProblemSaid(slug, trouble, { first })
+              : `${slug} has no workspace on this machine`);
+            skipped += 1;
+            continue;
           }
         }
         if (workspace) {
@@ -7375,7 +10290,7 @@ async function main() {
         });
         noted.delete(offered.run.id);
         claimable += 1;
-        void startRun(config, offered, workspace);
+        void startRun(config, offered, workspace, source);
       }
 
       // Forget runs that are no longer offered, so one that comes back around

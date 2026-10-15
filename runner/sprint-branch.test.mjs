@@ -40,7 +40,7 @@ async function aRepositoryWithASprintBranch() {
   const root = await mkdtemp(join(tmpdir(), 'cawdev-sprint-'));
   const origin = join(root, 'origin.git');
   const seed = join(root, 'seed');
-  await run('git', ['init', '-q', '--bare', origin]);
+  await run('git', ['init', '-q', '--bare', '-b', 'main', origin]);
   await run('git', ['init', '-q', '-b', 'main', seed]);
   await git(seed, ['config', 'user.email', 'test@cawdev.test']);
   await git(seed, ['config', 'user.name', 'Test']);
@@ -67,8 +67,8 @@ async function aRepositoryWithASprintBranch() {
 }
 
 /**
- * A `gh` that logs its argv: no pull request exists, and creating one answers
- * a URL. One line per call — the body's own newlines are folded to `⏎` so a
+ * A `gh` that logs its argv: no pull request exists until one is created,
+ * and creating one answers a URL. One line per call — the body's own newlines are folded to `⏎` so a
  * multi-line `--body` cannot read as three calls.
  */
 async function fakeGh(t) {
@@ -77,15 +77,17 @@ async function fakeGh(t) {
   await writeFile(join(dir, 'gh'), [
     '#!/bin/sh',
     `printf '%s' "$*" | tr '\\n' ' ' >> ${log}; printf '\\n' >> ${log}`,
+    // Like the real one, it finds what it created: the daemon asks the host
+    // again after `pr create`, and a gh that forgot would read as a failure.
     'case "$1 $2" in',
-    '  "pr view") exit 1 ;;',
-    `  "pr create") printf '%s\\n' "${PR}"; exit 0 ;;`,
+    `  "pr view") [ -f ${log}.created ] && printf '%s\\n' "${PR}" && exit 0; exit 1 ;;`,
+    `  "pr create") touch ${log}.created; printf '%s\\n' "${PR}"; exit 0 ;;`,
     'esac',
     'exit 1',
     '',
   ].join('\n'));
   await chmod(join(dir, 'gh'), 0o755);
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   return {
     dir,
     async calls() {
@@ -118,9 +120,9 @@ async function daemonWith(t, { repo, name, offers = [], workspaceRequests = [], 
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await rm(socketPathFor(name), { force: true });
-    await rm(repo.root, { recursive: true, force: true });
+    await rm(repo.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   return { platform, said: () => said, alive: () => daemon.exitCode === null };

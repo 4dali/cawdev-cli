@@ -22,6 +22,7 @@ import {
   withinCeiling,
 } from '../lib/tool-rules.mjs';
 import { findDestructive, withinScope } from '../lib/secrets.mjs';
+import { COMMITS_ITS_WORK, isUnfinished, leftOver, notDoneYet } from '../lib/finish-check.mjs';
 
 const NAME = 'cawdev';
 const VERSION = '0.1.0';
@@ -47,7 +48,7 @@ async function readConfig() {
   const project = process.env.CAWDEV_PROJECT ?? fromFile.values.CAWDEV_PROJECT;
 
   return {
-    url: (url ?? 'http://localhost:4200').replace(/\/+$/, ''),
+    url: (url ?? 'https://app.cawdev.com').replace(/\/+$/, ''),
     token,
     project,
     // Where each value came from. roadmap_where reports this, because "which
@@ -411,6 +412,7 @@ const TOOLS = [
         status: {
           type: 'string',
           enum: [
+            'BACKLOG',
             'CONSIDERING',
             'PLANNED',
             'NEW',
@@ -420,6 +422,12 @@ const TOOLS = [
             'SHIPPED',
             'DECLINED',
           ],
+        },
+        assignee: {
+          type: 'string',
+          description:
+            'Only cards assigned to this person — a username, or "me" for the owner of this ' +
+            'token. An unknown username is refused.',
         },
         brief: { type: 'boolean', description: 'Omit bodies. Default true.' },
       },
@@ -432,6 +440,7 @@ const TOOLS = [
       // R257. The API refuses a number with no sprint behind it, naming the
       // sprints there are; that sentence is passed through as the tool error.
       if (args.sprint) query.set('sprint', String(args.sprint));
+      if (args.assignee) query.set('assignee', args.assignee);
       query.set('brief', String(brief));
 
       const entries = await api(config, `/api/projects/${slug}/roadmap?${query}`);
@@ -537,6 +546,52 @@ const TOOLS = [
   },
 
   {
+    name: 'quality_get',
+    description:
+      "The SonarQube reading of this project — the default branch's gate and its counts — and, " +
+      "if you name a branch, that branch's gate and how many NEW bugs, vulnerabilities, hotspots " +
+      "and smells it adds, with the SonarQube link. Inside a run, the branch defaults to this " +
+      "run's. A branch nobody has scanned yet says so. A red gate with new vulnerabilities is a " +
+      'finding to report, not a failure to hide. Read-only: nothing here refreshes, scans or files.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_ARGUMENT,
+        branch: {
+          type: 'string',
+          description:
+            "A branch name. Omit inside a run to read this run's branch; omit outside one for " +
+            'the default branch only.',
+        },
+      },
+    },
+    handler: async (config, args) => {
+      const slug = await resolveProject(config, args.project);
+      // R302. The run's own branch when none was named — the TEST stage that
+      // calls this is asking about the branch it just tested, and should not
+      // have to know its name. Its own try: a plain `cawd_` token has no run,
+      // and `requireRun` refuses it with a sentence about orchestration tools
+      // that would be wrong here — outside a run, the default branch alone is
+      // the ordinary answer, not a refusal.
+      const branch = args.branch
+        ?? await requireRun(config)
+          .then(({ runId, project }) => api(config, `/api/projects/${project}/runs/${runId}`))
+          .then((run) => run?.branch ?? null)
+          .catch(() => null);
+      const reading = await api(
+        config,
+        `/api/projects/${slug}/quality/reading${branch ? `?branch=${encodeURIComponent(branch)}` : ''}`,
+      );
+      // A 204 has no body, and `api` hands that back as null.
+      if (!reading) {
+        return `${slug} is not on SonarQube — no server, token or project key set on it. `
+          + 'Work as you would have anyway.';
+      }
+      return formatQualityReading(reading, branch);
+    },
+  },
+
+  {
     name: 'roadmap_comment',
     description:
       'Say something about an entry, beside the entry rather than inside it. Use it for the ' +
@@ -568,12 +623,70 @@ const TOOLS = [
   },
 
   {
+    name: 'done_when_tick',
+    description:
+      "Tick (or untick) one item of the card's Done-when checklist as built. Items are " +
+      "numbered from 1 as task_current lists them. Call it when you have BUILT the item and " +
+      'CHECKED it, with one line of evidence — a test name, a command, a file:line. Do not ' +
+      'tick what you did not check: the reviewer ticks their own column separately and sees ' +
+      'yours. Defaults to the card this run is working on, and a run cannot tick another.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_ARGUMENT,
+        number: {
+          type: ['string', 'integer'],
+          description:
+            'The card by ref — R91, i91. Optional inside a run: defaults to the run\'s own card.',
+        },
+        item: { type: 'integer', minimum: 1, description: "The item's number, from 1." },
+        done: { type: 'boolean', description: 'false takes the tick back. Default true.' },
+        note: {
+          type: 'string',
+          description: 'One line of evidence: a test name, a command, a file:line.',
+        },
+      },
+      required: ['item'],
+    },
+    handler: async (config, args) => {
+      let slug;
+      let ref = args.number;
+      if (ref === undefined || ref === null || ref === '') {
+        const { runId, project } = await requireRun(config);
+        const run = await api(config, `/api/projects/${project}/runs/${runId}`);
+        ref = run.entryRef ?? run.entryNumber;
+        slug = project;
+      } else {
+        slug = await resolveProject(config, args.project);
+      }
+      if (ref === undefined || ref === null || ref === '') {
+        throw new CawdevError('This run has no card, so there is no Done-when list to tick.');
+      }
+      if (!Number.isInteger(args.item) || args.item < 1) {
+        throw new CawdevError('item must be a whole number from 1, as task_current lists them.');
+      }
+      const done = args.done !== false;
+      const row = await api(config, `/api/projects/${slug}/roadmap/${encodeURIComponent(String(ref))}/done-when/${args.item}/built`, {
+        method: 'PUT',
+        body: { done, note: args.note },
+      });
+      return (
+        `${done ? 'Ticked' : 'Unticked'} item ${row.position} of ${ref} in ${slug} as built: ` +
+        row.text
+      );
+    },
+  },
+
+  {
     name: 'roadmap_create',
     description:
       'Create a roadmap entry. The platform allocates its permanent number — written R91 on ' +
       'a roadmap card and i91 on an issue, one sequence across both — and the ' +
-      'platform decides where a card starts — CONSIDERING — unless you say otherwise; ' +
-      'a status that requires something must be given it.',
+      'project decides where a card you file starts — the BACKLOG by default for a card an ' +
+      'agent files, waiting until a person or a sprint brings it in — unless you say ' +
+      'otherwise; a status that requires something must be given it. A card in the BACKLOG ' +
+      'holds no sprint: giving it one moves it to CONSIDERING. A plan session\'s card lands ' +
+      'where the console\'s do (R380).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -586,6 +699,7 @@ const TOOLS = [
         status: {
           type: 'string',
           enum: [
+            'BACKLOG',
             'CONSIDERING',
             'PLANNED',
             'IN_DEVELOPMENT',
@@ -619,6 +733,45 @@ const TOOLS = [
             'Cards this one starts coding after — it waits in the queue until every one of ' +
             'them is MERGED or SHIPPED. Refs, as `related`. Same project, must exist, never itself.',
         },
+        tags: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Free words — lowercase, letters/digits/./_/-, up to 32 characters, at least one ' +
+            'letter, at most 12. The leading # is optional and stripped.',
+        },
+        assignee: {
+          type: 'string',
+          description:
+            'A username — the person responsible for the card. Leave out for nobody. Refused, naming the ' +
+            'person, unless they hold WRITER or more on the project and are not disabled.',
+        },
+        priority: {
+          type: 'string',
+          enum: ['HIGHEST', 'HIGH', 'MEDIUM', 'LOW', 'LOWEST'],
+          description:
+            'How much it matters; it does not reorder the board. Leave out for MEDIUM.',
+        },
+        due: {
+          type: 'string',
+          description: 'When it is due, written 2026-11-01. A fact on the card; it moves nothing. Leave out for none.',
+        },
+        estimate: {
+          type: 'integer',
+          minimum: 1,
+          description: "How big it is, in the team's own unit (points, days — the platform does not say). Leave out for none.",
+        },
+        targetVersion: {
+          type: 'string',
+          description: 'The version it is meant to ship in — one the project DEFINED under Project settings → Versions (R362); any other name is refused. The release corrects it if it lands elsewhere. Leave out for none.',
+        },
+        parent: {
+          type: 'string',
+          description:
+            'The card this one sits under (an epic), e.g. "R300". One level only: the parent ' +
+            'must be the same kind and have no parent itself, and this card must have no ' +
+            'children. An open card cannot be filed under a SHIPPED or DECLINED one.',
+        },
       },
       required: ['title'],
     },
@@ -628,7 +781,7 @@ const TOOLS = [
         method: 'POST',
         body: pick(args, [
           'title', 'body', 'status', 'branch', 'merge', 'version', 'reason', 'section', 'related',
-          'after', 'sprint',
+          'after', 'sprint', 'tags', 'assignee', 'priority', 'due', 'estimate', 'targetVersion', 'parent',
         ]),
       });
       return `Created ${refOf(entry)} in ${slug}.\n\n${formatEntry(entry, {})}`;
@@ -640,7 +793,7 @@ const TOOLS = [
     description:
       'What is broken in a project, and how badly — R85. The same numbering as the roadmap, ' +
       'written with an i: card 91 filed as an issue is i91, and there is no R91 as well. ' +
-      'Statuses are NEW, CONFIRMED, IN_DEVELOPMENT, MERGED (drawn as ' +
+      'Statuses are BACKLOG, NEW, CONFIRMED, IN_DEVELOPMENT, MERGED (drawn as ' +
       'Resolved) and DECLINED (Won\'t fix).',
     inputSchema: {
       type: 'object',
@@ -648,7 +801,11 @@ const TOOLS = [
         ...PROJECT_ARGUMENT,
         status: {
           type: 'string',
-          enum: ['NEW', 'CONFIRMED', 'IN_DEVELOPMENT', 'MERGED', 'SHIPPED', 'DECLINED'],
+          enum: ['BACKLOG', 'NEW', 'CONFIRMED', 'IN_DEVELOPMENT', 'MERGED', 'SHIPPED', 'DECLINED'],
+        },
+        assignee: {
+          type: 'string',
+          description: 'Only issues assigned to this person — a username, or "me".',
         },
         brief: { type: 'boolean', description: 'Drop the bodies.' },
       },
@@ -658,6 +815,7 @@ const TOOLS = [
       const query = new URLSearchParams();
       if (args.status) query.set('status', args.status);
       if (args.brief) query.set('brief', 'true');
+      if (args.assignee) query.set('assignee', args.assignee);
       const suffix = query.toString() ? `?${query}` : '';
       const issues = await api(config, `/api/projects/${slug}/issues${suffix}`);
       if (!issues.length) {
@@ -670,8 +828,10 @@ const TOOLS = [
   {
     name: 'issue_file',
     description:
-      'File an issue: something that is broken, with how badly. Lands at NEW — filed and not ' +
-      'yet triaged — unless you say CONFIRMED, which claims you have already checked it. The ' +
+      'File an issue: something that is broken, with how badly. Lands where the project says ' +
+      'for an issue an agent files — the BACKLOG by default, waiting to be brought in, or NEW ' +
+      '(filed and not yet triaged) — unless you say NEW, or CONFIRMED, which claims you have ' +
+      'already checked it. The ' +
       'severity is required: it is how the board is ordered. Use `related` to name the card it ' +
       'was found on, by ref (R84). Issues count on their own sequence — R221 — and are ' +
       'written with an i: i91 is the ninety-first issue, and R91 is another card.',
@@ -682,11 +842,36 @@ const TOOLS = [
         title: { type: 'string' },
         body: { type: 'string', description: 'Markdown. What happens, and what should instead.' },
         severity: { type: 'string', enum: ['CRITICAL', 'MEDIUM', 'MINOR'] },
-        status: { type: 'string', enum: ['NEW', 'CONFIRMED'] },
+        status: { type: 'string', enum: ['BACKLOG', 'NEW', 'CONFIRMED'] },
         related: {
           type: 'array',
           items: { type: ['string', 'integer'] },
           description: 'Refs — R12, i15; a bare number is a roadmap card (R221).',
+        },
+        tags: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Free words — lowercase, letters/digits/./_/-, up to 32 characters, at least one ' +
+            'letter, at most 12. The leading # is optional and stripped.',
+        },
+        assignee: {
+          type: 'string',
+          description:
+            'A username — the person responsible for the card. Leave out for nobody. Refused, naming the ' +
+            'person, unless they hold WRITER or more on the project and are not disabled.',
+        },
+        priority: {
+          type: 'string',
+          enum: ['HIGHEST', 'HIGH', 'MEDIUM', 'LOW', 'LOWEST'],
+          description:
+            'How much it matters; it does not reorder the board. Leave out for MEDIUM.',
+        },
+        affectedVersions: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Versions the project defined or shipped in where this issue was found — R378. Any other name is refused.',
         },
       },
       required: ['title', 'severity'],
@@ -695,7 +880,7 @@ const TOOLS = [
       const slug = await resolveProject(config, args.project);
       const issue = await api(config, `/api/projects/${slug}/issues`, {
         method: 'POST',
-        body: pick(args, ['title', 'body', 'severity', 'status', 'related']),
+        body: pick(args, ['title', 'body', 'severity', 'status', 'related', 'tags', 'assignee', 'priority', 'affectedVersions']),
       });
       return `Filed ${refOf(issue)} in ${slug}.\n\n${formatEntry(issue, {})}`;
     },
@@ -716,14 +901,25 @@ const TOOLS = [
         kind: { type: 'string', enum: ['ISSUE', 'FEATURE'] },
         title: { type: 'string' },
         body: { type: 'string', description: 'Markdown. What you noticed, and what should happen instead.' },
+        tags: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Who it came from, beyond you — e.g. "customer" when you are passing on what a user ' +
+            'said. "agent" is always added: you filed it. Same word rule as card tags.',
+        },
       },
       required: ['kind', 'title', 'body'],
     },
     handler: async (config, args) => {
       const slug = await resolveProject(config, args.project);
+      // R372: feedback says who it came from, and an agent filing it is one
+      // of the sources. Added here, at the agent's own door, not by the API:
+      // an application's token files through the same endpoint and is not an agent.
+      const tags = [...new Set([...(Array.isArray(args.tags) ? args.tags : []), 'agent'])];
       const item = await api(config, `/api/projects/${slug}/backlog`, {
         method: 'POST',
-        body: pick(args, ['kind', 'title', 'body']),
+        body: { ...pick(args, ['kind', 'title', 'body']), tags },
       });
       return `Filed in ${slug}'s backlog as pending: "${item.title}". Somebody will accept it ` +
         'as a card or an issue, or refuse it.';
@@ -733,8 +929,8 @@ const TOOLS = [
   {
     name: 'roadmap_update',
     description:
-      'Edit an entry\'s title, body, section, sprint, related refs or the cards it starts ' +
-      'after. Use roadmap_set_status to move it.',
+      'Edit an entry\'s title, body, section, sprint, tags, parent, related refs or the cards it ' +
+      'starts after. Use roadmap_set_status to move it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -767,6 +963,50 @@ const TOOLS = [
             'them is MERGED or SHIPPED. Refs, as `related`. Same project, must exist, never ' +
             'itself. [] clears it.',
         },
+        tags: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Free words — same rule as roadmap_create. Leave out to leave them alone; [] clears them.',
+        },
+        assignee: {
+          type: 'string',
+          description:
+            'A username — the person responsible for the card. Leave out to leave it alone; "" takes the card off them. Refused, naming the ' +
+            'person, unless they hold WRITER or more on the project and are not disabled.',
+        },
+        priority: {
+          type: 'string',
+          enum: ['HIGHEST', 'HIGH', 'MEDIUM', 'LOW', 'LOWEST'],
+          description:
+            'How much it matters; it does not reorder the board. Leave out for MEDIUM (leave out to leave it alone).',
+        },
+        due: {
+          type: 'string',
+          description: 'When it is due, written 2026-11-01. Leave out to leave it alone; "" clears it.',
+        },
+        estimate: {
+          type: 'integer',
+          minimum: 0,
+          description: "How big it is, in the team's own unit. Leave out to leave it alone; 0 clears it.",
+        },
+        targetVersion: {
+          type: 'string',
+          description: 'The version it is meant to ship in — one the project defined (R362); any other name is refused. Leave out to leave it alone; "" clears it.',
+        },
+        parent: {
+          type: 'string',
+          description:
+            'The card this one sits under (an epic), e.g. "R300". "" takes the card out of its ' +
+            'parent; leave out to leave it alone. Same rules as roadmap_create.',
+        },
+        affectedVersions: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Issues only (R378): the versions the project defined or shipped in where it was found. ' +
+            'Leave out to leave them alone; [] clears them. A roadmap card refuses a non-empty list.',
+        },
       },
       required: ['number'],
     },
@@ -775,7 +1015,10 @@ const TOOLS = [
       const entry = await api(config, `/api/projects/${slug}/roadmap/${args.number}`, {
         method: 'PATCH',
         // pick keeps a present 0, which is how a card leaves its sprint.
-        body: pick(args, ['title', 'body', 'section', 'related', 'after', 'sprint']),
+        body: pick(args, [
+          'title', 'body', 'section', 'related', 'after', 'sprint', 'tags', 'assignee', 'priority',
+          'due', 'estimate', 'targetVersion', 'parent', 'affectedVersions',
+        ]),
       });
       return `Updated ${refOf(entry)}.\n\n${formatEntry(entry, {})}`;
     },
@@ -802,6 +1045,7 @@ const TOOLS = [
         status: {
           type: 'string',
           enum: [
+            'BACKLOG',
             'CONSIDERING',
             'PLANNED',
             'NEW',
@@ -1013,6 +1257,12 @@ const TOOLS = [
         config,
         `/api/projects/${project}/roadmap/${cardRef}/plans`,
       ).catch(() => []);
+      // R368. The plan's Done-when list, numbered, with the ticks so far. Its
+      // own try, like the plan above: a platform without it answers 404.
+      const criteria = await api(
+        config,
+        `/api/projects/${project}/roadmap/${cardRef}/done-when`,
+      ).catch(() => []);
 
       const lines = [];
 
@@ -1039,8 +1289,25 @@ const TOOLS = [
         `run:     ${run.state}${run.runnerName ? ` on ${run.runnerName}` : ''}`,
         `started by ${run.startedByEmail}`,
         '',
-        formatEntry(entry, { comments, plan: plans?.[0] ?? null }),
       );
+      // R336. The epic this card was cut from, so a session sees the context.
+      // Its own try, like the history above: a parent that cannot be read (a
+      // 404, no grant) costs the paragraph and never the call.
+      if (entry.parent) {
+        const epic = await api(config, `/api/projects/${project}/roadmap/${entry.parent.ref}`)
+          .catch(() => null);
+        if (epic) {
+          lines.push(
+            `This card is part of ${entry.parent.ref} — ${epic.title}:`,
+            epicExcerpt(epic.body),
+            '',
+          );
+        }
+      }
+      lines.push(formatEntry(entry, { comments, plan: plans?.[0] ?? null }));
+      if (criteria?.length) {
+        lines.push('', formatDoneWhen(criteria));
+      }
 
       // What happened the other times. A session is told the entry and the
       // branch but not that two previous runs on this card failed, which is
@@ -1115,7 +1382,9 @@ const TOOLS = [
     description:
       'Say what is happening. `progress` as often as useful; `done` when the work is finished, ' +
       'naming the branch and any PR; `blocked` when something stops you that a person must ' +
-      'resolve. done and blocked also end the run — you do not need a separate step.',
+      'resolve. done and blocked also end the run — you do not need a separate step. On a ' +
+      'coding run, done is refused while the checkout has uncommitted files or unpushed ' +
+      'commits: commit and push first.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1126,6 +1395,21 @@ const TOOLS = [
     },
     handler: async (config, args) => {
       const { runId, project } = await requireRun(config);
+
+      // R345: a finished run is committed and pushed. Asked HERE, before the
+      // message is posted, because this is the one moment the session that
+      // made the files is still there to say what they are — the daemon's own
+      // check at the end can only commit them blind or hold them.
+      if (args.kind === 'done') {
+        const run = await api(config, `/api/projects/${project}/runs/${runId}`).catch(() => null);
+        if (run && run.branch && COMMITS_ITS_WORK.has(run.profile)) {
+          const left = await leftOver(process.env.CAWDEV_WORKSPACE ?? process.cwd(), run.branch);
+          if (isUnfinished(left)) {
+            return notDoneYet(left);
+          }
+        }
+      }
+
       const message = await api(config, `/api/projects/${project}/runs/${runId}/messages`, {
         method: 'POST',
         body: { kind: args.kind.toUpperCase(), body: args.body },
@@ -1585,9 +1869,13 @@ async function decide(config, args) {
     }
     // EXPIRED, or the poll gave up before the platform expired it. Same answer
     // either way, and the difference is on the run for whoever reads it later.
+    // R339: a person may still allow it late, and if they do the session is
+    // sent a message saying so — so this says to carry on, not to stop.
     return deny(
-      `Nobody answered this permission request in time. Do not retry it in a loop: report ` +
-        `blocked, say exactly what you needed to run and why, and let a person allow it.`,
+      `Nobody answered this permission request in time. Do not retry it in a loop. Carry on ` +
+        `with whatever does not need it; if a person allows it later you will be sent a ` +
+        `message saying so, and may run it then. If nothing else can be done without it, ` +
+        `report blocked and say exactly what you needed to run and why.`,
     );
   } catch (failure) {
     return deny(
@@ -1740,9 +2028,10 @@ function skillServers() {
 /**
  * Waits for somebody to decide, for as long as the platform will hold it open.
  *
- * Bounded a little beyond the platform's own expiry so the two cannot both be
- * waiting on each other: if the sweep is late, this gives up and denies, which
- * is the same answer the sweep would have produced.
+ * R339: the platform's wait is the project's setting now, and may be never,
+ * so this has no deadline of its own: it returns when the request stops being
+ * PENDING — allowed, refused, or expired by the platform's sweep. A test may
+ * still bound it.
  */
 async function pollForDecision(config, project, runId, approvalId) {
   const deadline = Date.now() + approvalTimeoutSeconds() * 1000;
@@ -1765,10 +2054,10 @@ async function pollForDecision(config, project, runId, approvalId) {
   return null;
 }
 
-/** A little past the platform's own fifteen-minute expiry. Overridable for tests. */
+/** For ever: the platform decides when nobody is coming (R339). Overridable for tests. */
 function approvalTimeoutSeconds() {
   const configured = Number(process.env.CAWDEV_APPROVAL_TIMEOUT_SECONDS);
-  return Number.isFinite(configured) && configured > 0 ? configured : 960;
+  return Number.isFinite(configured) && configured > 0 ? configured : Infinity;
 }
 
 // There is no roadmap_delete or changelog_delete, and there will not be. The
@@ -1907,12 +2196,142 @@ function formatFileDeps(map, path) {
   return lines.join('\n');
 }
 
+/** How many finding lines a reading prints before saying "and N more" — R302. */
+const FINDING_LINES = 50;
+
+/**
+ * The reading as a session should read it — R302: one line for the default
+ * branch, one for the branch asked about, then the open findings.
+ *
+ * <p>The branch line comes SECOND and not first, though it is the one the
+ * caller asked about: the default branch's gate is what a person sees on the
+ * project's door, and "your branch is red" means something different under a
+ * green main than under a red one. The findings are the default branch's,
+ * and the last line says so, because a session that read "2 new
+ * vulnerabilities" and then a list of twelve will otherwise look for the two
+ * among the twelve.
+ */
+function formatQualityReading(reading, branch) {
+  const lines = [];
+  const project = reading.project;
+  if (!project) {
+    lines.push('Default branch: connected to SonarQube, but nothing has read it yet — the timer '
+      + 'has not fired since the connection was set.');
+  } else {
+    // A failed read is the headline, not a clause after the gate: a session
+    // skimming for the verdict stops at the first token, and `gate OK · the
+    // last read failed` reads as OK. The numbers are a dated echo and say so.
+    const parts = project.error
+      ? [`the last read failed: ${project.error}`, `before that: gate ${project.gate ?? 'NONE'}`]
+      : [`gate ${project.gate ?? 'NONE'}`];
+    parts.push(
+      `${count(project.bugs)} bugs`,
+      `${count(project.vulnerabilities)} vulnerabilities`,
+      `${count(project.securityHotspots)} hotspots`,
+      `${count(project.codeSmells)} smells`,
+      `coverage ${percent(project.coverage)}`,
+    );
+    if (project.analysedAt) parts.push(`analysed ${project.analysedAt}`);
+    if (project.dashboardUrl) parts.push(project.dashboardUrl);
+    lines.push(`Default branch: ${parts.join(' · ')}`);
+  }
+
+  const asked = reading.branch;
+  if (asked) {
+    if (!asked.scanned) {
+      lines.push(`Branch ${asked.branch}: no machine has scanned it yet. A coding run's TEST stage `
+        + 'is when a scan happens; until then the default branch above is all there is.');
+    } else if (asked.reading?.error) {
+      lines.push(`Branch ${asked.branch}: the scan could not run — ${asked.reading.error}`);
+    } else {
+      const row = asked.reading;
+      const parts = [
+        `gate ${row.gate ?? 'NONE'}`,
+        `new: ${count(row.newBugs)} bugs`,
+        `${count(row.newVulnerabilities)} vulnerabilities`,
+        `${count(row.newSecurityHotspots)} hotspots`,
+        `${count(row.newCodeSmells)} smells`,
+        `new coverage ${percent(row.newCoverage)}`,
+      ];
+      if (row.analysedAs === 'MAIN') parts.push('analysed as the main branch, not under its own name');
+      if (row.analysedAs === 'PROJECT') {
+        parts.push('analysed as its own SonarQube project; new = on lines this branch changed; no gate');
+      }
+      if (row.headSha) parts.push(`at ${row.headSha.slice(0, 7)}`);
+      if (row.dashboardUrl) parts.push(row.dashboardUrl);
+      lines.push(`Branch ${asked.branch}: ${parts.join(' · ')}`);
+      if (row.warning) lines.push(`  ${row.warning}`);
+    }
+  } else if (branch === null) {
+    lines.push('No branch was read: outside a run, name one to see its gate and new problems.');
+  }
+
+  const findings = reading.findings ?? [];
+  lines.push('');
+  if (!findings.length) {
+    lines.push('Open findings: none.');
+  } else {
+    lines.push(`Open findings (${findings.length}, worst first):`);
+    for (const finding of findings.slice(0, FINDING_LINES)) {
+      const where = finding.path
+        ? ` ${finding.path}${finding.line != null ? `:${finding.line}` : ''}`
+        : '';
+      const filed = finding.became?.ref ? ` (filed as ${finding.became.ref})` : '';
+      lines.push(`  ${finding.type} ${finding.severity} ${finding.rule}${where} — ${finding.message}`
+        + ` — ${finding.url}${filed}`);
+    }
+    if (findings.length > FINDING_LINES) {
+      lines.push(`  … and ${findings.length - FINDING_LINES} more in SonarQube.`);
+    }
+  }
+  lines.push('');
+  lines.push("These findings are the default branch's; SonarQube's per-branch issue list is not "
+    + "read here, so a branch's new problems are counts and a link.");
+  return lines.join('\n');
+}
+
+/** A count as a reading prints it: the number, or a dash for one SonarQube did not report. */
+function count(value) {
+  return value == null ? '–' : String(value);
+}
+
+/** A percentage as a reading prints it: `71.2%`, or a dash for none reported. */
+function percent(value) {
+  return value == null ? '–' : `${value}%`;
+}
+
 /**
  * What to call a card — R127. The server says, in `ref`; this is the fallback
  * for anything that predates it.
  */
 function refOf(entry) {
   return entry.ref ?? ((entry.kind === 'ISSUE' ? 'i' : 'R') + entry.number);
+}
+
+/**
+ * The word `formatEntry` prints for a card's origin — R315. Never stored,
+ * always the object shape `{kind, label, url}` off the API — unlike
+ * `roadmap-format.mjs`'s own copy, which also has to read one back out of a
+ * file.
+ */
+function originWord(origin) {
+  if (!origin || origin.kind === 'NONE') return null;
+  switch (origin.kind) {
+    case 'SONARQUBE': return 'SonarQube';
+    case 'FEEDBACK': return 'Feedback';
+    case 'APPLICATION': return origin.label ? `an application (${origin.label})` : 'an application';
+    case 'SESSION': return origin.label ? `a session (${origin.label})` : 'a session';
+    default: return null;
+  }
+}
+
+/** The first 600 characters of an epic's body, cut at a word — R336. */
+function epicExcerpt(body) {
+  const text = (body ?? '').trim();
+  if (text.length <= 600) return text;
+  const cut = text.slice(0, 600);
+  const space = cut.lastIndexOf(' ');
+  return `${(space > 0 ? cut.slice(0, space) : cut).trimEnd()}…`;
 }
 
 function formatEntry(entry, { brief, comments, plan }) {
@@ -1922,6 +2341,22 @@ function formatEntry(entry, { brief, comments, plan }) {
   if (entry.version) lines.push(`  version: ${entry.version}`);
   if (entry.declinedReason) lines.push(`  declined because: ${entry.declinedReason}`);
   if (entry.section) lines.push(`  section: ${entry.section}`);
+  // R315. Sorted for the same reason the export is: a reader's shape must not
+  // depend on the set's own insertion order.
+  if (entry.tags?.length) lines.push(`  tags: ${[...entry.tags].sort().map((t) => `#${t}`).join(' ')}`);
+  // R331. A username, never the email.
+  if (entry.assignee) lines.push(`  assignee: ${entry.assignee.username}`);
+  // R335. Not printed at MEDIUM, as the export does not write it.
+  if (entry.priority && entry.priority !== 'MEDIUM') {
+    lines.push(`  priority: ${entry.priority}`);
+  }
+  // R351. Both printed only when the card carries them, as the export does.
+  if (entry.due) lines.push(`  due: ${entry.due}`);
+  if (entry.estimate) lines.push(`  estimate: ${entry.estimate}`);
+  // R358. Printed until the card ships; `version` says where it did.
+  if (entry.targetVersion && !entry.version) lines.push(`  target: ${entry.targetVersion}`);
+  // R378. History, not plan: still printed once the issue has shipped.
+  if (entry.affectedVersions?.length) lines.push(`  affects: ${entry.affectedVersions.join(', ')}`);
   // R257. Always printed when the card has one, so a reader's shape does not
   // depend on which tool printed the card; a closed sprint says so.
   if (entry.sprint) {
@@ -1947,6 +2382,14 @@ function formatEntry(entry, { brief, comments, plan }) {
         .join(', ')}`,
     );
   }
+  // R336. The epic this card sits under, and the cards under this one.
+  if (entry.parent) lines.push(`  parent: ${entry.parent.ref} — ${entry.parent.title}`);
+  if (entry.children?.length) {
+    const progress = entry.progress ? `${entry.progress.done} of ${entry.progress.total} done — ` : '';
+    lines.push(
+      `  children: ${progress}${entry.children.map((c) => `${c.ref} (${c.status})`).join(', ')}`,
+    );
+  }
   // Said in a survey, where the comments themselves are not fetched: an entry
   // with an argument attached should be visibly different from one without,
   // even in a list. Omitted at zero rather than written as "comments: 0".
@@ -1958,6 +2401,12 @@ function formatEntry(entry, { brief, comments, plan }) {
     lines.push(`  written by: a ${entry.createdBy.profile} session, `
       + `under ${entry.createdBy.startedByEmail}`);
   }
+  // R315. Never null on the wire — NONE is a person at the console — so only
+  // ever printed when it says something. Beside `written by` rather than
+  // instead of it: origin says the DOOR, and the session line above already
+  // says who and what kind, when the door was a session.
+  const origin = originWord(entry.origin);
+  if (origin) lines.push(`  origin: ${origin}`);
   if (!brief && entry.body) lines.push('', entry.body);
   // R124, between the body and the discussion — the order they are read in:
   // what we want, how we mean to get it, and the argument about both.
@@ -1987,6 +2436,22 @@ function formatPlan(plan) {
     ? `${plan.createdAt} by ${who}, against ${plan.baseCommit.slice(0, 10)}`
     : `${plan.createdAt} by ${who}`;
   return [`--- the plan (${written}) ---`, plan.body].join('\n');
+}
+
+/**
+ * R368. The Done-when list as an agent reads it: numbered as done_when_tick
+ * takes them, with each tick and its evidence. A reviewer's confirmation is
+ * shown too — it is the other column, and the agent should see it.
+ */
+export function formatDoneWhen(criteria) {
+  const lines = ['--- done when (tick each with done_when_tick once you have checked it) ---'];
+  for (const item of criteria) {
+    const mark = item.built ? '[built]' : '[ ]';
+    const note = item.built && item.builtNote ? ` — ${item.builtNote}` : '';
+    const confirmed = item.confirmed ? ' (confirmed by reviewer)' : '';
+    lines.push(`${String(item.position).padStart(2)}. ${mark} ${item.text}${note}${confirmed}`);
+  }
+  return lines.join('\n');
 }
 
 /**

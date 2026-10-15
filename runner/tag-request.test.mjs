@@ -37,7 +37,7 @@ const DAEMON = new URL('./runner.mjs', import.meta.url).pathname;
  */
 async function aRepositoryWithARemote(t) {
   const remote = await mkdtemp(join(tmpdir(), 'cawdev-remote-'));
-  await run('git', ['init', '-q', '--bare', remote]);
+  await run('git', ['init', '-q', '--bare', '-b', 'main', remote]);
 
   const path = await mkdtemp(join(tmpdir(), 'cawdev-tag-'));
   await run('git', ['init', '-q', '-b', 'main'], { cwd: path });
@@ -49,7 +49,7 @@ async function aRepositoryWithARemote(t) {
   await run('git', ['commit', '-q', '-m', 'first'], { cwd: path });
   await run('git', ['push', '-q', '-u', 'origin', 'main'], { cwd: path });
 
-  t.after(() => rm(remote, { recursive: true, force: true }));
+  t.after(() => rm(remote, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   return { path, remote };
 }
 
@@ -77,9 +77,9 @@ async function daemonWith(t, { path, name, workspaceRequests, env = {} }) {
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await rm(socketPathFor(name), { force: true });
-    await rm(path, { recursive: true, force: true });
+    await rm(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   return { platform, said: () => said, alive: () => daemon.exitCode === null };
@@ -206,7 +206,7 @@ test('a TAG naming a path this daemon does not serve is refused', async (t) => {
   const { path } = await aRepositoryWithARemote(t);
   const elsewhere = await mkdtemp(join(tmpdir(), 'cawdev-elsewhere-'));
   await run('git', ['init', '-q', '-b', 'main'], { cwd: elsewhere });
-  t.after(() => rm(elsewhere, { recursive: true, force: true }));
+  t.after(() => rm(elsewhere, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
   const { platform, said } = await daemonWith(t, {
     path,

@@ -66,6 +66,19 @@ test('a machine serving nothing says so rather than showing a gap', () => {
   assert.match(plainBanner({ ...config, projects: {} }), /serving\s+nothing/);
 });
 
+test('the agents line names what this machine spawns, defaulting to claude — R283', () => {
+  assert.match(plainBanner(config), /agents\s+claude/, 'no agentCommands at all is the DEFAULT, claude');
+  assert.match(plainBanner({ ...config, agentCommands: ['claude', 'agy'] }), /agents\s+claude, agy/);
+});
+
+test('the CLI version line appears only when one was passed — R283', () => {
+  assert.doesNotMatch(plainBanner(config), /\bcli\b/, 'nothing worth printing about a version nobody gave');
+  assert.match(
+    stripAnsi(bannerLines(config, painter(3), '0.10.0').join('\n')),
+    /cli\s+0\.10\.0/,
+  );
+});
+
 test('with colour off the banner is still the same information', () => {
   const said = bannerLines(config, painter(0)).join('\n');
   assert.equal(stripAnsi(said), said, 'no escapes should survive');

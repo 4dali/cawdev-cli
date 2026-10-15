@@ -182,8 +182,8 @@ async function daemonWith(t, { path, name, rules = null, offers = [MERGE_RUN],
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(home, { recursive: true, force: true });
-    await rm(path, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await rm(socketPathFor(name), { force: true });
   });
 
@@ -298,7 +298,14 @@ test('a merge that comes out clean spawns nothing at all', async (t) => {
   const came = await until(said, /merged into r155-work with no conflict/);
   assert.ok(came, `the daemon never reported a clean merge:\n${said()}`);
 
-  const prepared = platform.mergeReports.find((each) => each.kind === 'prepared');
+  // The log line is written before the report is POSTed, so the report is
+  // waited for rather than read the instant the line appears — on a slow CI
+  // runner it had not arrived yet, and that failed v1.0.8-beta's release gate.
+  let prepared;
+  for (const deadline = Date.now() + 10000; Date.now() < deadline && !prepared;) {
+    prepared = platform.mergeReports.find((each) => each.kind === 'prepared');
+    if (!prepared) await new Promise((done) => setTimeout(done, 100));
+  }
   assert.ok(prepared, `the daemon never said what git merged:\n${said()}`);
   assert.equal(prepared.clean, true);
   assert.deepEqual(prepared.conflictedFiles, []);
@@ -392,7 +399,7 @@ async function fakeGh(t, { mergeFails, viewJson }) {
     '',
   ].join('\n'));
   await chmod(join(dir, 'gh'), 0o755);
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   return {
     dir,
     async calls() {
@@ -500,7 +507,13 @@ test('a pull request the host has not judged yet is OTHER, never "no conflict"',
     workspaceRequests: [
       { id: 'wr-merge', path, kind: 'MERGE', message: MERGE_RUN.branch },
     ],
-    env: { PATH: `${gh.dir}:${process.env.PATH}` },
+    env: {
+      PATH: `${gh.dir}:${process.env.PATH}`,
+      // R306: before merging, the daemon waits while the host says UNKNOWN —
+      // bounded, and this host never says anything else. Five seconds a poll
+      // in production; the test is not that patient.
+      CAWDEV_MERGEABILITY_WAIT_MS: '20',
+    },
   });
 
   const came = await platform.untilFinished((finished) => finished.length === 1);
@@ -508,4 +521,6 @@ test('a pull request the host has not judged yet is OTHER, never "no conflict"',
 
   const [done] = platform.finishedRequests;
   assert.equal(done.failure, 'OTHER');
+  // The wait gave up rather than waited for ever, and said so.
+  assert.match(said(), /still has not computed mergeability/);
 });

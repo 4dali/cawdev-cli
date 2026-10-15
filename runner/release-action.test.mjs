@@ -137,8 +137,8 @@ async function daemonWith(t, { name, releaseWrites = VERSION_FILES, offers = [RE
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(home, { recursive: true, force: true });
-    await rm(path, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await rm(socketPathFor(name), { force: true });
   });
 
@@ -167,7 +167,7 @@ test('a release is prepared a working copy on the release branch, like a coding 
       // prepared — that is `writesCodeProfile`, and it is why a release counts
       // against the coding cap.
       assert.ok(await untilSaid(/working copy .* is on release-v9\.9\.9/), said());
-      assert.doesNotMatch(said(), /nothing prepared/);
+      assert.doesNotMatch(said(), /nothing cut/);
       // And the daemon says what the platform let it write, where the
       // operator can see it.
       assert.match(said(), /a release session may write: backend\/pom\.xml, openapi\.yaml, tools\/package\.json/);

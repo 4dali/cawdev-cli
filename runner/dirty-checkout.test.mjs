@@ -100,6 +100,10 @@ async function stateOf(path) {
 }
 
 async function daemonWith(t, { path, name, offers = [], allowDirty = false, workspaceRequests = [] }) {
+  // R270's tests need two checkouts of the one project to choose between —
+  // `path` as an array is `{ workspaces: [...] }`, the pool form; a single
+  // path is R47's bare-path form, unchanged for the tests already here.
+  const paths = Array.isArray(path) ? path : [path];
   const platform = await fakePlatform({ offers, allowDirty, workspaceRequests });
   const home = await mkdtemp(join(tmpdir(), 'cawdev-cfg-'));
   const config = join(home, 'config.json');
@@ -109,7 +113,7 @@ async function daemonWith(t, { path, name, offers = [], allowDirty = false, work
     agentCommand: '/bin/echo',
     pollSeconds: 1,
     workspacePollSeconds: 1,
-    projects: { board: path },
+    projects: { board: Array.isArray(path) ? { workspaces: path } : path },
   }));
 
   const daemon = spawn(process.execPath, [DAEMON, '--config', config], {
@@ -123,9 +127,9 @@ async function daemonWith(t, { path, name, offers = [], allowDirty = false, work
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await rm(socketPathFor(name), { force: true });
-    await rm(path, { recursive: true, force: true });
+    await Promise.all(paths.map((each) => rm(each, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })));
   });
 
   return { platform, said: () => said };
@@ -256,4 +260,174 @@ test('Show reads the diff, and a path this machine does not serve is refused', a
   const refused = platform.finishedRequests.find((each) => each.id === 'wr-elsewhere');
   assert.equal(refused.ok, false);
   assert.match(refused.result, /does not serve/);
+});
+
+/**
+ * The checkout a carried-on run left behind: on its own branch, with the
+ * edits it made and never committed. The platform NAMES it (`mustUse`,
+ * offered as `workspace`), because R80 held it for exactly this work.
+ */
+async function aCheckoutHeldForItsBranch(branch) {
+  const path = await mkdtemp(join(tmpdir(), 'cawdev-held-'));
+  const git = (...args) => run('git', args, { cwd: path });
+  await git('init', '-q', '-b', 'main');
+  await git('config', 'user.email', 'test@cawdev.test');
+  await git('config', 'user.name', 'Test');
+  await writeFile(join(path, 'config.json'), settings('main', 'main'));
+  await git('add', '.');
+  await git('commit', '-q', '-m', 'first');
+  await git('checkout', '-q', '-b', branch);
+  await writeFile(join(path, 'config.json'), settings('main', 'the run wrote this'));
+  await writeFile(join(path, 'new-file.txt'), 'the run created this\n');
+  return path;
+}
+
+test('a carried-on run takes back its own uncommitted work instead of refusing it', async (t) => {
+  const path = await aCheckoutHeldForItsBranch('r80-held');
+  const { platform, said } = await daemonWith(t, {
+    path,
+    name: 'test-dirty-held',
+    offers: [{ ...codingRun('r80-held'), mustUse: path }],
+  });
+
+  const started = await platform.until(
+    (transitions) => transitions.some((each) => each.state === 'RUNNING'),
+  );
+  const failed = platform.transitions.find((each) => each.state === 'FAILED');
+  // Before this, Carry on failed here with "has uncommitted changes … Commit
+  // or stash them first" — about work that was the run's own.
+  assert.equal(failed, undefined, `the run failed: ${failed?.summary}\n${said()}`);
+  assert.ok(started, `the run never started:\n${said()}`);
+
+  assert.match(await readFile(join(path, 'config.json'), 'utf8'), /the run wrote this/);
+  // Untracked, so `git clean -fd` — the reset a fresh run gets — would have
+  // deleted it.
+  assert.equal(await readFile(join(path, 'new-file.txt'), 'utf8'), 'the run created this\n');
+});
+
+test('a named checkout on ANOTHER branch is still refused when dirty', async (t) => {
+  const path = await aCheckoutHeldForItsBranch('somebody-elses');
+  const { platform, said } = await daemonWith(t, {
+    path,
+    name: 'test-dirty-held-elsewhere',
+    offers: [{ ...codingRun('r80-other'), mustUse: path }],
+  });
+
+  const stopped = await platform.until(
+    (transitions) => transitions.some((each) => each.state === 'FAILED'),
+  );
+  assert.ok(stopped, `the run did not stop:\n${said()}`);
+  const failed = platform.transitions.find((each) => each.state === 'FAILED');
+  assert.match(failed.summary, /has uncommitted changes/);
+});
+
+// R270: "Queue for a clean checkout" — a run whose offer carries
+// `waitForClean` is never claimed onto a dirty tree, not even the one that
+// `pickWorkspace` would otherwise fall back to as "everything is dirty, take
+// the first free one anyway".
+
+/** A checkout with one commit, nothing uncommitted. */
+async function aCleanCheckout() {
+  const path = await mkdtemp(join(tmpdir(), 'cawdev-clean-'));
+  const git = (...args) => run('git', args, { cwd: path });
+  await git('init', '-q', '-b', 'main');
+  await git('config', 'user.email', 'test@cawdev.test');
+  await git('config', 'user.name', 'Test');
+  await writeFile(join(path, 'README.md'), 'clean\n');
+  await git('add', '.');
+  await git('commit', '-q', '-m', 'first');
+  return path;
+}
+
+/** The same, plus a file nobody has committed. */
+async function aDirtyCheckout() {
+  const path = await aCleanCheckout();
+  await writeFile(join(path, 'README.md'), 'somebody is mid-edit\n');
+  return path;
+}
+
+test('waitForClean leaves the run queued rather than take the one dirty checkout', async (t) => {
+  const path = await aDirtyCheckout();
+  const { platform, said } = await daemonWith(t, {
+    path,
+    name: 'test-wait-for-clean-alone',
+    offers: [{ ...codingRun('r270-wait'), waitForClean: true }],
+  });
+
+  const queued = await platform.untilQueued(
+    (reasons) => reasons.some((reason) => reason.runId === 'run-dirty'
+      && /waiting for a clean checkout/.test(reason.why)),
+  );
+  assert.ok(queued, `the runner never said why it is waiting:\n${said()}`);
+  assert.equal(
+    platform.transitions.length, 0,
+    `the run was claimed when it should have kept waiting:\n${said()}`,
+  );
+
+  // Cleaning the checkout — the panel's own Stash button does this — unblocks
+  // the next poll without anything else changing.
+  await run('git', ['stash'], { cwd: path });
+
+  const started = await platform.until(
+    (transitions) => transitions.some((each) => each.state === 'RUNNING'),
+  );
+  assert.ok(started, `the run never started once the checkout was clean:\n${said()}`);
+});
+
+test('waitForClean skips a dirty preferred checkout for a clean free one', async (t) => {
+  const dirty = await aDirtyCheckout();
+  const clean = await aCleanCheckout();
+  const { platform, said } = await daemonWith(t, {
+    path: [dirty, clean],
+    name: 'test-wait-for-clean-preferred',
+    offers: [{ ...codingRun('r270-preferred'), waitForClean: true, prefers: dirty }],
+  });
+
+  const started = await platform.until(
+    (transitions) => transitions.some((each) => each.state === 'RUNNING'),
+  );
+  assert.ok(started, `the run never started:\n${said()}`);
+  const failed = platform.transitions.find((each) => each.state === 'FAILED');
+  assert.equal(failed, undefined, `the run failed: ${failed?.summary}\n${said()}`);
+
+  const dirtyStill = (await run('git', ['status', '--porcelain'], { cwd: dirty })).stdout.trim();
+  assert.notEqual(dirtyStill, '', 'the dirty checkout was touched, and it should not have been');
+  const branchInClean = (
+    await run('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: clean })
+  ).stdout.trim();
+  assert.equal(branchInClean, 'r270-preferred', 'the run did not land in the clean checkout');
+});
+
+test('without waitForClean the same dirty checkout is still claimed, and still refused', async (t) => {
+  const path = await aDirtyCheckout();
+  const { platform, said } = await daemonWith(t, {
+    path,
+    name: 'test-wait-for-clean-regression',
+    offers: [codingRun('r270-regression')],
+  });
+
+  const stopped = await platform.until(
+    (transitions) => transitions.some((each) => each.state === 'FAILED'),
+  );
+  assert.ok(stopped, `the run did not stop:\n${said()}`);
+  const failed = platform.transitions.find((each) => each.state === 'FAILED');
+  assert.match(failed.summary, /has uncommitted changes/);
+});
+
+test('the daemon says waitForClean: true about itself', async (t) => {
+  const path = await aCleanCheckout();
+  const { platform, said } = await daemonWith(t, { path, name: 'test-wait-for-clean-capability' });
+
+  const registered = await new Promise((resolve) => {
+    const deadline = Date.now() + 20000;
+    const check = () => {
+      if (platform.registrations.length) return resolve(true);
+      if (Date.now() > deadline) return resolve(false);
+      setTimeout(check, 150);
+    };
+    check();
+  });
+  assert.ok(registered, `the daemon never registered:\n${said()}`);
+  const capabilities = JSON.parse(platform.registrations[0].capabilities);
+  assert.equal(capabilities.waitForClean, true);
 });

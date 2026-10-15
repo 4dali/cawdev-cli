@@ -11,6 +11,9 @@
 
 import { createServer } from 'node:http';
 import { once } from 'node:events';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 /**
  * @param offers runs to hand over, each ONCE — the queue empties afterwards,
@@ -60,6 +63,8 @@ export async function fakePlatform({
   skills = [],
   instincts = [],
   workflow = [],
+  /** R305: `{ PLAN: { tokensIn, tokensOut } }` — what a stage row already holds. */
+  stageTokens = null,
   shield = null,
   gateDecision = null,
   /**
@@ -92,9 +97,34 @@ export async function fakePlatform({
     ],
   },
   actions = [],
+  /**
+   * R283: what `GET /api/health` answers. Null is the shape every test before
+   * this card got — the catch-all's bare `{}`, which `isBelow` reads as "no
+   * minimum" because `minimumCliVersion` is simply absent.
+   */
+  health = null,
+  /**
+   * R300: what the claim says about the project's SonarQube — its key and
+   * its server. Null is a project not on SonarQube, which the daemon reads
+   * as "do not scan"; a key with no url is the platform having none, which
+   * the daemon reports as an error reading unless its own block names one.
+   */
+  sonarProjectKey = null,
+  sonarUrl = null,
+  /** R316: what the claim says about whether the server analyses branches — null is "not sure". */
+  sonarBranches = null,
+  /**
+   * R346: what `GET …/work-item-branches` answers. Null falls through to the
+   * catch-all's `{}` — the shape of a platform older than R346, which the
+   * daemon must read as "nothing to ask".
+   */
+  workItemBranches = null,
 } = {}) {
+  /** R346: every body POSTed to `…/work-item-merges`, in order. */
+  const workItemMergeReadings = [];
   const seen = [];
   const transitions = [];
+  const drivingDir = mkdtempSync(join(tmpdir(), 'cawdev-driving-'));
   const remaining = [...offers];
   const pending = [...workspaceRequests];
   const pendingActions = [...actions];
@@ -102,6 +132,8 @@ export async function fakePlatform({
   const finishedActions = [];
   /** R260: every registration body, so a test can read the capabilities off it. */
   const registrations = [];
+  /** R283: every heartbeat body, so a test can watch what a machine reports change. */
+  const heartbeats = [];
   /** What the daemon said it did, so a test can read the stash ref back. */
   const finishedRequests = [];
   /** R155: what a merge run's machine reported, in the order it reported it. */
@@ -123,8 +155,12 @@ export async function fakePlatform({
   const usage = [];
   /** What the daemon read out of each repository — R24, and R96's `brief`. */
   const gitReadings = [];
+  /** R300: what the daemon said SonarQube made of each branch it scanned. */
+  const qualityReports = [];
   /** Working-copy readings as posted — R217 reads the last one. */
   const workingCopies = [];
+  /** The commits each run reported — what the finish rules are judged on. */
+  const commitReports = [];
   /** R112: every stage begin and report the daemon sent, in order. */
   const stageCalls = [];
   /** R112: the approvals it raised at a gate. */
@@ -133,6 +169,8 @@ export async function fakePlatform({
   const briefings = [];
   /** R110: what it said the shield stopped. */
   const blocks = [];
+  /** R148/R270: the daemon's current snapshot of why each queued run waits. */
+  const queuedReasons = [];
 
   const server = createServer((request, response) => {
     seen.push(`${request.method} ${request.url.split('?')[0]}`);
@@ -163,23 +201,44 @@ export async function fakePlatform({
           expiresAt: new Date(Date.now() + 600_000).toISOString(),
         }));
       }
+      if (url.endsWith('/api/health')) {
+        return response.end(JSON.stringify(health ?? {}));
+      }
       if (url.endsWith('/api/runners') && request.method === 'POST') {
         registrations.push(JSON.parse(body));
         return response.end(JSON.stringify({ id: 'runner-1', name: JSON.parse(body).name }));
+      }
+      if (url.includes('/heartbeat') && request.method === 'POST') {
+        heartbeats.push(body ? JSON.parse(body) : {});
+        return response.end(JSON.stringify({}));
+      }
+      if (url.endsWith('/queued-reasons') && request.method === 'POST') {
+        // R148/R270: what the daemon currently says every queued run is
+        // waiting for — the whole list, replaced rather than appended, because
+        // the daemon posts its own current snapshot each time it changes.
+        //
+        // Checked BEFORE `/queue` below: "/queued-reasons" contains "/queue"
+        // as a substring, and `.includes` does not know the difference.
+        queuedReasons.length = 0;
+        queuedReasons.push(...(JSON.parse(body).reasons ?? []));
+        return response.end('{}');
       }
       if (url.includes('/queue')) {
         // Everything still unclaimed, every time — a real queue re-offers a run
         // it has not given to anybody, and the daemon's own bookkeeping is what
         // stops it claiming the same one twice.
         //
-        // `mustUse` and `prefers` are test-only fields read off the fixture run
-        // and echoed nowhere else: the checkout the real platform names on the
-        // offer while the branch is bound (R86), and the one it only prefers
-        // once the branch is entirely on the remote (R212).
+        // `mustUse`, `prefers` and `waitForClean` are test-only fields read off
+        // the fixture run and echoed nowhere else: the checkout the real
+        // platform names on the offer while the branch is bound (R86), the one
+        // it only prefers once the branch is entirely on the remote (R212), and
+        // whether this run asked to wait for a clean checkout instead of taking
+        // a dirty one — R270.
         return response.end(JSON.stringify(remaining.map((run) => ({
           run,
           workspace: run.mustUse ?? null,
           preferredWorkspace: run.prefers ?? null,
+          waitForClean: run.waitForClean === true,
         }))));
       }
       if (url.includes('/claim/')) {
@@ -198,6 +257,14 @@ export async function fakePlatform({
           // R260: the sprint's branch this run is cut from, when the fixture
           // says one. Absent otherwise, as on a platform before R260.
           ...(claimed.baseBranch ? { baseBranch: claimed.baseBranch } : {}),
+          // R124: the card's plan of record, when the fixture's offer carries
+          // one. Absent is a card nobody planned.
+          ...(claimed.plan ? { plan: claimed.plan } : {}),
+          // R300: the project's SonarQube key and server, or null on one not
+          // on SonarQube. Never a token.
+          sonarProjectKey,
+          sonarUrl,
+          sonarBranches,
           allowDirty,
           resume,
           mcpServers,
@@ -233,8 +300,24 @@ export async function fakePlatform({
       // approval PENDING, which is how a test watches the daemon WAIT — the
       // interesting half, and the one a stub that always answered could not
       // show.
+      // R305. What each stage was already credited with, read once at the top
+      // of a walk. `stageTokens` seeds it; otherwise the rows carry nothing,
+      // which is what a run walked for the first time looks like.
+      if (url.endsWith('/stages') && request.method === 'GET') {
+        return response.end(JSON.stringify((workflow ?? []).map((each, position) => ({
+          stage: each.stage, position, state: 'PENDING', ...(stageTokens?.[each.stage] ?? {}),
+        }))));
+      }
       if (url.includes('/stages/') && request.method === 'POST') {
-        const [, stage, what] = url.match(/\/stages\/([A-Z]+)\/(begin|report)/) ?? [];
+        const [, stage, what] = url.match(/\/stages\/([A-Z]+)\/(begin|report|usage)/) ?? [];
+        // R305. A stage's reading goes with the run's readings, tagged with the
+        // stage, rather than into `stageCalls` — a test about what a stage cost
+        // reads one array, and the run-level entries are the ones with no
+        // `stage` key. Not `(begin|report)` and a silent `what === undefined`.
+        if (what === 'usage') {
+          usage.push({ runId: url.split('/runs/')[1]?.split('/')[0], stage, ...JSON.parse(body || '{}') });
+          return response.end(JSON.stringify({ stage, state: 'RUNNING' }));
+        }
         stageCalls.push({ stage, what, body: JSON.parse(body || '{}') });
         return response.end(JSON.stringify({ stage, state: 'DONE' }));
       }
@@ -272,6 +355,13 @@ export async function fakePlatform({
 
       if (url.includes('/api/runners/') && url.endsWith('/tool-rules') && machineRules) {
         return response.end(JSON.stringify(machineRules));
+      }
+      if (url.endsWith('/work-item-branches') && workItemBranches) {
+        return response.end(JSON.stringify(workItemBranches));
+      }
+      if (url.endsWith('/work-item-merges') && request.method === 'POST') {
+        workItemMergeReadings.push(JSON.parse(body || '{}'));
+        return response.end(JSON.stringify({ recorded: 0, merged: [] }));
       }
       if (url.endsWith('/tool-rules')) {
         // A list, because the real one answers with a list. The catch-all below
@@ -322,12 +412,20 @@ export async function fakePlatform({
         });
         return response.end('{}');
       }
+      if (url.match(/\/quality\/[^/]+$/) && request.method === 'POST') {
+        qualityReports.push({ slug: url.split('/quality/')[1], ...JSON.parse(body) });
+        return response.end('{}');
+      }
       if (url.match(/\/git\/[^/]+$/) && request.method === 'POST') {
         gitReadings.push({ slug: url.split('/git/')[1], ...JSON.parse(body) });
         return response.end('{}');
       }
       if (url.endsWith('/working-copy') && request.method === 'POST') {
         workingCopies.push({ runId: url.split('/runs/')[1]?.split('/')[0], ...JSON.parse(body) });
+        return response.end('{}');
+      }
+      if (url.endsWith('/commits') && request.method === 'POST') {
+        commitReports.push({ runId: url.split('/runs/')[1]?.split('/')[0], ...JSON.parse(body) });
         return response.end('{}');
       }
       if (url.endsWith('/transition') && request.method === 'POST') {
@@ -388,27 +486,60 @@ export async function fakePlatform({
     env(extra = {}) {
       return {
         ...process.env,
+        // R339's note of what a daemon is driving is keyed by runner id, and
+        // this fake hands every daemon the same one (`runner-1`). Shared, the
+        // tests running beside each other read each other's notes: one
+        // daemon stopped another test's agent and reported its run FAILED
+        // into the wrong platform, which failed v1.0.8-beta's release gate.
+        // One directory per platform, so two daemons on ONE platform — the
+        // restart test — still find each other's note.
+        CAWDEV_DRIVING_DIR: drivingDir,
         CAWDEV_URL: url,
         CAWDEV_TOKEN: 'cawd_fake',
         // A run's own scoping, which a spawned session leaves in the
         // environment of anything it starts. Nothing under test wants it.
         CAWDEV_PROJECT: undefined,
         CAWDEV_GRANTABLE: undefined,
+        // Node's test runner sets FORCE_COLOR=1 in every test process when its
+        // own stdout is a terminal, and `lib/ansi.mjs` honours it over a pipe.
+        // A daemon spawned with it colours the log lines a test parses — the
+        // frozen MCP server's path came back ending in an escape code — so
+        // the suite passed piped (CI, an agent's shell) and failed in a
+        // person's terminal (`./sonar.sh` by hand). What a test reads is plain.
+        FORCE_COLOR: undefined,
         ...extra,
       };
     },
     seen,
     transitions,
+    /** A workspace request asked for LATER — after the daemon booted, the way a person's /pr is. */
+    askOfWorkspace(request) {
+      pending.push(request);
+    },
     finishedRequests,
     finishedActions,
     registrations,
+    heartbeats,
+    workItemMergeReadings,
     workspaceReports,
     mergeReports,
     sessionIds,
     outputs,
     usage,
     gitReadings,
+    qualityReports,
     workingCopies,
+    commitReports,
+    queuedReasons,
+    /** Waits for the queued-reasons snapshot to say something matching — R148/R270. */
+    async untilQueued(predicate, timeout = 20000) {
+      const deadline = Date.now() + timeout;
+      while (Date.now() < deadline) {
+        if (predicate(queuedReasons)) return true;
+        await new Promise((done) => setTimeout(done, 150));
+      }
+      return false;
+    },
     /** Waits for a reading of the repository to arrive — R24, R96. */
     async untilGit(timeout = 20000) {
       const deadline = Date.now() + timeout;
@@ -463,6 +594,9 @@ export async function fakePlatform({
       }
       return false;
     },
-    close: () => server.close(),
+    close: () => {
+      server.close();
+      rmSync(drivingDir, { recursive: true, force: true });
+    },
   };
 }

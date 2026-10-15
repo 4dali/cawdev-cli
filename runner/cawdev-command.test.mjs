@@ -20,7 +20,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fakePlatform } from './test-platform.mjs';
-import { daemonUrl, findConfig, isTheCommand, signInUrl } from './cawdev.mjs';
+import { daemonUrl, findConfig, isTheCommand, launchUrl, signInUrl } from './cawdev.mjs';
 
 const CAWDEV = new URL('./cawdev.mjs', import.meta.url).pathname;
 
@@ -31,7 +31,7 @@ async function aCleanMachine() {
     home,
     runDir: join(home, 'run'),
     async clean() {
-      await rm(home, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     },
   };
 }
@@ -99,6 +99,9 @@ test('with no daemon anywhere, `cawdev` starts one and attaches to it', async (t
       ...process.env,
       HOME: machine.home,
       CAWDEV_RUN_DIR: machine.runDir,
+      // Plain output, whatever Node's runner set: the footer is matched as text
+      // (`test-platform.mjs`'s `env()` says why FORCE_COLOR is there at all).
+      FORCE_COLOR: undefined,
       CAWDEV_TOKEN: 'cawd_fake',
       // The daemon reads these from the environment before the file, so a
       // developer's own shell would otherwise point the test at their cawdev.
@@ -157,6 +160,7 @@ test('a machine with no config is set up rather than told to write one', async (
       ...process.env,
       HOME: machine.home,
       CAWDEV_RUN_DIR: machine.runDir,
+      FORCE_COLOR: undefined,
       CAWDEV_TOKEN: undefined,
       CAWDEV_URL: undefined,
       CAWDEV_RUNNER_CONFIG: undefined,
@@ -191,7 +195,7 @@ test('--no-start refuses rather than launching something nobody asked for', asyn
   t.after(() => machine.clean());
 
   const cawdev = spawn(process.execPath, [CAWDEV, '--no-start', '--watch-only'], {
-    env: { ...process.env, HOME: machine.home, CAWDEV_RUN_DIR: machine.runDir },
+    env: { ...process.env, HOME: machine.home, CAWDEV_RUN_DIR: machine.runDir, FORCE_COLOR: undefined },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let stderr = '';
@@ -210,7 +214,7 @@ test('a runner named by hand is never started for you', async (t) => {
   t.after(() => machine.clean());
 
   const cawdev = spawn(process.execPath, [CAWDEV, '--runner', 'not-here', '--watch-only'], {
-    env: { ...process.env, HOME: machine.home, CAWDEV_RUN_DIR: machine.runDir },
+    env: { ...process.env, HOME: machine.home, CAWDEV_RUN_DIR: machine.runDir, FORCE_COLOR: undefined },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let stderr = '';
@@ -243,8 +247,8 @@ test('the config is looked for where somebody would expect it, in that order', a
   const home = await mkdtemp(join(tmpdir(), 'cawdev-conf-'));
   const here = await mkdtemp(join(tmpdir(), 'cawdev-cwd-'));
   t.after(async () => {
-    await rm(home, { recursive: true, force: true });
-    await rm(here, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(here, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   // What they just typed wins, and is not checked for existence — a named file
@@ -268,7 +272,7 @@ test('no config anywhere is not an error here — the daemon decides that', asyn
   // what is missing. A second copy of that judgement here would be a second
   // place for it to drift, and this one knows less.
   const empty = await mkdtemp(join(tmpdir(), 'cawdev-none-'));
-  t.after(() => rm(empty, { recursive: true, force: true }));
+  t.after(() => rm(empty, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
   assert.equal(await findConfig([], { HOME: empty }, empty), null);
 });
@@ -282,7 +286,7 @@ test('the command runs when it is reached through the symlink npm installs', asy
   // exited 0 having printed nothing at all. Every test and every hand check
   // had typed the path, which is the one way it worked.
   const home = await mkdtemp(join(tmpdir(), 'cawdev-bin-'));
-  t.after(() => rm(home, { recursive: true, force: true }));
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const link = join(home, 'cawdev');
   await symlink(CAWDEV, link);
 
@@ -298,7 +302,7 @@ test('the command runs when it is reached through the symlink npm installs', asy
 
 test('the rule itself: a link and its target are the same file', async (t) => {
   const home = await mkdtemp(join(tmpdir(), 'cawdev-link-'));
-  t.after(() => rm(home, { recursive: true, force: true }));
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const link = join(home, 'cawdev');
   await symlink(CAWDEV, link);
 
@@ -336,9 +340,31 @@ test('the daemon key follows the daemon: CAWDEV_URL, then the config, then the d
   // The CONSOLE's origin, not the API's — one origin is the constraint, `:8091`
   // does not exist outside development, and both the session and the token are
   // filed under this string. A config naming the API directly still wins.
-  assert.equal(daemonUrl(null, {}), 'http://localhost:4200', 'the default drifted');
+  assert.equal(daemonUrl(null, {}), 'https://app.cawdev.com', 'the default drifted');
   assert.equal(daemonUrl({ url: 'https://cawdev.example/' }, {}), 'https://cawdev.example',
     'a trailing slash would file the token under a second name for one instance');
+});
+
+test('a launch signs in where its --config says, not at the default', async () => {
+  // The bug: the machine's token was minted at the config's localhost, then the
+  // person's session opened the browser on app.cawdev.com, because the banner,
+  // the version check and the session read `urlFrom(argv)`, which never sees a
+  // config.
+  const here = await mkdtemp(join(tmpdir(), 'cawdev-launch-url-'));
+  try {
+    const local = join(here, 'local.config.json');
+    await writeFile(local, JSON.stringify({ url: 'http://localhost:5200/', projects: {} }));
+
+    assert.equal(await launchUrl(['--config', local], {}, here), 'http://localhost:5200');
+    assert.equal(await launchUrl(['--config', local, '--url', 'http://localhost:4200'], {}, here),
+      'http://localhost:4200', '--url is still the door the person chose');
+    assert.equal(await launchUrl(['--config', local], { CAWDEV_URL: 'https://env.example' }, here),
+      'https://env.example');
+    assert.equal(await launchUrl([], { HOME: here }, here), 'https://app.cawdev.com',
+      'with no config anywhere the default still applies');
+  } finally {
+    await rm(here, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
 });
 
 test('with no config, both questions have the same answer', () => {

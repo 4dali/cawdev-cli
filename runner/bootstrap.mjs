@@ -30,8 +30,10 @@ import { spawn } from 'node:child_process';
 import { access, chmod, mkdir, writeFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline/promises';
 import { homedir, hostname } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join } from 'node:path';
 import { painter } from '../lib/ansi.mjs';
+import { agentLabel } from '../lib/agents.mjs';
+import { absolute } from './paths.mjs';
 import { Select, pickFromLine, pickManyFromLine, plainLines } from './select.mjs';
 import { signInThroughBrowser, storedSession } from './sign-in.mjs';
 import { saveToken, tokenFile } from './token-store.mjs';
@@ -106,7 +108,9 @@ export function checkoutFor(root, slug) {
     // the root the person named. Everything else is already inside it, because
     // the separator is the character the line above removes.
     .replace(/^\.+$/, '-');
-  return join(resolve(root), safe);
+  // `absolute` and not `resolve`: `~/code` through resolve alone was
+  // `<cwd>/~/code`, which is the bug R289 started from.
+  return join(absolute(root), safe);
 }
 
 async function exists(path) {
@@ -160,7 +164,11 @@ export async function mintRunnerToken(session, slugs, name) {
   if (!minted?.secret) {
     throw new Error('The platform minted a token but did not return it.');
   }
-  return minted.secret;
+  // R283: the id travels alongside the secret from here on, so a later
+  // `cawdev config add-project` can widen THIS token's grants
+  // (`PUT /api/tokens/{id}/grants`) instead of minting a new one and leaving
+  // the old one live on the Tokens page for somebody to notice and revoke.
+  return { secret: minted.secret, id: minted.token?.id ?? null };
 }
 
 /**
@@ -185,19 +193,26 @@ export function cloneInto(gitUrl, path) {
   });
 }
 
-/** Whether `claude` is on the PATH at all — a cheaper question than "is it signed in". */
-export function findAgent(command = 'claude') {
-  return new Promise((done) => {
-    const child = spawn(process.platform === 'win32' ? 'where' : 'which', [command], {
-      stdio: ['ignore', 'pipe', 'ignore'],
+/** Whether the agent is on the PATH at all — a cheaper question than "is it signed in". */
+export async function findAgents(commands = ['agy', 'codex', 'claude']) {
+  const found = [];
+  for (const command of Array.isArray(commands) ? commands : [commands]) {
+    const where = await new Promise((done) => {
+      const child = spawn(process.platform === 'win32' ? 'where' : 'which', [command], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      let out = '';
+      child.stdout.on('data', (chunk) => {
+        out += chunk;
+      });
+      child.on('error', () => done(null));
+      child.on('close', (code) => done(code === 0 && out.trim() ? out.trim().split('\n')[0] : null));
     });
-    let out = '';
-    child.stdout.on('data', (chunk) => {
-      out += chunk;
-    });
-    child.on('error', () => done(null));
-    child.on('close', (code) => done(code === 0 && out.trim() ? out.trim().split('\n')[0] : null));
-  });
+    if (where) {
+      found.push({ command, where });
+    }
+  }
+  return found;
 }
 
 /**
@@ -213,7 +228,38 @@ export function asker(input = process.stdin, output = process.stdout) {
   return {
     line: (prompt) => rl.question(prompt),
     close: () => rl.close(),
+    /**
+     * Hands the terminal to somebody else while `work` runs — a `git clone`
+     * whose ssh asks for a key's passphrase.
+     *
+     * ssh reads that from `/dev/tty` itself, and an open readline is reading
+     * the SAME terminal in raw mode, echoing what it gets: the keys were
+     * shared between the two, the passphrase arrived with letters missing, and
+     * one of them was printed on the screen. So the interface stops reading and
+     * the terminal goes back to cooked mode — echo off is then ssh's to decide —
+     * and both are put back afterwards, whatever `work` did.
+     */
+    async aside(work) {
+      const wasRaw = Boolean(input.isTTY && input.isRaw);
+      rl.pause();
+      if (wasRaw) input.setRawMode(false);
+      try {
+        return await work();
+      } finally {
+        if (wasRaw) input.setRawMode(true);
+        rl.resume();
+      }
+    },
   };
+}
+
+/**
+ * `clone` with the terminal handed over for its duration, when the asker can —
+ * see `asker().aside`. An asker without it (a test's, the attached screen's)
+ * is not reading the terminal, so there is nothing to hand over.
+ */
+export function cloneAside(ask, clone, gitUrl, path) {
+  return typeof ask?.aside === 'function' ? ask.aside(() => clone(gitUrl, path)) : clone(gitUrl, path);
 }
 
 /**
@@ -285,7 +331,7 @@ export async function setUpThisMachine({
   configPath = runnerConfigPath(),
   signIn = signInThroughBrowser,
   session: given = null,
-  agent = findAgent,
+  agent = findAgents,
 } = {}) {
   const session = given ?? (await storedSession(url));
 
@@ -360,13 +406,13 @@ export async function setUpThisMachine({
         say(`  ${ink.muted(`Skipping ${project.slug}.`)}`);
         continue;
       }
-      entries.push({ slug: project.slug, path: resolve(typed) });
+      entries.push({ slug: project.slug, path: absolute(typed) });
       continue;
     }
     say('');
     say(`  ${ink.muted('Cloning')} ${ink.accent(project.gitUrl)} ${ink.muted('into')} ${ink.text(path)}`);
     await mkdir(dirname(path), { recursive: true });
-    await clone(project.gitUrl, path);
+    await cloneAside(ask, clone, project.gitUrl, path);
     entries.push({ slug: project.slug, path });
   }
 
@@ -377,25 +423,46 @@ export async function setUpThisMachine({
   // R93's one question this cannot answer for itself. Asked BEFORE the token is
   // minted, so somebody who has to go and log in elsewhere has not left a
   // credential behind them.
-  const where = await agent();
-  say('');
-  if (where) {
-    say(`  ${ink.muted('This machine spawns')} ${ink.text('claude')} ${ink.muted(`(${where}) for every run.`)}`);
-  } else {
-    say(`  ${ink.warn('!')} ${ink.muted('No')} ${ink.text('claude')} ${ink.muted('on this PATH. Install Claude Code before a run can start.')}`);
+  const agentInfos = await agent();
+  if (agentInfos.length === 0) {
+    say(`  ${ink.warn('!')} ${ink.muted('None of Claude Code, Antigravity CLI or Codex CLI is on PATH. Install at least one before a run can start.')}`);
+    throw new Error('No supported coding agent found.');
   }
-  say(`  ${ink.muted('It cannot sign in for you: a runner whose Claude Code is logged out')}`);
-  say(`  ${ink.muted('boots fine and then fails every run.')}`);
-  if (!await confirm(ask, 'Is Claude Code signed in on this machine?')) {
-    throw new Error(
-      'Sign in first — run `claude` once in a terminal and follow it — then run cawdev again.\n'
-        + '  Nothing has been created, so there is nothing to undo.',
-    );
+
+  const chosenAgents = agentInfos.length === 1
+    ? agentInfos
+    : (await askMany(ask, say, new Select({
+      title: 'Which coding agents do you want to use on this machine?',
+      rows: agentInfos.map((a) => ({
+        id: a.command,
+        label: agentLabel(a.command),
+        hint: a.where,
+      })),
+    }))).map((row) => agentInfos.find((a) => a.command === row.id));
+
+  if (!chosenAgents.length) {
+    throw new Error('You must select at least one coding agent to run.');
+  }
+
+  say('');
+  for (const a of chosenAgents) {
+    const agentDisplayName = agentLabel(a.command);
+    say(`  ${ink.muted('This machine spawns')} ${ink.text(a.command)} ${ink.muted(`(${a.where}) for every run.`)}`);
+    if (!await confirm(ask, `Is ${agentDisplayName} signed in on this machine?`)) {
+      throw new Error(
+        `Sign in first — run \`${a.command}\` once in a terminal and follow it — then run cawdev again.\n`
+          + '  Nothing has been created, so there is nothing to undo.',
+      );
+    }
   }
 
   const name = defaultRunnerName();
-  const token = await mintRunnerToken(session, entries.map((entry) => entry.slug), name);
-  const config = configFor({ url, token, name, entries });
+  const minted = await mintRunnerToken(session, entries.map((entry) => entry.slug), name);
+  const config = configFor({ url, token: minted.secret, name, entries });
+  config.agentCommands = chosenAgents.map(a => a.command);
+  // R283: kept beside the secret so a later `cawdev config add-project` can
+  // widen this token in place rather than minting a second one.
+  config.tokenId = minted.id;
   await write(configPath, config);
 
   say('');
@@ -477,13 +544,13 @@ export async function mintForThisMachine({
   say(`  ${ink.success('✓')} ${ink.muted('Signed in as')} ${ink.text(session.email)}`);
 
   const name = config.name ?? defaultRunnerName();
-  const token = await mintRunnerToken(session, slugs, name);
+  const minted = await mintRunnerToken(session, slugs, name);
 
   // Filed under the name the DAEMON will look for, which is not always the door
   // a person came through — in development the console is on `:4200` and the
   // API it proxies to is on `:8091`, and both are this one cawdev. Storing it
   // under the sign-in URL puts a working credential somewhere nothing reads.
-  await store(storeUrl, token, { name });
+  await store(storeUrl, minted.secret, { name, id: minted.id });
 
   say(`  ${ink.success('✓')} ${ink.muted('Minted a')} ${ink.text('runner:operate')} `
     + `${ink.muted(`token for ${slugs.length} project${slugs.length === 1 ? '' : 's'}`)}`);
@@ -497,5 +564,5 @@ export async function mintForThisMachine({
   }
   say('');
 
-  return { token, slugs, name };
+  return { token: minted.secret, tokenId: minted.id, slugs, name };
 }

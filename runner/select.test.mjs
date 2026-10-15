@@ -255,7 +255,10 @@ const COMMANDS = [['/help', 'this list'], ['/login', 'sign in'], ['/logout', 'fo
 
 test('a bare slash offers everything, and typing narrows it', () => {
   assert.equal(completions('/', COMMANDS).length, COMMANDS.length);
+  // A name typed in full comes first, so enter runs it.
   assert.deepEqual(completions('/log', COMMANDS).map(([name]) => name),
+    ['/log', '/login', '/logout']);
+  assert.deepEqual(completions('/lo', COMMANDS).map(([name]) => name),
     ['/login', '/logout', '/log']);
   assert.deepEqual(completions('/q', COMMANDS).map(([name]) => name), ['/quit']);
   assert.deepEqual(completions('/zzz', COMMANDS), []);

@@ -47,6 +47,16 @@ const DATAVIZ = {
   mode: 'REQUIRED',
 };
 
+const AN_EXPERT = {
+  key: 'architect',
+  name: 'The architect',
+  description: 'Designs how a change fits.',
+  // No `tools:` line: it inherits the stage's own, so it reaches IMPLEMENT
+  // the way `readOnlyExpert`'s own comment says an undeclared one does.
+  body: '# Architect\n',
+  mode: 'REQUIRED',
+};
+
 async function aRepository() {
   const path = await mkdtemp(join(tmpdir(), 'cawdev-required-'));
   await run('git', ['init', '-q', '-b', 'main'], { cwd: path });
@@ -72,7 +82,12 @@ async function aRepository() {
  * agent can answer by construction rather than by matching text.
  *
  * @param turns what to emit for each user message, in order. `'skip'` ends the
- *   turn having done nothing; `'use'` calls the required skill first.
+ *   turn having done nothing; `'use'` calls the required skill first;
+ *   `'call-server'` calls a tool of the required MCP server first (R303);
+ *   `'background-expert'` delegates to the required expert with `Agent`,
+ *   the way a session that never passes `run_in_background` at all does —
+ *   i257; `'await-expert'` does the same call WITH `run_in_background:
+ *   false`, the fix i257 asks a session to make instead.
  */
 async function anAgentThat(home, name, turns) {
   const path = join(home, `${name}.mjs`);
@@ -94,10 +109,50 @@ process.stdin.on('data', (chunk) => {
     if (!line.trim()) continue;
     const what = turns[at] ?? 'skip';
     at += 1;
+    // i257: message one is the opening prompt; from two on, it is whatever
+    // the daemon wrote back — the nudge, here. Echoed as an ASSISTANT line so
+    // a test can assert on ITS WORDING, not merely that a nudge happened.
+    if (at > 1) {
+      try {
+        const received = JSON.parse(line);
+        const text = received?.message?.content?.[0]?.text;
+        if (typeof text === 'string') {
+          emit({ type: 'assistant', message: { content: [{ type: 'text', text: 'RECEIVED: ' + text }] } });
+        }
+      } catch {
+        // Not JSON — nothing to echo.
+      }
+    }
     if (what === 'use') {
       emit({
         type: 'assistant',
         message: { content: [{ type: 'tool_use', name: 'Skill', input: { skill: 'cawdev:dataviz' } }] },
+      });
+    }
+    if (what === 'call-server') {
+      // The CLI's own name for an MCP server's tool, through the ordinary
+      // path: no Skill(), no Agent(), just the prefix.
+      emit({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'mcp__fake__x', input: { query: 'anything' } }] },
+      });
+    }
+    if (what === 'background-expert') {
+      // i257: no \`run_in_background\` at all, which the harness prompt now
+      // says defaults to backgrounded — the exact shape that lost i249 and
+      // i250's work.
+      emit({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'Agent',
+          input: { subagent_type: 'cawdev:architect', description: 'reviewing' } }] },
+      });
+    }
+    if (what === 'await-expert') {
+      emit({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'Agent',
+          input: { subagent_type: 'cawdev:architect', description: 'reviewing',
+            run_in_background: false } }] },
       });
     }
     emit({ type: 'result', result: 'turn ' + at + ' over' });
@@ -110,13 +165,31 @@ process.stdin.resume();
   return path;
 }
 
-async function daemonWith(t, { name, agent, workflow, skills = [], expertAgents = [] }) {
+/**
+ * A REQUIRED MCP server on the claim — R303. Not `codegraph`: a key the daemon
+ * has no local knowledge of (`SKILLS_HERE`) attaches with no indexer to
+ * prepare, and the stub agent never spawns the command anyway.
+ */
+const FAKE_SERVER = {
+  key: 'fake',
+  name: 'A fake server',
+  serverName: 'fake',
+  toolPrefix: 'mcp__fake',
+  command: process.execPath,
+  args: ['-e', 'setInterval(() => {}, 1000)'],
+  version: '0.0.1',
+  settings: '{}',
+  mode: 'REQUIRED',
+};
+
+async function daemonWith(t, { name, agent, workflow, skills = [], expertAgents = [], mcpServers = [] }) {
   const workspace = await aRepository();
   const platform = await fakePlatform({
     offers: [CODING],
     workflow,
     skills,
     expertAgents,
+    mcpServers,
     // The stage's own handling has to be what ends this child, not the reaper —
     // see lifecycle.test.mjs, where the same line is load-bearing for the same
     // reason.
@@ -146,8 +219,8 @@ async function daemonWith(t, { name, agent, workflow, skills = [], expertAgents 
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(home, { recursive: true, force: true });
-    await rm(workspace, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(workspace, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await rm(socketPathFor(name), { force: true });
   });
 
@@ -170,11 +243,12 @@ async function untilReported(platform, stage, timeout = 30000) {
 const bodies = (platform) => platform.outputs.map((line) => line.body ?? '');
 
 const nudges = (platform) =>
-  bodies(platform).filter((body) => /has not used .*which this project requires/.test(body));
+  bodies(platform).filter((body) => /(has not used|delegated to) .*which this project requires/
+    .test(body));
 
 test('a stage that skipped a required skill is nudged once, uses it, and ends DONE', async (t) => {
   const home = await mkdtemp(join(tmpdir(), 'cawdev-required-agent-'));
-  t.after(() => rm(home, { recursive: true, force: true }));
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
   const { platform, said } = await daemonWith(t, {
     name: 'test-required-nudged',
@@ -205,7 +279,7 @@ test('a stage that skipped a required skill is nudged once, uses it, and ends DO
 
 test('a stage that used the required skill is never nudged', async (t) => {
   const home = await mkdtemp(join(tmpdir(), 'cawdev-required-agent-'));
-  t.after(() => rm(home, { recursive: true, force: true }));
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
   const { platform, said } = await daemonWith(t, {
     name: 'test-required-used',
@@ -225,7 +299,7 @@ test('a stage that ignores the nudge is not asked twice, and still ENDS', async 
   // are one test is that they are one failure: a daemon that kept asking would
   // also be a daemon that never closed the input.
   const home = await mkdtemp(join(tmpdir(), 'cawdev-required-agent-'));
-  t.after(() => rm(home, { recursive: true, force: true }));
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
   const { platform, said } = await daemonWith(t, {
     name: 'test-required-ignored',
@@ -252,7 +326,7 @@ test('an expert a read-only stage cannot reach is not required of it', async (t)
   // given would be this card widening what a run may do, which is the one thing
   // it must not do. The mode is read AFTER the narrowing, always.
   const home = await mkdtemp(join(tmpdir(), 'cawdev-required-agent-'));
-  t.after(() => rm(home, { recursive: true, force: true }));
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
   const { platform, said } = await daemonWith(t, {
     name: 'test-required-unreachable',
@@ -275,5 +349,115 @@ test('an expert a read-only stage cannot reach is not required of it', async (t)
   // And the existing explanation is still there, unchanged — the honest answer
   // to "why did my expert never get used?" in the other common case.
   assert.ok(bodies(platform).some((body) => /cannot reach it/.test(body)),
+    bodies(platform).join('\n'));
+});
+
+test('a stage that skipped a required MCP server is nudged once, calls it, and ends DONE — R303', async (t) => {
+  // The same loop as the skill's, with the third shape the reader knows: a
+  // call to ANY tool under the server's prefix is the use. Built from what the
+  // machine ATTACHED, and this machine attached it.
+  const home = await mkdtemp(join(tmpdir(), 'cawdev-required-agent-'));
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-required-server',
+    agent: await anAgentThat(home, 'skips-the-server', ['skip', 'call-server']),
+    workflow: [{ stage: 'IMPLEMENT', gate: 'AUTO' }],
+    mcpServers: [FAKE_SERVER],
+  });
+
+  assert.ok(await untilReported(platform, 'IMPLEMENT'), said());
+  const lines = bodies(platform);
+  assert.equal(nudges(platform).length, 1, lines.join('\n'));
+  assert.match(nudges(platform)[0], /has not used fake,/);
+
+  // Said where the person is looking, as the expert's line is.
+  assert.ok(lines.some((body) => /A fake server is available .* This project REQUIRES it/.test(body)),
+    lines.join('\n'));
+
+  const nudgedAt = lines.findIndex((body) => /which this project requires/.test(body));
+  const usedAt = lines.findIndex((body) => body.startsWith('mcp__fake__x'));
+  assert.ok(usedAt > nudgedAt && nudgedAt !== -1,
+    `nudge at ${nudgedAt}, use at ${usedAt}:\n${lines.join('\n')}`);
+
+  const report = platform.stageCalls.find((each) => each.what === 'report');
+  assert.equal(report.body.state, 'DONE', JSON.stringify(report.body));
+});
+
+test('a required MCP server is not required of a read-only stage, which cannot call it — R303', async (t) => {
+  // A PLAN stage is spawned with the list as its whole permission and no
+  // prompt for anything off it, and `mcp__<server>__*` is never on it. Nudging
+  // it for the server would be requiring what the stage was deliberately not
+  // given — the rule the expert case above pins, on the third shape.
+  const home = await mkdtemp(join(tmpdir(), 'cawdev-required-agent-'));
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-required-server-readonly',
+    agent: await anAgentThat(home, 'plans-without-the-server', ['skip', 'skip']),
+    workflow: [{ stage: 'PLAN', gate: 'AUTO' }],
+    mcpServers: [FAKE_SERVER],
+  });
+
+  assert.ok(await untilReported(platform, 'PLAN'), said());
+  assert.deepEqual(nudges(platform), [], bodies(platform).join('\n'));
+});
+
+test('a stage that only BACKGROUNDS a required expert is nudged, told to wait for it, and ends DONE once it does — i257', async (t) => {
+  // The bug i249 and i250 both hit: `Agent(cawdev:architect)` was called —
+  // `used` says so — but never with `run_in_background: false`, so its result
+  // was never going to reach this turn. `used` alone would let this stage
+  // finish silently; `backgrounded` is what still calls it missing.
+  const home = await mkdtemp(join(tmpdir(), 'cawdev-required-agent-'));
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-required-expert-backgrounded',
+    agent: await anAgentThat(home, 'backgrounds-the-expert',
+      ['background-expert', 'await-expert']),
+    workflow: [{ stage: 'IMPLEMENT', gate: 'AUTO' }],
+    expertAgents: [AN_EXPERT],
+  });
+
+  assert.ok(await untilReported(platform, 'IMPLEMENT'), said());
+
+  // Nudged exactly once, same as every other required capability.
+  const lines = bodies(platform);
+  assert.equal(nudges(platform).length, 1, lines.join('\n'));
+
+  // It was CALLED — `capabilityIn` sees `Agent(cawdev:architect)` — so the
+  // transcript line must not say "has not used it", which would be false;
+  // it says what actually happened.
+  const nudgeLine = nudges(platform)[0];
+  assert.match(nudgeLine, /delegated to cawdev:architect only in the background/);
+  assert.doesNotMatch(nudgeLine, /has not used/);
+
+  // And the session itself — not just the transcript a person reads — was
+  // told the specific, actionable reason, not the generic "use it now": it
+  // already used it, and being told to use it again the same way would teach
+  // it nothing.
+  const received = lines.find((body) => body.startsWith('RECEIVED:'));
+  assert.doesNotMatch(received, /has not used/);
+  assert.match(received, /run_in_background: false/);
+  assert.match(received, /delegated to.*with `Agent`, but in the background/);
+
+  const report = platform.stageCalls.find((each) => each.what === 'report');
+  assert.equal(report.body.state, 'DONE', JSON.stringify(report.body));
+});
+
+test('a stage that delegates to the required expert with run_in_background: false is never nudged — i257', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'cawdev-required-agent-'));
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-required-expert-awaited',
+    agent: await anAgentThat(home, 'awaits-the-expert', ['await-expert']),
+    workflow: [{ stage: 'IMPLEMENT', gate: 'AUTO' }],
+    expertAgents: [AN_EXPERT],
+  });
+
+  assert.ok(await untilReported(platform, 'IMPLEMENT'), said());
+  assert.deepEqual(nudges(platform), [], bodies(platform).join('\n'));
+  assert.ok(bodies(platform).some((body) => body.startsWith('Agent(cawdev:architect)')),
     bodies(platform).join('\n'));
 });

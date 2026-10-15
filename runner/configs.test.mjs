@@ -1,16 +1,24 @@
 // node --test tools/runner/configs.test.mjs
 //
-// Every runner config checked into this repository parses.
+// Every runner config beside runner.mjs parses, and none carries a token.
 //
-// This exists because one did not. `macbook-laptop.json` was committed with
-// unresolved merge-conflict markers still in it — `<<<<<<< Updated upstream`
-// and the rest — and sat on `main` invalid. Nothing noticed, because the daemon
-// reads the file on somebody's disk rather than the one in git, and the machine
-// that had a good copy locally went on running perfectly.
+// This exists because one did not parse. `macbook-laptop.json` was committed
+// with unresolved merge-conflict markers still in it — `<<<<<<< Updated
+// upstream` and the rest — and sat on `main` invalid. Nothing noticed, because
+// the daemon reads the file on somebody's disk rather than the one in git, and
+// the machine that had a good copy locally went on running perfectly.
 //
 // That is the shape of the failure worth guarding: a config is the one kind of
 // file a repository can hold in a broken state indefinitely without any test
 // failing, because nothing imports it. So this imports it.
+//
+// Since the laptop's config was untracked (tools/runner/.gitignore — a
+// machine's checkout paths are not the repository's to carry, and `files`
+// packed them into every cawdev-cli tarball), the ordinary state of this
+// directory is NO config at all, and every test here passes on nothing. That
+// is deliberate: what they guard is the config somebody adds back, and the
+// token test is the one DEVELOPING.md leans on — a `runner:operate` token
+// must never arrive in a file in this repository, ignored or not.
 
 import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
@@ -22,10 +30,6 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 
 test('every runner config in the repository is valid JSON', async () => {
   const configs = (await readdir(HERE)).filter((name) => name.endsWith('.json'));
-
-  // Not an empty pass. If the configs move or are renamed away, this test
-  // should be deleted deliberately rather than quietly succeeding on nothing.
-  assert.ok(configs.length > 0, 'no runner configs found beside runner.mjs');
 
   for (const name of configs) {
     const text = await readFile(join(HERE, name), 'utf8');

@@ -57,15 +57,19 @@ async function fakeGh(t, { existing }) {
     '#!/bin/sh',
     `printf '%s' "$*" | tr '\\n' ' ' >> ${log}; printf '\\n' >> ${log}`,
     'case "$1 $2" in',
-    existing ? `  "pr view") printf '%s\\n' "${PR}"; exit 0 ;;` : '  "pr view") exit 1 ;;',
-    `  "pr create") printf '%s\\n' "${PR}"; exit 0 ;;`,
+    // Like the real one, it finds what it created: the daemon asks the host
+    // again after `pr create`.
+    existing
+      ? `  "pr view") printf '%s\\n' "${PR}"; exit 0 ;;`
+      : `  "pr view") [ -f ${log}.created ] && printf '%s\\n' "${PR}" && exit 0; exit 1 ;;`,
+    `  "pr create") touch ${log}.created; printf '%s\\n' "${PR}"; exit 0 ;;`,
     '  "pr merge") exit 0 ;;',
     'esac',
     'exit 1',
     '',
   ].join('\n'));
   await chmod(join(dir, 'gh'), 0o755);
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   return {
     dir,
     async calls() {
@@ -98,9 +102,9 @@ async function daemonWith(t, { path, name, workspaceRequests, env = {} }) {
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await rm(socketPathFor(name), { force: true });
-    await rm(path, { recursive: true, force: true });
+    await rm(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   return { platform, said: () => said };
@@ -134,6 +138,9 @@ test('a MERGE with mergeMethod MERGE_COMMIT runs gh pr merge --merge, and the se
 
   assert.deepEqual(await gh.calls(), [
     'pr view s1-notifications --json url --jq .url',
+    // R306: the mergeability question before every merge. This fake answers
+    // it with a bare URL, which is not JSON, so nothing waits.
+    `pr view ${PR} --json mergeable,mergeStateStatus`,
     `pr merge ${PR} --merge --delete-branch`,
   ]);
 });
@@ -229,4 +236,89 @@ test('an OPEN_PR for a branch that already has a pull request reports it ok, and
   assert.match(byId['wr-open-blank'].result, /has to name a branch/);
 
   assert.deepEqual(await gh.calls(), ['pr view s1-notifications --json url --jq .url']);
+});
+
+// --- a card's branch, asked for by a person ---------------------------------
+//
+// The same OPEN_PR, addressed to a card's branch by `POST work-items/{id}/
+// pull-request`. The difference that matters: that branch may never have left
+// this machine, and `gh pr create --head` names a branch on the host.
+
+/** `aRepository` with a real remote — a bare one on disk — so a push can land. */
+async function aRepositoryWithARemote(t) {
+  const path = await aRepository();
+  const bare = await mkdtemp(join(tmpdir(), 'cawdev-origin-'));
+  t.after(() => rm(bare, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  await run('git', ['init', '-q', '--bare', '-b', 'main', bare]);
+  await run('git', ['remote', 'set-url', 'origin', bare], { cwd: path });
+  await run('git', ['push', '-q', 'origin', 'main'], { cwd: path });
+  return { path, bare };
+}
+
+test('an OPEN_PR for a branch only this machine has pushes it first, and says so under the URL', async (t) => {
+  const { path, bare } = await aRepositoryWithARemote(t);
+  await run('git', ['checkout', '-q', '-b', 'r3-the-thing'], { cwd: path });
+  await writeFile(join(path, 'thing.md'), 'the thing\n');
+  await run('git', ['add', '.'], { cwd: path });
+  await run('git', ['commit', '-q', '-m', 'the thing'], { cwd: path });
+  // Standing on main again, so "nothing moves the checkout" is checked too.
+  await run('git', ['checkout', '-q', 'main'], { cwd: path });
+
+  const gh = await fakeGh(t, { existing: false });
+  const { platform, said } = await daemonWith(t, {
+    path,
+    name: 'test-card-open-pr',
+    workspaceRequests: [{
+      id: 'wr-card', path, kind: 'OPEN_PR', message: 'r3-the-thing',
+      defaultBranch: 'main', title: 'R3 — The thing',
+    }],
+    env: { PATH: `${gh.dir}:${process.env.PATH}` },
+  });
+
+  assert.ok(await platform.untilFinished((finished) => finished.length === 1), said());
+  const [done] = platform.finishedRequests;
+  assert.equal(done.ok, true, done.result);
+  assert.deepEqual(done.result.split('\n'), [PR, 'pushed r3-the-thing to origin first']);
+
+  const { stdout: onOrigin } = await run('git', ['rev-parse', 'r3-the-thing'], { cwd: bare });
+  const { stdout: here } = await run('git', ['rev-parse', 'r3-the-thing'], { cwd: path });
+  assert.equal(onOrigin.trim(), here.trim());
+  const { stdout: head } = await run('git', ['branch', '--show-current'], { cwd: path });
+  assert.equal(head.trim(), 'main', 'the checkout did not move');
+
+  const create = (await gh.calls()).find((each) => each.startsWith('pr create'));
+  assert.match(create, /--head r3-the-thing --base main --title R3 — The thing --body Opened by cawdev for `r3-the-thing` — R3 — The thing\./);
+  assert.doesNotMatch(create, /sprint/);
+});
+
+test('an OPEN_PR does not push over a branch origin has moved on', async (t) => {
+  const { path, bare } = await aRepositoryWithARemote(t);
+  await run('git', ['checkout', '-q', '-b', 'r4-shared'], { cwd: path });
+  await run('git', ['push', '-q', 'origin', 'r4-shared'], { cwd: path });
+  // Somebody else's commit on origin, which this clone has fetched …
+  const other = await mkdtemp(join(tmpdir(), 'cawdev-other-'));
+  t.after(() => rm(other, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  await run('git', ['clone', '-q', '-b', 'r4-shared', bare, other]);
+  await run('git', ['-c', 'user.email=o@x', '-c', 'user.name=O', 'commit', '-q', '--allow-empty', '-m', 'theirs'], { cwd: other });
+  await run('git', ['push', '-q', 'origin', 'r4-shared'], { cwd: other });
+  // … and a different one here: the two have diverged.
+  await run('git', ['commit', '-q', '--allow-empty', '-m', 'mine'], { cwd: path });
+  await run('git', ['fetch', '-q', 'origin'], { cwd: path });
+  const { stdout: theirs } = await run('git', ['rev-parse', 'r4-shared'], { cwd: bare });
+
+  const gh = await fakeGh(t, { existing: false });
+  const { platform, said } = await daemonWith(t, {
+    path,
+    name: 'test-card-open-pr-diverged',
+    workspaceRequests: [{
+      id: 'wr-diverged', path, kind: 'OPEN_PR', message: 'r4-shared',
+      defaultBranch: 'main', title: 'R4 — Shared',
+    }],
+    env: { PATH: `${gh.dir}:${process.env.PATH}` },
+  });
+
+  assert.ok(await platform.untilFinished((finished) => finished.length === 1), said());
+  const { stdout: after } = await run('git', ['rev-parse', 'r4-shared'], { cwd: bare });
+  assert.equal(after.trim(), theirs.trim(), 'origin kept its own commit');
+  assert.ok(!platform.finishedRequests[0].result.includes('pushed'));
 });

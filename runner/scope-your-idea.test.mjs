@@ -131,8 +131,12 @@ async function daemonWith(t, { name, offers = [SCOPE_RUN] }) {
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(home, { recursive: true, force: true });
-    await rm(path, { recursive: true, force: true });
+    // The agent the daemon spawned is in a process group of its own and
+    // outlives a SIGKILL'd parent for a moment, still writing into `home` —
+    // an rmdir that races it is ENOTEMPTY, which failed CI's gate once.
+    const gone = { recursive: true, force: true, maxRetries: 10, retryDelay: 100 };
+    await rm(home, gone);
+    await rm(path, gone);
     await rm(socketPathFor(name), { force: true });
   });
 
@@ -156,7 +160,7 @@ function toolsOn(line) {
 
 test('a scoping session takes no checkout and prepares nothing, like an audit', async (t) => {
   const { said, untilSaid } = await daemonWith(t, { name: 'test-scope-nothing-prepared' });
-  assert.ok(await untilSaid(/a scope session: no branch, nothing prepared/), said());
+  assert.ok(await untilSaid(/a scope session: no branch, nothing cut/), said());
   // The claim carried no branch and the daemon cut none.
   assert.match(said(), /claiming board Scope your idea on null/);
 });

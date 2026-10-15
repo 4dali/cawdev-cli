@@ -47,22 +47,36 @@ async function aRepository() {
  * One line per call, so the assertion is on what was asked rather than on how
  * many times something was asked.
  */
-async function fakeGh(t) {
+async function fakeGh(t, { mergeability = null } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'cawdev-bin-'));
   const log = join(dir, 'calls.txt');
+  const answers = join(dir, 'mergeability.txt');
+  if (mergeability) {
+    await writeFile(answers, mergeability.join('\n') + '\n');
+  }
   await writeFile(join(dir, 'gh'), [
     '#!/bin/sh',
     `printf '%s\\n' "$*" >> ${log}`,
     // `pr view` is how the daemon finds the pull request; `pr merge` is the act.
+    // R306: `pr view <url> --json mergeable,…` is the mergeability question,
+    // answered from a scripted list when the test gave one — each answer
+    // consumed in turn, the last one repeated — and with the bare URL (not
+    // JSON, so the daemon does not wait) when it did not.
     'case "$1 $2" in',
-    `  "pr view") printf '%s\\n' "${PR}"; exit 0 ;;`,
+    '  "pr view")',
+    `    if [ -s ${answers} ] && [ "$5" = "mergeable,mergeStateStatus" ]; then`,
+    `      answer=$(head -n 1 ${answers})`,
+    `      if [ "$(wc -l < ${answers})" -gt 1 ]; then tail -n +2 ${answers} > ${answers}.next && mv ${answers}.next ${answers}; fi`,
+    `      printf '{"mergeable":"%s","mergeStateStatus":"CLEAN"}\\n' "$answer"; exit 0;`,
+    '    fi',
+    `    printf '%s\\n' "${PR}"; exit 0 ;;`,
     '  "pr merge") exit 0 ;;',
     'esac',
     'exit 1',
     '',
   ].join('\n'));
   await chmod(join(dir, 'gh'), 0o755);
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   return {
     dir,
     async calls() {
@@ -76,7 +90,7 @@ async function pathWithoutGh(t) {
   const dir = await mkdtemp(join(tmpdir(), 'cawdev-nogh-'));
   const git = (await run('sh', ['-c', 'command -v git'])).stdout.trim();
   await symlink(git, join(dir, 'git'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   return dir;
 }
 
@@ -104,9 +118,9 @@ async function daemonWith(t, { path, name, workspaceRequests, env = {} }) {
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await rm(socketPathFor(name), { force: true });
-    await rm(path, { recursive: true, force: true });
+    await rm(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   return { platform, said: () => said, alive: () => daemon.exitCode === null };
@@ -138,16 +152,65 @@ test('a MERGE runs gh pr merge and reports the pull request on the first line', 
   const calls = await gh.calls();
   assert.deepEqual(calls, [
     'pr view r134-work --json url --jq .url',
+    // R306: the mergeability question before every merge. This fake answers
+    // it with a bare URL, which is not JSON, so nothing waits and the merge
+    // follows at once.
+    `pr view ${PR} --json mergeable,mergeStateStatus`,
     `pr merge ${PR} --squash --delete-branch`,
   ]);
 
-  assert.match(said(), /MERGING r134-work/);
+  assert.match(said(), /MERGING r134-work — asked for from the console/);
+});
+
+// R306. GitHub computes mergeability lazily, and a merge seconds after
+// `gh pr create` — exactly when a rule's merge arrives — used to fail for no
+// reason a person could act on. The daemon waits while the host says UNKNOWN,
+// bounded, and merges once it says anything else.
+test('a MERGE waits while the host says mergeability is UNKNOWN, then merges once', async (t) => {
+  const path = await aRepository();
+  const gh = await fakeGh(t, {
+    // The first two mergeability questions answer UNKNOWN; the third MERGEABLE.
+    mergeability: ['UNKNOWN', 'UNKNOWN', 'MERGEABLE'],
+  });
+  const { platform, said } = await daemonWith(t, {
+    path,
+    name: 'test-merge-unknown',
+    workspaceRequests: [{
+      id: 'wr-rule', path, kind: 'MERGE', message: 'r306-work', requestedByRule: 'auto_merge',
+    }],
+    env: {
+      PATH: `${gh.dir}:${process.env.PATH}`,
+      // The wait is five seconds in production; the test is not that patient.
+      CAWDEV_MERGEABILITY_WAIT_MS: '50',
+    },
+  });
+
+  const came = await platform.untilFinished((finished) => finished.length === 1);
+  assert.ok(came, `the runner never took the merge:\n${said()}`);
+
+  const [done] = platform.finishedRequests;
+  assert.equal(done.ok, true, done.result);
+  assert.equal(done.result.split('\n')[0], PR);
+
+  const calls = await gh.calls();
+  const mergeabilityQuestions = calls.filter((each) => each.includes('--json mergeable'));
+  assert.equal(mergeabilityQuestions.length, 3, calls.join('\n'));
+  assert.deepEqual(calls.filter((each) => each.startsWith('pr merge')), [
+    `pr merge ${PR} --squash --delete-branch`,
+  ]);
+  // The merge came after the last question, not between them.
+  assert.equal(calls.at(-1), `pr merge ${PR} --squash --delete-branch`);
+
+  // Whose idea it was is in the log — a rule's merge lands with nobody
+  // reading the diff, and the operator's terminal is where that is seen.
+  assert.match(said(), /MERGING r306-work — by auto_merge, nobody is reading this diff/);
+  assert.match(said(), /mergeability known after/);
 });
 
 test('a MERGE naming a path this daemon does not serve is refused, and gh is never called', async (t) => {
   const path = await aRepository();
   const elsewhere = await mkdtemp(join(tmpdir(), 'cawdev-elsewhere-'));
-  t.after(() => rm(elsewhere, { recursive: true, force: true }));
+  t.after(() => rm(elsewhere, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const gh = await fakeGh(t);
   const { platform, said } = await daemonWith(t, {
     path,

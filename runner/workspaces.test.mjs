@@ -81,10 +81,10 @@ async function daemonWith(t, { workspaces, offers, name }) {
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await rm(socketPathFor(name), { force: true });
     for (const workspace of workspaces) {
-      await rm(workspace, { recursive: true, force: true });
+      await rm(workspace, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -185,8 +185,8 @@ test('a bare path is still one workspace', async (t) => {
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(home, { recursive: true, force: true });
-    await rm(workspace, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(workspace, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await rm(socketPathFor('test-workspaces-bare'), { force: true });
   });
 
@@ -285,8 +285,8 @@ test('a stale local branch is brought up to origin before a session starts', asy
   await run('git', ['commit', '-q', '-m', 'work'], { cwd: ws1 });
   await run('git', ['push', '-q', '-u', 'origin', 'r9-work'], { cwd: ws1 });
   t.after(async () => {
-    await rm(origin, { recursive: true, force: true });
-    await rm(ws1, { recursive: true, force: true });
+    await rm(origin, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(ws1, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   const { platform, said } = await daemonWith(t, {
@@ -302,4 +302,62 @@ test('a stale local branch is brought up to origin before a session starts', asy
   const { stdout: pushed } = await run('git', ['rev-parse', 'r9-work'], { cwd: ws1 });
   assert.equal(inWs2.trim(), pushed.trim(), `ws2 started on stale code:\n${said()}`);
   assert.match(said(), /r9-work fast-forwarded to origin\/r9-work/);
+});
+
+test('a run passes over a checkout somebody stranded work in, for the clean one beside it', async (t) => {
+  // R71/i258. workspaces[0] looks exactly as "free" to `held` as workspaces[1]
+  // — nothing claims it — but a previous session left uncommitted work in it.
+  // A modified TRACKED file, not an untracked one: `resetWorkspace`'s
+  // `git clean -fd` would sweep an untracked file away before the picker's
+  // choice was even tested.
+  const workspaces = [await aRepository(), await aRepository()];
+  await writeFile(join(workspaces[0], 'README.md'), '# a project\nstranded\n');
+
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-workspaces-dirty-sibling',
+    workspaces,
+    offers: [codingRun('run-u', 'the card')],
+  });
+
+  const started = await platform.until((transitions) => transitions.some((each) => each.state === 'RUNNING'));
+  assert.ok(started, `the run never started:\n${said()}`);
+  const running = platform.transitions.find((each) => each.state === 'RUNNING');
+  assert.equal(running.workspace, workspaces[1]);
+
+  const failed = platform.transitions.filter((each) => each.state === 'FAILED');
+  assert.deepEqual(failed, [], `a run failed: ${failed[0]?.summary}\n${said()}`);
+
+  // The stranded checkout was never touched: still dirty, still on main.
+  const { stdout: dirty } = await run('git', ['status', '--porcelain'], { cwd: workspaces[0] });
+  assert.ok(dirty.trim(), 'the stranded checkout lost its uncommitted work');
+  const { stdout: branch } = await run(
+    'git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workspaces[0] },
+  );
+  assert.equal(branch.trim(), 'main');
+});
+
+test('when every free checkout is dirty it still takes the first, and says so', async (t) => {
+  // The fallback: with no clean checkout to prefer, the picker's behaviour is
+  // exactly today's — the first free path, dirty or not — and the person
+  // gets the same refusal and *Start anyway* flow they always did.
+  const workspaces = [await aRepository(), await aRepository()];
+  await writeFile(join(workspaces[0], 'README.md'), '# a project\nstranded one\n');
+  await writeFile(join(workspaces[1], 'README.md'), '# a project\nstranded two\n');
+
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-workspaces-all-dirty',
+    workspaces,
+    offers: [codingRun('run-v', 'the card')],
+  });
+
+  const failed = await platform.until((transitions) => transitions.some((each) => each.state === 'FAILED'));
+  assert.ok(failed, `the run never failed:\n${said()}`);
+
+  const failure = platform.transitions.find((each) => each.state === 'FAILED');
+  assert.match(failure.summary, /uncommitted changes/);
+  assert.ok(
+    failure.summary.includes(workspaces[0]),
+    `did not name ${workspaces[0]}:\n${failure.summary}`,
+  );
+  assert.match(said(), /every free checkout in board has uncommitted work/);
 });

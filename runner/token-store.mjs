@@ -61,6 +61,18 @@ export async function loadToken(url) {
 }
 
 /**
+ * The whole record for one instance — R283, and the reason it exists beside
+ * {@link loadToken} rather than replacing it: widening this token's grants
+ * (`PUT /api/tokens/{id}/grants`, R173's own mechanism) needs the token's
+ * PUBLIC id, which is not the secret and was never stored before this. A
+ * record with no `id` — every token minted before R283 — is not an error;
+ * the caller falls back to looking it up by label.
+ */
+export async function loadTokenRecord(url) {
+  return (await readAll())[key(url)] ?? null;
+}
+
+/**
  * The instances this machine holds a token for.
  *
  * For one message and it earns its place there: a token filed under a URL the
@@ -79,9 +91,9 @@ export async function storedUrls() {
  * that already exists — so asking for 0600 and getting 0644 is the ordinary
  * outcome rather than the unusual one.
  */
-export async function saveToken(url, token, { name = null } = {}) {
+export async function saveToken(url, token, { name = null, id = null } = {}) {
   const all = await readAll();
-  all[key(url)] = { token, name, mintedAt: new Date().toISOString() };
+  all[key(url)] = { token, name, id, mintedAt: new Date().toISOString() };
   await mkdir(dirname(tokenFile()), { recursive: true, mode: 0o700 });
   await writeFile(tokenFile(), `${JSON.stringify(all, null, 2)}\n`, { mode: 0o600 });
   await chmod(tokenFile(), 0o600).catch(() => undefined);

@@ -136,25 +136,38 @@ export class History {
     this.draft = '';
   }
 
-  /** Older. Returns null when there is nothing older, so the line is left alone. */
-  back(current = '') {
+  /**
+   * Older. Returns null when there is nothing older, so the line is left alone.
+   *
+   * @param keep which entries this line walks — a command line walks the
+   *   commands and skips the prompts sent to sessions, which it cannot send
+   */
+  back(current = '', keep = () => true) {
     if (this.at === this.entries.length) {
       this.draft = current;
     }
-    if (this.at === 0) {
+    let at = this.at;
+    do {
+      at -= 1;
+    } while (at >= 0 && !keep(this.entries[at]));
+    if (at < 0) {
       return null;
     }
-    this.at -= 1;
-    return this.entries[this.at];
+    this.at = at;
+    return this.entries[at];
   }
 
   /** Newer, ending at the draft you were writing. */
-  forward() {
+  forward(keep = () => true) {
     if (this.at >= this.entries.length) {
       return null;
     }
-    this.at += 1;
-    return this.at === this.entries.length ? this.draft : this.entries[this.at];
+    let at = this.at;
+    do {
+      at += 1;
+    } while (at < this.entries.length && !keep(this.entries[at]));
+    this.at = at;
+    return at === this.entries.length ? this.draft : this.entries[at];
   }
 
   reset() {
@@ -179,7 +192,11 @@ export function completions(text, commands) {
     return [];
   }
   const word = typed.slice(1).toLowerCase();
-  return commands.filter(([name]) => name.slice(1).toLowerCase().startsWith(word));
+  const found = commands.filter(([name]) => name.slice(1).toLowerCase().startsWith(word));
+  // A name typed in full comes first, so enter runs `/log` and not `/login`,
+  // the first longer one in the list.
+  const exact = found.filter(([name]) => name.slice(1).toLowerCase() === word);
+  return [...exact, ...found.filter((row) => !exact.includes(row))];
 }
 
 /**

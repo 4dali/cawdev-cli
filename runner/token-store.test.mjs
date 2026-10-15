@@ -17,7 +17,7 @@ import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { clearToken, loadToken, saveToken, tokenFile } from './token-store.mjs';
+import { clearToken, loadToken, loadTokenRecord, saveToken, tokenFile } from './token-store.mjs';
 
 /** A home nobody else is using, so the store can be looked at on disk. */
 async function inAFreshHome(what) {
@@ -28,7 +28,7 @@ async function inAFreshHome(what) {
     return await what(home);
   } finally {
     process.env.HOME = was;
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }
 
@@ -78,6 +78,23 @@ test('a half-written store is a machine with no token, not a crash', async () =>
     // state cawdev can leave. A parse error thrown from a credential store is
     // one it cannot.
     assert.equal(await loadToken('https://cawdev.example'), null);
+  });
+});
+
+test('the id travels beside the secret, for widening this token later — R283', async () => {
+  await inAFreshHome(async () => {
+    await saveToken('https://cawdev.example', 'cawd_one', { name: 'laptop', id: 'tok-abc' });
+    assert.equal((await loadTokenRecord('https://cawdev.example')).id, 'tok-abc');
+    // loadToken is untouched: everything that reads a bare string still gets one.
+    assert.equal(await loadToken('https://cawdev.example'), 'cawd_one');
+  });
+});
+
+test('a token minted before R283 has no id, and that is not an error', async () => {
+  await inAFreshHome(async () => {
+    await saveToken('https://cawdev.example', 'cawd_one', { name: 'laptop' });
+    assert.equal((await loadTokenRecord('https://cawdev.example')).id, null);
+    assert.equal(await loadTokenRecord('https://never.example'), null);
   });
 });
 

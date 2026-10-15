@@ -25,7 +25,7 @@ const run = promisify(execFile);
 /** A repository whose default branch and feature branch differ. */
 async function aRepository(t) {
   const path = await mkdtemp(join(tmpdir(), 'cawdev-map-'));
-  t.after(() => rm(path, { recursive: true, force: true }));
+  t.after(() => rm(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
 
   await run('git', ['init', '-q', '-b', 'main'], { cwd: path });
   await run('git', ['config', 'user.email', 'test@cawdev.test'], { cwd: path });

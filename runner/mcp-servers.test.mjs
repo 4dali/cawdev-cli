@@ -207,9 +207,9 @@ async function daemonWith(t,
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     for (const path of paths) {
-      await rm(path, { recursive: true, force: true });
+      await rm(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
     await rm(socketPathFor(name), { force: true });
   });
@@ -493,8 +493,8 @@ setTimeout(() => {}, 60000);
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(home, { recursive: true, force: true });
-    await rm(path, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await rm(socketPathFor('test-skill-usage'), { force: true });
   });
 

@@ -81,6 +81,15 @@ commit, or a sha — `SHIPPED` needs a version that is a real git tag, and
 request it would otherwise carry belongs to the run, and a project that reviews
 without opening pull requests has none to give it.
 
+**A card you file may land in the `BACKLOG`** (R371). Where a new card goes
+when you name no status is the project's rule, per door, and the default for a
+card or issue an agent files is the backlog: waiting until a person or a sprint
+brings it in, in no sprint and on no board column. Its origin names your
+session and the card your run was on. A plan session's card lands where the console's
+do (R380). Name a status (`CONSIDERING`, `NEW`) when
+you mean the pipeline. Giving a backlog card a sprint moves it to the first
+status of its kind; moving a card to `BACKLOG` takes it out of its sprint.
+
 **Any status may move to any other.** There is no transition diagram — an entry
 really can go from `CONSIDERING` straight to `SHIPPED` if that is what happened.
 The rules are about what a status *carries*, not the path it took.
@@ -163,15 +172,17 @@ what you are allowed to do.
 | `roadmap_list` | Entries, optionally by status. `brief` omits bodies — use it to survey. |
 | `roadmap_get` | One entry in full: its body, **the plan agreed for it**, and the discussion on it. |
 | `roadmap_create` | Create an entry; the platform allocates its permanent number. |
-| `roadmap_update` | Title, body, section, related ids, and the cards it starts coding after (`after` — R181). |
+| `roadmap_update` | Title, body, section, related ids, the cards it starts coding after (`after` — R181), when it is due and how big it is (`due` — R351: an ISO date, `""` clears; `estimate`: a positive number, `0` clears), the version it is meant for (`targetVersion` — R358, `""` clears; since R362 it must be one the project defined under Project settings → Versions, and any other name is refused), the versions an issue was found in (`affectedVersions` — R378, issues only: names the project defined or shipped in, `[]` clears), and who it is assigned to (`assignee` — R331: a username, `""` clears; `roadmap_list`/`issue_list` take `assignee` too, and `me` means the token's owner). |
 | `roadmap_comment` | Say something *beside* an entry rather than inside it. |
+| `done_when_tick` | Tick (or untick) one numbered item of the card's Done-when checklist as built, with one line of evidence (R368). `task_current` lists the items. Defaults to the run's own card and refuses another; the reviewer's column is a person's and no token can set it. |
 | `roadmap_set_status` | Move an entry, carrying whatever the status requires. |
 | `roadmap_decline` | Decline with a reason. The only exit. |
-| `backlog_file` | File **feedback**, not a card — something a person should decide about. A WRITER accepts it as a card or an issue, or refuses it (R199). |
+| `backlog_file` | File **feedback**, not a card — something a person should decide about. A WRITER accepts it as a card or an issue, or refuses it (R199). Tagged `agent` as a source, plus any `tags` you pass — `customer` when you relay what a user said (R372). |
 | `changelog_list` | The changelog, grouped by release, newest first. |
 | `changelog_get` | One entry. |
 | `changelog_add` | Add an entry; no version means `Unreleased`. |
 | `changelog_update` | Edit one, including moving it to a release when it ships. |
+| `quality_get` | The SonarQube reading — the default branch's gate, a named branch's gate and new problems (inside a run, this run's branch by default), and the open findings with links. Read-only: nothing here refreshes, scans or files (R302). |
 
 ### Inside a run
 
@@ -182,7 +193,7 @@ token gets a refusal saying so.
 | Tool | What it does |
 |---|---|
 | `task_current` | The entry you are working on, its branch, everything already said and asked on this run, **and every earlier run on the same card**. **Call it first**, and again whenever you are unsure where you are. |
-| `report` | `progress` as often as useful; `done` when finished, naming the branch and any PR; `blocked` when a person must resolve something. `done` and `blocked` end the run. |
+| `report` | `progress` as often as useful; `done` when finished, naming the branch and any PR; `blocked` when a person must resolve something. `done` and `blocked` end the run; on a coding run `done` is refused until everything is committed and pushed (R345). |
 | `ask_user` | Ask the person who started the run, and wait. Blocks up to ten minutes, then hands back a `question_id`. |
 | `await_answer` | Resume waiting for a question `ask_user` handed back. |
 | `ask_group` | Ask a **round** — up to twelve questions that belong together, under one title. Blocks until every one of them has been answered, then hands back a `group_id`. |
@@ -214,6 +225,11 @@ answers — they can always write their own.
 
 After `report done` or `report blocked`, the run is over and your token has
 expired with it. There is nothing further to do.
+
+On a coding run, `report done` is **refused** while the checkout has
+uncommitted files or commits the remote has not seen (R345) — the answer names
+them. Commit what belongs to the work (discard what does not), `git push`, and
+report done again; `report blocked` if something stops you.
 
 ### When something you need is not allowed (R51)
 

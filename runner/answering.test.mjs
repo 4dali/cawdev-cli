@@ -794,3 +794,16 @@ test('a daemon that never said its pid is left alone rather than guessed at', ()
   }
   assert.deepEqual(stopped, []);
 });
+
+test('a session the platform stops honouring is said once, and /login is offered', async () => {
+  const { ui } = client({ question: null });
+  ui.session.email = null;
+  ui.session.signedIn = false;
+  ui.session.onExpired();
+  ui.session.onExpired();
+  const lines = said(ui).split('\n').filter((line) => /expired/.test(line));
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /type \/login to sign in again/);
+  assert.equal(ui.expired, true);
+  assert.match(ui.footer().map(stripAnsi).join('\n'), /session expired — \/login/);
+});

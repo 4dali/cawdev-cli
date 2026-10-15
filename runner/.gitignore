@@ -1,0 +1,6 @@
+# A machine's own runner config: the paths of somebody's checkouts. Not the
+# repository's to carry. npm's packer reads this file too, and it is HERE
+# rather than in tools/ because a .gitignore beside package.json cannot
+# override `files` (which names runner/ whole) while one in a subdirectory
+# can — so this one line keeps the file out of git and out of the tarball.
+macbook-laptop.json

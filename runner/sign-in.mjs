@@ -26,6 +26,9 @@ export class Session {
     this.url = String(url).replace(/\/+$/, '');
     this.cookies = new Map();
     this.email = null;
+    /** Called once when a signed-in session is answered 401 — expired, or
+     *  revoked on the platform. The terminal offers `/login` from there. */
+    this.onExpired = null;
   }
 
   get signedIn() {
@@ -63,6 +66,14 @@ export class Session {
     });
     this.#remember(response);
     const text = await response.text();
+    if (response.status === 401 && this.email !== null) {
+      // The cookie stopped meaning anything: expired, signed out elsewhere, or
+      // the account revoked. Until this every action failed one at a time with
+      // a bare "HTTP 401" while the footer still named the person — so the
+      // state is put right HERE, where every request passes, and said once.
+      this.email = null;
+      this.onExpired?.();
+    }
     if (!response.ok) {
       const failure = new Error(messageIn(text) ?? `${method} ${path} failed: HTTP ${response.status}`);
       failure.status = response.status;

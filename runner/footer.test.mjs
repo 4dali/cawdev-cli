@@ -50,6 +50,33 @@ test('the footer carries all five settings at once, and never scrolls away', () 
   assert.match(said, /sessions 1\/4/, "the machine's own cap");
 });
 
+// --- R294: a config the daemon has not restarted onto stays on the footer ---------
+
+test('restartNeeded on the hello is a pinned row naming the keys and how to restart', () => {
+  const stale = { ...runner, restartNeeded: ['projects', 'url'] };
+  const said = footerLines({ runner: stale, runs, email: 'dali@cawdev.test', watching: null }, 100, painter(3)).map(stripAnsi);
+  const row = said.find((line) => line.includes('config changed'));
+  assert.ok(row, 'a row of its own');
+  assert.match(row, /! config changed: projects, url — restart to apply \(q, then cawdev\)/);
+  // Every row keeps the invariant the scrollback rests on: exactly the width.
+  for (const line of said) assert.equal(line.length, 100);
+});
+
+test('no restartNeeded, an empty one, or an older daemon without the field, draws nothing', () => {
+  for (const hello of [runner, { ...runner, restartNeeded: [] }, { ...runner, restartNeeded: null }]) {
+    const said = footerLines({ runner: hello, runs, email: 'x@y', watching: null }, 100, painter(3)).map(stripAnsi);
+    assert.ok(!said.some((line) => line.includes('config changed')));
+  }
+});
+
+test('the restart row is clipped at forty columns rather than wrapping under the footer', () => {
+  const stale = { ...runner, restartNeeded: ['projects', 'url', 'token', 'browser'] };
+  const said = footerLines({ runner: stale, runs, email: 'x@y', watching: null }, 40, painter(3)).map(stripAnsi);
+  const row = said.find((line) => line.includes('config changed'));
+  assert.ok(row);
+  assert.equal(row.length, 40);
+});
+
 test('the run being watched is on the footer, because that is what enter prompts', () => {
   const said = drawn({ email: 'dali@cawdev.test', watching: runs[0] }).join('\n');
   assert.match(said, /R81 — one word/);
@@ -320,4 +347,20 @@ test('a paste is characters, not one enormous key', () => {
   const pasted = 'fix the thing\nand the other';
   assert.equal(keysIn(pasted).length, pasted.length);
   assert.equal(keysIn(pasted).join(''), pasted);
+});
+
+test('an expired session is pinned with the way back', () => {
+  const lines = drawn({ email: null, expired: true }).join('\n');
+  assert.match(lines, /session expired — \/login to sign in again/);
+  assert.match(lines, /watching only/);
+  assert.doesNotMatch(drawn({ email: null }).join('\n'), /session expired/);
+});
+
+test('a many-line summary (a stage gate\'s plan) is one row and a count', () => {
+  const lines = permissionBanner({
+    approval: { toolName: 'stage gate', summary: 'Plan for R12\nstep one\nstep two\n\nstep three', askedAt: '2026-10-11T10:00:00Z' },
+  }, 80, painter(1)).map(stripAnsi);
+  assert.match(lines[0], /^ permission  Plan for R12 \(\+3 lines\)$/);
+  assert.ok(lines.every((line) => !line.includes('\n')));
+  assert.ok(!lines.some((line) => /step one/.test(line)));
 });

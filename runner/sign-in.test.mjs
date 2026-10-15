@@ -71,6 +71,10 @@ async function fakeApi({ answers = [] }) {
         });
         return response.end(JSON.stringify(answer));
       }
+      if (url === '/api/inbox') {
+        response.writeHead(401, { 'content-type': 'application/json' });
+        return response.end('{"message":"Not signed in."}');
+      }
       response.writeHead(404);
       return response.end('{}');
     });
@@ -97,7 +101,7 @@ async function inAFreshHome(what) {
     return await what(home);
   } finally {
     process.env.HOME = was;
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }
 
@@ -162,6 +166,35 @@ test('a code that expires under the terminal stops it, and says which it was', a
     assert.equal(outcome.signedIn, false);
     assert.equal(outcome.expired, true);
   });
+});
+
+test('a 401 on a signed-in session ends it and says so once', async (t) => {
+  const api = await fakeApi({ answers: [] });
+  t.after(() => api.close());
+
+  const session = new Session(api.url);
+  session.email = 'dali@cawdev.test';
+  let told = 0;
+  session.onExpired = () => told++;
+
+  await assert.rejects(session.request('/api/inbox'), (failure) => failure.status === 401);
+  assert.equal(session.signedIn, false, 'the footer must stop naming somebody the platform refuses');
+  assert.equal(told, 1);
+
+  // Every poll after that is answered 401 too, and is not news.
+  await assert.rejects(session.request('/api/inbox'));
+  assert.equal(told, 1);
+});
+
+test('a 401 before anybody signed in is not an expiry', async (t) => {
+  const api = await fakeApi({ answers: [] });
+  t.after(() => api.close());
+
+  const session = new Session(api.url);
+  let told = 0;
+  session.onExpired = () => told++;
+  await assert.rejects(session.request('/api/inbox'));
+  assert.equal(told, 0);
 });
 
 test('the machine describes itself as something a person could recognise', () => {

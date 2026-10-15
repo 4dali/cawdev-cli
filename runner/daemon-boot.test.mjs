@@ -13,9 +13,10 @@
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createServer } from 'node:http';
 import { connect } from 'node:net';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -94,7 +95,7 @@ test('the daemon registers, offers a socket, and says what it is', async (t) => 
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await rm(socketPathFor(RUNNER), { force: true });
   });
 
@@ -119,6 +120,201 @@ test('the daemon registers, offers a socket, and says what it is', async (t) => 
   assert.ok(platform.seen.some((call) => call.includes('heartbeat')), platform.seen.join(', '));
 });
 
+test('the daemon reports its own version, and refuses to boot below the platform\'s minimum — R283', async (t) => {
+  const platform = await fakePlatform({ health: { version: '9.9.9', minimumCliVersion: '999.0.0' } });
+  const directory = await mkdtemp(join(tmpdir(), 'cawdev-boot-'));
+  const config = join(directory, 'config.json');
+  await writeFile(config, JSON.stringify({
+    url: platform.url,
+    name: `${RUNNER}-min`,
+    agentCommand: '/bin/echo',
+    projects: { board: directory },
+  }));
+
+  const daemon = spawn(process.execPath, [DAEMON, '--config', config], {
+    env: platform.env(),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let said = '';
+  daemon.stdout.on('data', (chunk) => (said += chunk));
+  daemon.stderr.on('data', (chunk) => (said += chunk));
+
+  const [code] = await once(daemon, 'exit');
+
+  t.after(async () => {
+    platform.close();
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(socketPathFor(`${RUNNER}-min`), { force: true });
+  });
+
+  assert.notEqual(code, 0, 'a CLI below the declared minimum must not start driving runs');
+  assert.match(said, /requires at least 999\.0\.0/);
+  // Never registered — a refused boot must not have already claimed anything.
+  assert.ok(!platform.seen.includes('POST /api/runners'), platform.seen.join(', '));
+});
+
+test('the version is sent on registration when nothing refuses it', async (t) => {
+  const platform = await fakePlatform({ health: { version: '0.9.0' } });
+  const directory = await mkdtemp(join(tmpdir(), 'cawdev-boot-'));
+  const config = join(directory, 'config.json');
+  await writeFile(config, JSON.stringify({
+    url: platform.url,
+    name: `${RUNNER}-ver`,
+    agentCommand: '/bin/echo',
+    projects: { board: directory },
+  }));
+
+  await rm(socketPathFor(`${RUNNER}-ver`), { force: true });
+  const daemon = spawn(process.execPath, [DAEMON, '--config', config], {
+    env: platform.env(),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  t.after(async () => {
+    daemon.kill('SIGKILL');
+    platform.close();
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(socketPathFor(`${RUNNER}-ver`), { force: true });
+  });
+
+  await firstMessage(socketPathFor(`${RUNNER}-ver`));
+  assert.match(platform.registrations[0].cliVersion, /^\d+\.\d+\.\d+/);
+});
+
+test('SIGHUP re-reads acceptsRulesFromConsole and agentCommands without a restart — R283', async (t) => {
+  const platform = await fakePlatform();
+  const directory = await mkdtemp(join(tmpdir(), 'cawdev-boot-'));
+  const config = join(directory, 'config.json');
+  const written = {
+    url: platform.url,
+    name: `${RUNNER}-hup`,
+    agentCommand: '/bin/echo',
+    projects: { board: directory },
+    acceptsRulesFromConsole: false,
+    // Fast enough that a test does not wait out a real 30s interval.
+    heartbeatSeconds: 1,
+  };
+  await writeFile(config, JSON.stringify(written));
+
+  await rm(socketPathFor(`${RUNNER}-hup`), { force: true });
+  const daemon = spawn(process.execPath, [DAEMON, '--config', config], {
+    env: platform.env(),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let said = '';
+  daemon.stdout.on('data', (chunk) => (said += chunk));
+  daemon.stderr.on('data', (chunk) => (said += chunk));
+
+  t.after(async () => {
+    daemon.kill('SIGKILL');
+    platform.close();
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(socketPathFor(`${RUNNER}-hup`), { force: true });
+  });
+
+  await firstMessage(socketPathFor(`${RUNNER}-hup`));
+  assert.equal(platform.heartbeats.at(-1)?.acceptsConsoleRules, false);
+
+  // The operator edits the file this daemon booted from, the way
+  // `cawdev config rules on` does, and signals it — no restart.
+  await writeFile(config, JSON.stringify({
+    ...written, acceptsRulesFromConsole: true, agentCommands: ['claude', 'agy'],
+  }));
+  daemon.kill('SIGHUP');
+
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline && platform.heartbeats.at(-1)?.acceptsConsoleRules !== true) {
+    await new Promise((done) => setTimeout(done, 150));
+  }
+
+  assert.equal(platform.heartbeats.at(-1)?.acceptsConsoleRules, true);
+  assert.match(said, /re-read .* on SIGHUP — applied: agentCommands, acceptsRulesFromConsole/);
+  assert.doesNotMatch(said, /needs restart/, 'both keys are hot-swappable');
+
+  // R294: the hello says so too, and nothing needs a restart.
+  const hello = await firstMessage(socketPathFor(`${RUNNER}-hup`));
+  assert.deepEqual(hello.runner.restartNeeded, []);
+  assert.ok(hello.runner.configReadAt, 'when the file was last read, for a door that signalled');
+});
+
+test('a project added to the file is "needs restart" on the hello, off the mtime with no signal — R294', async (t) => {
+  const platform = await fakePlatform();
+  const directory = await mkdtemp(join(tmpdir(), 'cawdev-boot-'));
+  const config = join(directory, 'config.json');
+  const written = {
+    url: platform.url,
+    name: `${RUNNER}-stale`,
+    agentCommand: '/bin/echo',
+    projects: { board: directory },
+    heartbeatSeconds: 1,
+  };
+  await writeFile(config, JSON.stringify(written));
+
+  await rm(socketPathFor(`${RUNNER}-stale`), { force: true });
+  const daemon = spawn(process.execPath, [DAEMON, '--config', config], {
+    env: platform.env(),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let said = '';
+  daemon.stdout.on('data', (chunk) => (said += chunk));
+  daemon.stderr.on('data', (chunk) => (said += chunk));
+  t.after(async () => {
+    daemon.kill('SIGKILL');
+    platform.close();
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(socketPathFor(`${RUNNER}-stale`), { force: true });
+  });
+
+  const booted = await firstMessage(socketPathFor(`${RUNNER}-stale`));
+  assert.deepEqual(booted.runner.restartNeeded, []);
+
+  // A client that stays attached, to see the daemon push its re-read hello.
+  const pushed = [];
+  const watcher = connect(socketPathFor(`${RUNNER}-stale`));
+  watcher.setEncoding('utf8');
+  let buffer = '';
+  watcher.on('data', (chunk) => {
+    buffer += chunk;
+    let at;
+    while ((at = buffer.indexOf('\n')) !== -1) {
+      pushed.push(JSON.parse(buffer.slice(0, at)));
+      buffer = buffer.slice(at + 1);
+    }
+  });
+  t.after(() => watcher.destroy());
+
+  // Somebody edits the file by hand: a second project, and the agent list —
+  // one the daemon can take, one it cannot. Nobody signals it.
+  await new Promise((done) => setTimeout(done, 1100)); // mtime resolution on some filesystems is a second
+  await writeFile(config, JSON.stringify({
+    ...written, projects: { ...written.projects, other: directory }, agentCommands: ['/bin/echo', 'claude'],
+  }));
+
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline && !pushed.some((event) => event.type === 'runner')) {
+    await new Promise((done) => setTimeout(done, 150));
+  }
+  const event = pushed.find((each) => each.type === 'runner');
+  assert.ok(event, 'the daemon told the attached client');
+  assert.deepEqual(event.runner.restartNeeded, ['projects']);
+  assert.deepEqual(event.runner.agents, ['/bin/echo', 'claude'], 'the hot-swappable half was applied');
+  assert.notEqual(event.runner.configReadAt, booted.runner.configReadAt);
+  assert.match(said, /re-read .* on edit — applied: agentCommands; needs restart: projects/);
+
+  // A fresh attach reads the same thing off its hello.
+  const again = await firstMessage(socketPathFor(`${RUNNER}-stale`));
+  assert.deepEqual(again.runner.restartNeeded, ['projects']);
+
+  // Reverted by hand: compared against what was BOOTED, so the notice clears.
+  await new Promise((done) => setTimeout(done, 1100));
+  await writeFile(config, JSON.stringify(written));
+  const cleared = Date.now() + 8000;
+  while (Date.now() < cleared && (await firstMessage(socketPathFor(`${RUNNER}-stale`))).runner.restartNeeded.length) {
+    await new Promise((done) => setTimeout(done, 150));
+  }
+  assert.deepEqual((await firstMessage(socketPathFor(`${RUNNER}-stale`))).runner.restartNeeded, []);
+});
+
 test('--attach starts the machine and shows it, in one terminal', async (t) => {
   const platform = await fakePlatform();
   const directory = await mkdtemp(join(tmpdir(), 'cawdev-boot-'));
@@ -140,7 +336,7 @@ test('--attach starts the machine and shows it, in one terminal', async (t) => {
   t.after(async () => {
     both.kill('SIGKILL');
     platform.close();
-    await rm(directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await rm(socketPathFor(`${RUNNER}-3`), { force: true });
   });
 
@@ -206,7 +402,7 @@ test('a claimed run actually spawns', async (t) => {
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await rm(socketPathFor(`${RUNNER}-4`), { force: true });
   });
 
@@ -268,7 +464,7 @@ test('a daemon that stops takes its socket with it', async (t) => {
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   await firstMessage(socketPathFor(`${RUNNER}-2`));
@@ -279,4 +475,130 @@ test('a daemon that stops takes its socket with it', async (t) => {
   // A file left behind is what makes the next attach report a machine that is
   // not there.
   await assert.rejects(() => firstMessage(socketPathFor(`${RUNNER}-2`), 1500));
+});
+
+test('a poll that returns after Ctrl-C claims nothing', async (t) => {
+  // i247. The queue's long poll blocks for up to pollSeconds, and a Ctrl-C
+  // during it flips `stopping` and begins the goodbye — bounded, not instant.
+  // A poll that returned inside that window walked on to claim the run it
+  // carried and handed an agent to a process that was about to exit.
+  //
+  // The fake platform answers the queue at once, so this one is hand-rolled:
+  // it HOLDS the poll, and answers it with an offer only once the goodbye has
+  // arrived — which is exactly the order a real platform can produce.
+  const seen = [];
+  let releasePoll = null;
+  const polled = new Promise((done) => {
+    releasePoll = done;
+  });
+  const server = createServer((request, response) => {
+    const url = request.url ?? '';
+    seen.push(`${request.method} ${url.split('?')[0]}`);
+    response.setHeader('content-type', 'application/json');
+    if (url.endsWith('/api/runners') && request.method === 'POST') {
+      return response.end(JSON.stringify({ id: 'runner-1', name: `${RUNNER}-3` }));
+    }
+    if (url.includes('/queue')) {
+      // Held. Released by the goodbye below.
+      releasePoll(response);
+      return undefined;
+    }
+    if (url.endsWith('/goodbye')) {
+      void polled.then((poll) => {
+        poll.end(JSON.stringify([{
+          run: { id: 'run-1', projectSlug: 'board', label: 'R1', branch: null, profile: 'ASK' },
+          workspace: null,
+          preferredWorkspace: null,
+        }]));
+        // Long enough for a claim to reach here if the daemon still makes one;
+        // well inside the daemon's own two-second bound on the goodbye.
+        setTimeout(() => response.end(JSON.stringify({})), 500);
+      });
+      return undefined;
+    }
+    request.resume();
+    return response.end(JSON.stringify({}));
+  });
+  await new Promise((done) => server.listen(0, '127.0.0.1', done));
+  const url = `http://127.0.0.1:${server.address().port}`;
+
+  const directory = await mkdtemp(join(tmpdir(), 'cawdev-boot-'));
+  const config = join(directory, 'config.json');
+  await writeFile(config, JSON.stringify({
+    url,
+    name: `${RUNNER}-3`,
+    agentCommand: '/bin/echo',
+    projects: { board: directory },
+  }));
+
+  const daemon = spawn(process.execPath, [DAEMON, '--config', config], {
+    env: { ...process.env, CAWDEV_URL: url, CAWDEV_TOKEN: 'cawd_fake', CAWDEV_PROJECT: undefined, CAWDEV_GRANTABLE: undefined },
+    stdio: 'ignore',
+  });
+  t.after(async () => {
+    daemon.kill('SIGKILL');
+    server.close();
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+
+  await firstMessage(socketPathFor(`${RUNNER}-3`));
+  await polled;
+
+  daemon.kill('SIGINT');
+  await once(daemon, 'exit');
+
+  assert.ok(seen.some((line) => line.endsWith('/goodbye')), `never said goodbye: ${seen}`);
+  assert.ok(
+    !seen.some((line) => line.includes('/claim/')),
+    `claimed a run after being told to stop: ${seen}`,
+  );
+});
+
+test('R339: a daemon booting after one that died reports the runs it was driving, at once and by cause', async (t) => {
+  const platform = await fakePlatform({ runLive: true });
+  const directory = await mkdtemp(join(tmpdir(), 'cawdev-boot-'));
+  const name = `${RUNNER}-restart`;
+  const config = join(directory, 'config.json');
+  await writeFile(config, JSON.stringify({
+    url: platform.url,
+    name,
+    agentCommand: '/bin/echo',
+    projects: { board: directory },
+  }));
+  // What the daemon before it left: one run, its writer a pid that is gone.
+  const notes = join(directory, 'driving');
+  const dead = spawn(process.execPath, ['-e', '']);
+  await once(dead, 'exit');
+  await mkdir(notes, { recursive: true });
+  await writeFile(join(notes, 'runner-1.json'), JSON.stringify({
+    pid: dead.pid,
+    runs: [{ id: 'run-killed', projectSlug: 'board', childPid: null, command: null }],
+  }));
+
+  const daemon = spawn(process.execPath, [DAEMON, '--config', config], {
+    env: { ...platform.env(), CAWDEV_DRIVING_DIR: notes },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let said = '';
+  daemon.stdout.on('data', (chunk) => (said += chunk));
+  daemon.stderr.on('data', (chunk) => (said += chunk));
+  t.after(async () => {
+    daemon.kill('SIGKILL');
+    platform.close();
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(socketPathFor(name), { force: true });
+  });
+
+  await firstMessage(socketPathFor(name));
+  const reported = platform.transitions.find((each) => each.runId === 'run-killed');
+  assert.ok(reported, `no transition for the run it left behind:\n${said}`);
+  assert.equal(reported.state, 'FAILED');
+  assert.equal(reported.failureReason, 'DAEMON_RESTARTED');
+  assert.match(reported.summary, new RegExp(`daemon on ${name} restarted`));
+  assert.match(reported.summary, new RegExp(`pid ${dead.pid}`));
+
+  // And the note is this daemon's now, with nothing in it.
+  const note = JSON.parse(await readFile(join(notes, 'runner-1.json'), 'utf8'));
+  assert.equal(note.pid, daemon.pid);
+  assert.deepEqual(note.runs, []);
 });

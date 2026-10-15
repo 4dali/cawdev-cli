@@ -19,6 +19,12 @@
 //                 profile: a question is bounded here and nowhere else
 //   the browser   R61, and the one line that says an agent may reach Chrome
 //
+// R283 adds two more, because both became things a machine can now be
+// RECONFIGURED into without a restart (`cawdev config`, and the daemon's own
+// SIGHUP handler in runner.mjs): which agent(s) this machine spawns, and —
+// when it could be read — the CLI's own version, so a stale one is visible at
+// the moment it would matter most, before anything has failed yet.
+//
 // It prints once, at boot. Anything that changes afterwards belongs in the
 // log, not here.
 
@@ -31,7 +37,7 @@ import { padVisible } from '../lib/ansi.mjs';
  * Lines rather than output, so the caller decides where it goes — and so this
  * can be tested by reading it rather than by capturing a stream.
  */
-export function bannerLines(config, ink) {
+export function bannerLines(config, ink, cliVersionValue = null) {
   const lines = ['', ...mark(ink, { tagline: 'the runner' }), ''];
 
   const label = (text) => ink.muted(padVisible(text, 12));
@@ -39,6 +45,10 @@ export function bannerLines(config, ink) {
 
   say('platform', ink.accent(config.url));
   say('runner', ink.text(config.name));
+  if (cliVersionValue) {
+    say('cli', ink.muted(cliVersionValue));
+  }
+  say('agents', ink.text((config.agentCommands ?? []).join(', ') || 'claude'));
 
   const projects = Object.entries(config.projects);
   projects.forEach(([slug, project], at) => {

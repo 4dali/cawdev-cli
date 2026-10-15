@@ -51,8 +51,14 @@ const UP = new Set([`${ESC}[A`, `${ESC}OA`, `${ESC}[Z`, '\x10', 'k']);
  * an answer, a decision or a run to watch. The widget itself does not care.
  */
 export class Select {
-  constructor({ kind = 'choice', title = '', rows = [], at = 0, empty = null, hint = null }) {
+  constructor({ kind = 'choice', title = '', rows = [], at = 0, empty = null, hint = null,
+    many = false, picked = [] }) {
     this.kind = kind;
+    // MANY: space (or a digit) ticks a row, `a` ticks all or none, enter
+    // settles on what is ticked — or on the row under the cursor, when
+    // nothing is, so enter alone still means "this one".
+    this.many = many;
+    this.picked = new Set(picked);
     this.title = title;
     this.rows = rows;
     this.empty = empty;
@@ -93,7 +99,25 @@ export class Select {
       return { done: 'cancelled', row: null };
     }
     if (pressed === '\r' || pressed === '\n') {
+      if (this.many) {
+        const rows = this.rows.filter((row) => this.picked.has(row.id));
+        return { done: 'chosen', row: this.row, rows: rows.length ? rows : [this.row].filter(Boolean) };
+      }
       return { done: 'chosen', row: this.row };
+    }
+    if (this.many && (pressed === ' ' || /^[1-9]$/.test(pressed))) {
+      const at = pressed === ' ' ? this.at : Number(pressed) - 1;
+      const row = this.rows[at];
+      if (!row) return null;
+      this.at = at;
+      if (this.picked.has(row.id)) this.picked.delete(row.id);
+      else this.picked.add(row.id);
+      return { done: null, moved: true };
+    }
+    if (this.many && pressed === 'a') {
+      const all = this.rows.every((row) => this.picked.has(row.id));
+      this.picked = all ? new Set() : new Set(this.rows.map((row) => row.id));
+      return { done: null, moved: true };
     }
     if (DOWN.has(pressed)) {
       this.move(1);
@@ -141,7 +165,8 @@ export function selectLines(select, width, ink = painter(3), room = 8) {
     const at = from + offset;
     lines.push(rowLine(row, {
       chosen: at === select.at,
-      marker: row.marker ?? ' ',
+      marker: select.many ? (select.picked.has(row.id) ? ink.success('●') : ink.muted('○'))
+        : row.marker ?? ' ',
       // Past nine there is no digit to offer, and a number nobody can press is
       // worse than a space.
       number: at < 9 ? String(at + 1) : ' ',
@@ -172,8 +197,10 @@ function hintLine(select, width, ink) {
   if (room < 10) {
     return clip(` ${leave}`, width);
   }
-  const keys = [ink.muted('↑↓ move'), ink.muted('enter choose')];
-  if (select.rows.length > 1) {
+  const keys = select.many
+    ? [ink.muted('↑↓ move'), ink.muted('space tick'), ink.muted('a all'), ink.muted('enter confirm')]
+    : [ink.muted('↑↓ move'), ink.muted('enter choose')];
+  if (select.rows.length > 1 && !select.many) {
     keys.push(ink.muted('1-9 pick'));
   }
   if (select.hint) {

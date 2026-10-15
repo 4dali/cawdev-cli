@@ -70,10 +70,10 @@ async function daemonWith(t, { workspaces, offers, name, maxSessions }) {
   t.after(async () => {
     daemon.kill('SIGKILL');
     platform.close();
-    await rm(home, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     await rm(socketPathFor(name), { force: true });
     for (const workspace of workspaces) {
-      await rm(workspace, { recursive: true, force: true });
+      await rm(workspace, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 

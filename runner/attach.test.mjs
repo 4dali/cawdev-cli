@@ -8,7 +8,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { clip, stripAnsi, visibleWidth, wrap } from './attach.mjs';
+import { clip, sshNeedsAPerson, stripAnsi, visibleWidth, wrap } from './attach.mjs';
 
 const RED = '\x1b[31m';
 const OFF = '\x1b[0m';
@@ -48,4 +48,11 @@ test('clipping never cuts an escape sequence in half', () => {
 
 test('clipping leaves a short line alone', () => {
   assert.equal(clip('abc', 10), 'abc');
+});
+
+test('a clone ssh refused to ask about is told apart from any other failure', () => {
+  assert.equal(sshNeedsAPerson('git@bitbucket.org: Permission denied (publickey).\nfatal: Could not read'), true);
+  assert.equal(sshNeedsAPerson('Host key verification failed.'), true);
+  assert.equal(sshNeedsAPerson('fatal: repository not found'), false);
+  assert.equal(sshNeedsAPerson(undefined), false);
 });

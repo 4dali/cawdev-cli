@@ -21,8 +21,11 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { PassThrough } from 'node:stream';
 import {
+  asker,
   checkoutFor,
+  cloneAside,
   configFor,
   mintForThisMachine,
   mintRunnerToken,
@@ -74,7 +77,7 @@ const quiet = () => {};
 
 async function aTempHome() {
   const home = await mkdtemp(join(tmpdir(), 'cawdev-setup-'));
-  return { home, clean: () => rm(home, { recursive: true, force: true }) };
+  return { home, clean: () => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }) };
 }
 
 const A_PROJECT = {
@@ -138,9 +141,10 @@ test('the config holding the machine token is readable by nobody else', async (t
 
 test('the token minted is runner:operate on the chosen projects and nothing else', async () => {
   const session = fakeSession();
-  const secret = await mintRunnerToken(session, ['board', 'other'], 'laptop');
+  const minted = await mintRunnerToken(session, ['board', 'other'], 'laptop');
 
-  assert.equal(secret, 'cawd_minted');
+  assert.equal(minted.secret, 'cawd_minted');
+  assert.equal(minted.id, 'abc');
   assert.ok(session.seen.includes('{"board":["runner:operate"],"other":["runner:operate"]}'),
     session.seen.join(' | '));
 });
@@ -162,7 +166,7 @@ test('one project is served without asking which', async (t) => {
       cloned.push([gitUrl, path]);
       return Promise.resolve();
     },
-    agent: () => Promise.resolve('/usr/local/bin/claude'),
+    agent: () => Promise.resolve([{ command: 'claude', where: '/usr/local/bin/claude' }]),
     configPath: join(machine.home, 'runner.config.json'),
   });
 
@@ -188,7 +192,7 @@ test('several projects are chosen by number, and only those are cloned', async (
       cloned.push(path);
       return Promise.resolve();
     },
-    agent: () => Promise.resolve('/usr/local/bin/claude'),
+    agent: () => Promise.resolve([{ command: 'claude', where: '/usr/local/bin/claude' }]),
     configPath: join(machine.home, 'runner.config.json'),
   });
 
@@ -215,7 +219,7 @@ test('saying Claude Code is not signed in creates nothing at all', async (t) => 
         written = true;
         return Promise.resolve();
       },
-      agent: () => Promise.resolve(null),
+      agent: () => Promise.resolve([{ command: 'claude', where: '/usr/local/bin/claude' }]),
       configPath: join(machine.home, 'runner.config.json'),
     }),
     /Sign in first/,
@@ -236,7 +240,7 @@ test('a project with no git URL is asked about rather than skipped or guessed', 
     ask: scriptedAsker([machine.home, '/somewhere/board', 'y']),
     say: quiet,
     clone: () => assert.fail('nothing to clone from'),
-    agent: () => Promise.resolve('/usr/local/bin/claude'),
+    agent: () => Promise.resolve([{ command: 'claude', where: '/usr/local/bin/claude' }]),
     configPath: join(machine.home, 'runner.config.json'),
   });
 
@@ -254,7 +258,7 @@ test('a checkout already there is used rather than cloned over', async (t) => {
     ask: scriptedAsker([machine.home, 'y']),
     say: quiet,
     clone: () => assert.fail('it cloned over a directory that was already there'),
-    agent: () => Promise.resolve('/usr/local/bin/claude'),
+    agent: () => Promise.resolve([{ command: 'claude', where: '/usr/local/bin/claude' }]),
     configPath: join(machine.home, 'runner.config.json'),
   });
 
@@ -378,4 +382,71 @@ test('one URL is the ordinary case and stays one', async () => {
 
   assert.deepEqual(stored, [['https://cawdev.example', 'cawd_minted']],
     'storeUrl should default to the URL signed in to');
+});
+
+// --- the terminal during a clone --------------------------------------------
+//
+// ssh asks for a key's passphrase on /dev/tty itself. An asker still reading
+// that terminal in raw mode shared the keys with it and echoed its share — the
+// passphrase arrived with letters missing and one on the screen.
+
+/** A terminal as readline sees one: a TTY that can go raw, and says whether it is. */
+function aTerminal() {
+  const input = new PassThrough();
+  input.isTTY = true;
+  input.isRaw = false;
+  input.modes = [];
+  input.setRawMode = (raw) => {
+    input.isRaw = raw;
+    input.modes.push(raw);
+    return input;
+  };
+  const output = new PassThrough();
+  output.isTTY = true;
+  output.columns = 80;
+  output.resume();
+  return { input, output };
+}
+
+test('while a clone runs, the asker stops reading and the terminal is cooked', async () => {
+  const { input, output } = aTerminal();
+  const ask = asker(input, output);
+  try {
+    assert.equal(input.isRaw, true, 'readline on a TTY reads it raw — the precondition');
+    let during;
+    const result = await cloneAside(ask, async (url, path) => {
+      during = { raw: input.isRaw, reading: !input.isPaused(), url, path };
+      return 'cloned';
+    }, 'git@example.test:x.git', '/tmp/x');
+
+    assert.deepEqual(during, { raw: false, reading: false, url: 'git@example.test:x.git', path: '/tmp/x' });
+    assert.equal(result, 'cloned');
+    assert.equal(input.isRaw, true, 'raw again for the next question');
+
+    // And the next question is still answered — the interface was resumed.
+    const answered = ask.line('  next? ');
+    input.write('yes\n');
+    assert.equal(await answered, 'yes');
+  } finally {
+    ask.close();
+  }
+});
+
+test('a clone that fails still gives the terminal back', async () => {
+  const { input, output } = aTerminal();
+  const ask = asker(input, output);
+  try {
+    await assert.rejects(cloneAside(ask, async () => {
+      throw new Error('git clone exited 128.');
+    }, 'u', 'p'), /exited 128/);
+    assert.equal(input.isRaw, true);
+    assert.equal(input.isPaused(), false);
+  } finally {
+    ask.close();
+  }
+});
+
+test('an asker that reads no terminal just runs the clone', async () => {
+  const lines = { line: async () => '' };
+  assert.equal(await cloneAside(lines, async () => 'done', 'u', 'p'), 'done');
 });
