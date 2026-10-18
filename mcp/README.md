@@ -3,7 +3,9 @@
 Plain Node, zero dependencies, stdio JSON-RPC — `server.mjs`, plus the shared
 rule matcher in `tools/lib/tool-rules.mjs` that the runner uses too. It gives a coding
 agent a project's roadmap and changelog — the same verbs a person gets in the
-console, because the API was built to mirror these tools one-for-one.
+console, because the API was built to mirror these tools one-for-one. This README says
+**card** for the roadmap thing and **run** for the work on it, as the console does; the API and
+the tool names say *entry* (`roadmap_list`, `propose_entry`, `EntryRef`) and keep doing so.
 
 ## Setting it up in a repository
 
@@ -59,23 +61,23 @@ four being different from what you assumed.
 
 The sequence is fixed, and the second step is the one people skip:
 
-1. Branch off an up-to-date `main`, named after the entry — `r4-roadmap-entries`.
-2. **Move the entry to `CODING` naming the branch, before your first commit**
+1. Branch off an up-to-date `main`, named after the card — `r4-roadmap-entries`.
+2. **Move the card to `IN_DEVELOPMENT` naming the branch, before your first commit**
    (`roadmap_set_status`). Not after. The roadmap should be able to answer
    "what is being worked on right now" without asking anyone.
-3. Build to the entry's "Done when" list.
+3. Build to the card's "Done when" list.
 4. Finish with a PR. Never push to `main`. As your session ends the platform
    moves the *branch* on the development board, not the card: to `REVIEW` where
    the project runs `require_review` and somebody is going to read it, and to
    `DONE` where it does not — a finish nobody was asked about (R132), because
    there is no reviewer coming.
-5. When the PR merges, move the entry to `MERGED` naming it. The branch may then
-   be deleted — `CODING` is for work somebody is doing, not work that is done.
+5. When the PR merges, move the card to `MERGED` naming it. The branch may then
+   be deleted — `IN_DEVELOPMENT` is for work somebody is doing, not work that is done.
 
 ### What a status must carry
 
 `roadmap_statuses` will tell you, and it is worth reading rather than guessing:
-`CODING` needs a branch, `MERGED` needs the merge — a pull request, a merge
+`IN_DEVELOPMENT` needs a branch, `MERGED` needs the merge — a pull request, a merge
 commit, or a sha — `SHIPPED` needs a version that is a real git tag, and
 `DECLINED` needs a reason. `REVIEW` needs nothing, deliberately: the pull
 request it would otherwise carry belongs to the run, and a project that reviews
@@ -85,19 +87,29 @@ without opening pull requests has none to give it.
 when you name no status is the project's rule, per door, and the default for a
 card or issue an agent files is the backlog: waiting until a person or a sprint
 brings it in, in no sprint and on no board column. Its origin names your
-session and the card your run was on. A plan session's card lands where the console's
+session and the card your run was on. A plan run's card lands where the console's
 do (R380). Name a status (`CONSIDERING`, `NEW`) when
 you mean the pipeline. Giving a backlog card a sprint moves it to the first
 status of its kind; moving a card to `BACKLOG` takes it out of its sprint.
 
-**Any status may move to any other.** There is no transition diagram — an entry
+**Sprints are a team's** (R474, R489). The `sprint` of `roadmap_create`,
+`roadmap_update` and the filter of `roadmap_list` take an integer or a string:
+`7` or `"S7"` when the project's teams have one S7, `"Core team · S7"` (or
+`"Core team / S7"`) when two do — the API refuses an ambiguous `S7` naming both
+spellings, so read the sentence and send the long one — a sprint id, and `0` or
+`""` to take a card out. A completed sprint refuses a card that is not already
+in it, and only a person can reopen one; do not retry. `sprint_list` says which
+sprints there are. A card prints its sprint as `Core team · S7 Name (active)`.
+Opening, starting, completing and renaming a sprint stay a person's.
+
+**Any status may move to any other.** There is no transition diagram — a card
 really can go from `CONSIDERING` straight to `SHIPPED` if that is what happened.
 The rules are about what a status *carries*, not the path it took.
 
 ### The body is what we want; the plan is how; the comments are the argument
 
 `roadmap_get` gives you all three, and `task_current` gives you them for the
-entry you are working on.
+card you are working on.
 
 **The plan is the one to read before doing any of the work.** It was written by
 a plan phase and agreed by somebody, and it names the files — R124. If you are
@@ -110,8 +122,8 @@ either. The first is the platform's — it stores what a plan phase reports when
 the phase ends, so that a session which must not write is not handed a writer to
 do its own bookkeeping with. The second is refused outright: *an agent cannot
 start another agent*, which is `RunAccess.requireCanStart`'s rule and not an
-omission here. **Read the discussion before you propose anything about an
-entry.** It is where an objection was answered and where an obvious-looking
+omission here. **Read the discussion before you propose anything about a
+card.** It is where an objection was answered and where an obvious-looking
 approach was ruled out with a reason — and re-proposing what was talked out
 three months ago is precisely what it exists to stop.
 
@@ -123,7 +135,7 @@ that the next reader does not have to reconstruct it from the thread.
 A comment you write is attributed to your run as well as to the account that
 minted your token, so a person can tell an agent's reading from a colleague's.
 
-### Read what the earlier sessions did before repeating it
+### Read what the earlier runs did before repeating it
 
 `task_current` lists **every run this card has already had** — how each ended,
 on what branch, with what model, whether the work was pushed, and the commits it
@@ -133,21 +145,21 @@ to know what the first tried.
 
 No transcripts come with it, deliberately: the terminal log is on the run's own
 page in the console, and nine of them would fill the context this call exists to
-orient. If you need the detail, the discussion under the entry is where a
-previous session should have written down what it learned — and where yours
+orient. If you need the detail, the discussion under the card is where a
+previous run should have written down what it learned — and where yours
 should.
 
 ### There is no delete
 
 Not in these tools, not in the API. `roadmap_decline` with a reason is the only
-exit an entry has, and the reason is the point: it is what stops the same idea
+exit a card has, and the reason is the point: it is what stops the same idea
 being proposed again in six months. Same for changelog entries — correct the
 text, do not remove the record. Same for comments: nothing removes one, and the
 most you can do to your own is correct its wording.
 
 ### Ids are permanent, and a card is named by its ref
 
-An entry's number never changes and is never reused. Commit messages and code
+A card's number never changes and is never reused. Commit messages and code
 comments point at it. Since R221 a roadmap card and an issue each count on
 their own sequence, so `R91` and `i91` are two cards: wherever a tool takes
 `number`, `related`, `after` or `entryNumber`, pass the ref — `"i91"` for an
@@ -169,13 +181,14 @@ what you are allowed to do.
 |---|---|
 | `roadmap_where` | Which platform, which token, read from where, and who you are. Start here. |
 | `roadmap_statuses` | The eight statuses, what they mean, what each requires. |
-| `roadmap_list` | Entries, optionally by status. `brief` omits bodies — use it to survey. |
-| `roadmap_get` | One entry in full: its body, **the plan agreed for it**, and the discussion on it. |
-| `roadmap_create` | Create an entry; the platform allocates its permanent number. |
-| `roadmap_update` | Title, body, section, related ids, the cards it starts coding after (`after` — R181), when it is due and how big it is (`due` — R351: an ISO date, `""` clears; `estimate`: a positive number, `0` clears), the version it is meant for (`targetVersion` — R358, `""` clears; since R362 it must be one the project defined under Project settings → Versions, and any other name is refused), the versions an issue was found in (`affectedVersions` — R378, issues only: names the project defined or shipped in, `[]` clears), and who it is assigned to (`assignee` — R331: a username, `""` clears; `roadmap_list`/`issue_list` take `assignee` too, and `me` means the token's owner). |
-| `roadmap_comment` | Say something *beside* an entry rather than inside it. |
+| `roadmap_list` | Cards, optionally by status or `sprint` (any spelling below). `brief` omits bodies — use it to survey. |
+| `sprint_list` | The project's sprints with how far each has got (R489): `Core team · S7 Notifications — active — 4 of 9 landed`. ACTIVE and UPCOMING unless `state` says otherwise. A read: PLAN and VERIFY have it. |
+| `roadmap_get` | One card in full: its body, **the plan agreed for it**, and the discussion on it. |
+| `roadmap_create` | Create a card; the platform allocates its permanent number. |
+| `roadmap_update` | Title, body, section, sprint (R489: `7`, `S7`, `"Core team · S7"`, a sprint id; `0` or `""` takes the card out — see below), related ids, the cards it starts coding after (`after` — R181), when it is due and how big it is (`due` — R351: an ISO date, `""` clears; `estimate`: a positive number, `0` clears), the version it is meant for (`targetVersion` — R358, `""` clears; since R362 it must be one the project defined under Project settings → Versions, and any other name is refused), the versions an issue was found in (`affectedVersions` — R378, issues only: names the project defined or shipped in, `[]` clears), and who it is assigned to (`assignee` — R331: a username, `""` clears; `roadmap_list`/`issue_list` take `assignee` too, and `me` means the token's owner). |
+| `roadmap_comment` | Say something *beside* a card rather than inside it. |
 | `done_when_tick` | Tick (or untick) one numbered item of the card's Done-when checklist as built, with one line of evidence (R368). `task_current` lists the items. Defaults to the run's own card and refuses another; the reviewer's column is a person's and no token can set it. |
-| `roadmap_set_status` | Move an entry, carrying whatever the status requires. |
+| `roadmap_set_status` | Move a card, carrying whatever the status requires. |
 | `roadmap_decline` | Decline with a reason. The only exit. |
 | `backlog_file` | File **feedback**, not a card — something a person should decide about. A WRITER accepts it as a card or an issue, or refuses it (R199). Tagged `agent` as a source, plus any `tags` you pass — `customer` when you relay what a user said (R372). |
 | `changelog_list` | The changelog, grouped by release, newest first. |
@@ -192,8 +205,8 @@ token gets a refusal saying so.
 
 | Tool | What it does |
 |---|---|
-| `task_current` | The entry you are working on, its branch, everything already said and asked on this run, **and every earlier run on the same card**. **Call it first**, and again whenever you are unsure where you are. |
-| `report` | `progress` as often as useful; `done` when finished, naming the branch and any PR; `blocked` when a person must resolve something. `done` and `blocked` end the run; on a coding run `done` is refused until everything is committed and pushed (R345). |
+| `task_current` | The card you are working on, its branch, everything already said and asked on this run, **and every earlier run on the same card**. **Call it first**, and again whenever you are unsure where you are. |
+| `report` | `progress` as often as useful; `done` when finished, naming the branch and any PR; `blocked` when a person must resolve something. `done` and `blocked` end the run; on a review run the `done` body is filed as the branch's review (R529), so write it for the person reading the thread; on a coding run `done` is refused until everything is committed and pushed (R345). |
 | `ask_user` | Ask the person who started the run, and wait. Blocks up to ten minutes, then hands back a `question_id`. |
 | `await_answer` | Resume waiting for a question `ask_user` handed back. |
 | `ask_group` | Ask a **round** — up to twelve questions that belong together, under one title. Blocks until every one of them has been answered, then hands back a `group_id`. |
@@ -202,7 +215,7 @@ token gets a refusal saying so.
 | `approve` | **Not yours to call.** Claude Code calls it itself, as `--permission-prompt-tool`, when no rule covers a tool call. |
 
 **`ask_user` is for decisions that are genuinely theirs** — an architectural
-choice, a trade-off with no right answer, something the entry does not settle.
+choice, a trade-off with no right answer, something the card does not settle.
 Not for checking work you can check yourself. Every question stops the run and
 costs somebody's attention.
 
@@ -213,7 +226,7 @@ asked because the decision was not yours. Call `await_answer`, or `report`
 **`ask_group` is for when you have several questions at once** — R96. One
 question at a time is right for a decision you hit halfway through a piece of
 work; it is wrong when you are trying to understand something, because forty
-separate inbox items arriving over an afternoon is not a conversation, it is an
+separate Waiting on you items arriving over an afternoon is not a conversation, it is an
 interruption repeated forty times. A round arrives as one form under one title,
 the person answers it in one sitting, and you are woken once when all of it is
 answered.
@@ -259,9 +272,9 @@ Two smoke tests, both driving the server over real stdio.
 CAWDEV_URL=http://localhost:4200 CAWDEV_TOKEN=cawd_… node tools/mcp/smoke.mjs scratch-project
 ```
 
-**Name a scratch project.** The smoke test creates a roadmap entry and declines
-it, and entries cannot be deleted — so it refuses to guess which project you
-meant. It left two declined entries in cawdev's own roadmap before it did.
+**Name a scratch project.** The smoke test creates a roadmap card and declines
+it, and cards cannot be deleted — so it refuses to guess which project you
+meant. It left two declined cards in cawdev's own roadmap before it did.
 
 It drives the server the way a client does — spawn, write lines to stdin, read
 lines from stdout — rather than importing its functions, because the parts most

@@ -158,8 +158,9 @@ served like any added project, and the rest of the console's setup walk —
 rules, members, the CTO Interview — is linked at
 `<url>/projects/<slug>/setup`.
 
-**What takes effect when** (R294). Three settings a running daemon takes
-without a restart — `agentCommands`, `grantable`, `acceptsRulesFromConsole`,
+**What takes effect when** (R294). Four settings a running daemon takes
+without a restart — `agentCommands`, `grantable`, `acceptsRulesFromConsole`
+and `autoWorkspaces`,
 the `HOT_SWAPPABLE` list in `tools/lib/runner-config.mjs`, spelled once —
 because the daemon reads them fresh on every use. Everything else in the file
 (`projects` and their workspaces, `url`, `name`, the token, `browser`, the
@@ -197,7 +198,7 @@ and its copy all work exactly as they always have, and scrolling up reaches the
 start of the session. The only thing pinned is the footer at the bottom, and it
 never scrolls away: which cawdev, who you are signed in as, this machine's
 runner, the per-project session counts against their checkouts and the machine's
-total against `maxSessions` — plus the run you are watching and the keys that
+total — plus the run you are watching and the keys that
 work right now. Anything *stopping* a session sits above all of that, because it
 is the only thing in there waiting on a person.
 
@@ -283,7 +284,7 @@ the shape of the decision, and the whole value of asking a person is that they
 can say the thing that was not on the list — so getting there costs one key, and
 `esc` from it comes back to the list rather than abandoning the answer. A chosen
 option and a typed sentence resolve the same question the same way, through the
-same endpoint the inbox and the run page post to: one record, the same
+same endpoint the Waiting on you page and the run page post to: one record, the same
 `answeredBy`, and the badge clears at once.
 
 A permission request is the same widget — R60's lengths of yes as rows, with the
@@ -694,7 +695,7 @@ it ends.
 A bare path means one workspace, which is what every config meant before this
 existed — nothing changes for a machine that serves one checkout per project.
 
-How many coding runs go at once is `min(workspaces, maxSessions)`. A run that
+How many coding runs go at once is the number of workspaces. A run that
 waits now says **"no free workspace in cawdev (2 here, all busy)"** instead of
 "that project already has a run here", which was a proxy for it.
 
@@ -717,18 +718,16 @@ says about knowing it.
 
 **This number caps coding and nothing else** (R70). `ASK`, `ROADMAP`, `AUDIT`
 and `SCOPE` runs take no workspace, so a project whose checkouts are all busy
-still starts a question, an entry-writing session, an audit and a scoping
-session at once. `INTERVIEW`, `MERGE`
+still starts a question, a card-writing run, an audit and a scoping
+run at once. `INTERVIEW`, `MERGE`
 and `RELEASE` do take one — each commits something — and count against this
 number; what each may *write* in it is far narrower than a coding run's and is
 decided by the profile, not by the prompt: an interview writes `docs/brief/`,
 a merge writes the files git put conflict markers in, and a release (R187)
 writes exactly the version files the platform names on the claim, with `git`,
 `gh pr create`, `gh pr view` and `node` for the exports — no build tools, no
-permission prompt, no `gh pr merge`. What holds the rest back
-is `maxSessions`, which counts every profile — **"at 4 sessions on this machine
-(every profile counts)"** is the other thing a waiting run can say, and the log
-always says which of the two it was.
+permission prompt, no `gh pr merge`. What holds a coding run back
+is a free workspace, and the log says so (R109 removed `maxSessions`).
 
 **One thing this gate cannot express, and does not try to.** It serialises on a
 checkout, so two runs on *the same branch* in two checkouts are, to this daemon,
@@ -797,8 +796,8 @@ whether the browser is allowed. Those five answer nearly every "why did that
 not happen", and they used to be spread across a config file and a shrug.
 
 Attaching adds a second bar row: the URL, each project as **coding sessions over
-checkouts** (`cawdev 1/2`), and the machine's total against `maxSessions`.
-Both gates, on screen, counting what each actually bounds — a question is in the
+checkouts** (`cawdev 1/2`), and the machine's total.
+The gate, on screen, counting what it actually bounds — a question is in the
 total on the right and not in any project's figure, because it took no checkout.
 A run that is waiting is explained by the bar
 above it rather than by reading the source. A narrow terminal drops projects
@@ -849,11 +848,11 @@ than twenty-six. A machine that wants it unattended puts that string in its own
 ### What a person can ask of a checkout
 
 R57. The daemon polls `workspace-requests/claim` every few seconds and does one
-of **ten** things to a checkout it serves. It said six for two entries, and
+of **eleven** things to a checkout it serves. It said six for two entries, and
 `HANDOFF` had been missing from the list since R148 — a table that quietly does
 not describe one of the things a person can ask for is worse than no table. So
 count the rows below against that number before you trust either. `CUT_BRANCH`
-is the ninth, R260's; `OPEN_PR` the tenth, R261's.
+is the ninth, R260's; `OPEN_PR` the tenth, R261's, `CREATE_BRANCH` the eleventh, R379's.
 
 | | |
 |---|---|
@@ -867,6 +866,7 @@ is the ninth, R260's; `OPEN_PR` the tenth, R261's.
 | `TAG` | R156's release: `git ls-remote --tags origin refs/tags/<version>` for the version in `message`. **The remote, not this clone** — a local tag nobody pushed is exactly the state a release is trying to rule out, and `git tag --list` cannot tell the two apart. A read; it fetches nothing and moves no ref. The sha is reported on the result's first line, the way `MERGE` reports its URL, because the platform will not confirm a release on `ok: true` alone. **A tag that is not there yet is `ok: false` with a sentence, and that is a normal answer** — the release procedure pushes the tag last, so the first check correctly finds nothing. Addressed to a **release** rather than to a directory alone, which is why it is asked for from the roadmap board and refused on this channel. |
 | `CUT_BRANCH` | R260's sprint branch: `git push origin origin/<default>:refs/heads/<name>` for the branch in `message`, after a fetch — so the sprint's cards are cut from what everyone else has, not from whatever this checkout was left on. The second kind after `MERGE` whose effect is **not** in the checkout: the push names two refs and this clone's HEAD is not one of them, so any live checkout of the project will do and nothing local moves. **A branch already on origin is `ok: true`** ("already on origin at <sha>") — the sprint wanted one to exist, and one does. The sha is reported on the result's first line, the way `TAG` reports its. Addressed to a **sprint** and asked for from the sprint page by an OWNER, for `MERGE`'s reason — it reaches the remote — and refused on this channel. A `MERGE` of a card's pull request into a sprint branch still runs `--squash --delete-branch`: the card's branch goes, the sprint's stays. Landing the sprint branch itself is `OPEN_PR` then `MERGE` below. |
 | `OPEN_PR` | R261's sprint merge, first half: `gh pr create --head <branch> --base <base> --title <title>` for the branch in `message` — the sprint's — to `baseBranch ?? defaultBranch`, titled as the claim's `title` (*S1 Notifications*). **An existing pull request is `ok: true` with its URL** — the same `gh pr view` lookup the `auto_pr` rule makes, and the reason the platform can ask this every time: it holds no git-host credential and cannot know whether one exists. The URL is reported on the result's first line, and the platform queues the `MERGE` to this same checkout when it reads one. Nothing is pushed: the branch is on origin already, cut there by `CUT_BRANCH` and merged into by every card. Addressed to a **work item** — the sprint's — and asked for by Merge on the development board or *Merge sprint* on the sprint page, by an OWNER; refused on this channel for `MERGE`'s reason. |
+| `CREATE_BRANCH` | R379's New branch from the console: pushes `origin/<fromBranch>` to `refs/heads/<name>` for the name in `message`. Unlike `CUT_BRANCH` a name already on origin is a **refusal**, because the person asked for a new branch and the existing one may be somebody else's work. Touches no working tree; a daemon that knows the kind says `createBranch: true` in its hello. |
 
 **A `MERGE` that fails also says which KIND of failure it was** — R155, in one
 of five words beside `gh`'s own unchanged text:
@@ -1257,12 +1257,9 @@ rest queue.
 
 **Questions are not serialised.** An `ASK` run prepares nothing and writes
 nothing, so it runs alongside whatever else is going on — you can ask about a
-project while an agent is working in it. `maxSessions` (4 by default) bounds how
-many agent processes this machine will host at once, and it is the **only**
-thing bounding a question, a roadmap session or an audit (R70). It counts runs
-this daemon has claimed, not children it has spawned: a claim takes a second or
-two to become a process, and counting processes let one pass of the loop claim
-the whole queue.
+project while an agent is working in it. Nothing bounds a question, a roadmap session or an audit but the platform's
+own queue: `maxSessions` was removed in R109, and the workspace gate above is
+the only one.
 
 ## If the daemon dies mid-run
 
@@ -1391,7 +1388,7 @@ permission stops forever.
 
 - `--permission-mode acceptEdits` lets it write files.
 - `--allowedTools mcp__cawdev__…` lets it use the cawdev tools. **Without this
-  the entire loop is unreachable** — no reading the task, no moving the entry,
+  the entire loop is unreachable** — no reading the task, no moving the card,
   no reporting, no asking. A real session found this by being denied
   `task_current` and stopping rather than guessing, which was the right call
   and a good sign for the prompt.
@@ -1417,7 +1414,7 @@ never asks you anything — an unlisted tool is refused, not raised (i138).
 
 **Anything else stops and asks you** (R51). Rather than being denied in
 silence, a session that needs `mvn` or `npm` posts a request that appears in
-your inbox and on the run, and waits for an answer. Allow it once, or allow it
+your Waiting on you page and on the run, and waits for an answer. Allow it once, or allow it
 always here — which writes a rule on the project that every runner serving it
 inherits.
 
@@ -1548,8 +1545,8 @@ after `--mcp-config` fails with `ENAMETOOLONG`, which names neither the flag nor
 the prompt.
 
 The prompt deliberately teaches the **method**, not the task. The task is in the
-roadmap entry, which the agent reads for itself with `task_current` — putting it
-in the prompt too would be a second copy that can disagree with the entry.
+roadmap card, which the agent reads for itself with `task_current` — putting it
+in the prompt too would be a second copy that can disagree with the card.
 
 ### Codex CLI
 

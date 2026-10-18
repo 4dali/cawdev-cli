@@ -189,6 +189,7 @@ const DEFAULTS = {
     'mcp__cawdev__quality_get',
     'mcp__cawdev__roadmap_statuses',
     'mcp__cawdev__roadmap_list',
+    'mcp__cawdev__sprint_list',
     'mcp__cawdev__roadmap_get',
     // The MCP server has served this since R37, its README documents it, and
     // the REVIEW prompt below TELLS a session to file its findings with it —

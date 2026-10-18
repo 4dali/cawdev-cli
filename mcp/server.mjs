@@ -376,6 +376,41 @@ const TOOLS = [
   },
 
   {
+    name: 'sprint_list',
+    description:
+      'The sprints a project\'s cards can be filed into, with how far each has got — R489. Sprints ' +
+      'are a team\'s: written `S7` inside the team and `Core team · S7` outside it. Read this before ' +
+      'filing a card into one with roadmap_create / roadmap_update `sprint`. State narrows it ' +
+      '(ACTIVE, UPCOMING, COMPLETED; comma-separated); the default is ACTIVE and UPCOMING.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_ARGUMENT,
+        state: {
+          type: 'string',
+          description: 'ACTIVE, UPCOMING, COMPLETED — one or several, comma-separated. Default ACTIVE,UPCOMING.',
+        },
+      },
+    },
+    handler: async (config, args) => {
+      const slug = await resolveProject(config, args.project);
+      const state = args.state || 'ACTIVE,UPCOMING';
+      const sprints = await api(config, `/api/projects/${slug}/sprints?state=${encodeURIComponent(state)}`);
+      if (!sprints.length) return `${slug} has no sprints in ${state}.`;
+      return sprints
+        .map((sprint) => {
+          const counts = sprint.counts ?? {};
+          return (
+            `${sprint.label ?? sprint.ref}${sprint.name ? ` ${sprint.name}` : ''} — ` +
+            `${String(sprint.state).toLowerCase()} — ${counts.landed ?? 0} of ${counts.cards ?? 0} landed` +
+            (sprint.goal ? `\n    goal: ${sprint.goal}` : '')
+          );
+        })
+        .join('\n');
+    },
+  },
+
+  {
     name: 'roadmap_statuses',
     description:
       'The roadmap statuses, what each means, and what each one requires — IN DEVELOPMENT a ' +
@@ -396,18 +431,17 @@ const TOOLS = [
   {
     name: 'roadmap_list',
     description:
-      'A project\'s roadmap entries, optionally filtered by status or by sprint. Use brief=true ' +
-      'to survey without pulling every entry\'s body into context.',
+      'A project\'s roadmap cards, optionally filtered by status or by sprint. Use brief=true ' +
+      'to survey without pulling every card\'s body into context.',
     inputSchema: {
       type: 'object',
       properties: {
         ...PROJECT_ARGUMENT,
         sprint: {
-          type: 'integer',
-          minimum: 1,
+          type: ['integer', 'string'],
           description:
-            'Only cards in this sprint, by number — 1 for S1. A number the project has no ' +
-            'sprint for is refused naming the ones it has.',
+            'Only cards in this sprint: `S7` (or 7), "Core team · S7" when two teams have an S7, or a ' +
+            'sprint id. A sprint the project has none for is refused naming the ones it has.',
         },
         status: {
           type: 'string',
@@ -439,7 +473,9 @@ const TOOLS = [
       if (args.status) query.set('status', args.status);
       // R257. The API refuses a number with no sprint behind it, naming the
       // sprints there are; that sentence is passed through as the tool error.
-      if (args.sprint) query.set('sprint', String(args.sprint));
+      if (args.sprint !== undefined && args.sprint !== '' && args.sprint !== 0) {
+        query.set('sprint', String(args.sprint));
+      }
       if (args.assignee) query.set('assignee', args.assignee);
       query.set('brief', String(brief));
 
@@ -454,7 +490,7 @@ const TOOLS = [
   {
     name: 'roadmap_get',
     description:
-      'One roadmap entry in full: its body, THE PLAN somebody agreed for it, and the ' +
+      'One roadmap card in full: its body, THE PLAN somebody agreed for it, and the ' +
       'discussion on it. Read the plan before doing any of the work — it is what was decided, ' +
       'and it names the files. Read the comments before proposing anything: they are where an ' +
       'objection was answered, and re-proposing what was talked out three months ago is the ' +
@@ -594,7 +630,7 @@ const TOOLS = [
   {
     name: 'roadmap_comment',
     description:
-      'Say something about an entry, beside the entry rather than inside it. Use it for the ' +
+      'Say something about a card, beside the card rather than inside it. Use it for the ' +
       'argument: an objection, a measurement, why an obvious approach was not taken. The body ' +
       'is where a settled conclusion is written down — edit that when the discussion reaches ' +
       'one. Comments cannot be deleted, by you or by anyone.',
@@ -680,12 +716,12 @@ const TOOLS = [
   {
     name: 'roadmap_create',
     description:
-      'Create a roadmap entry. The platform allocates its permanent number — written R91 on ' +
-      'a roadmap card and i91 on an issue, one sequence across both — and the ' +
+      'Create a roadmap card. The platform allocates its permanent number — written R91 on ' +
+      'a roadmap card and i91 on an issue, two sequences, one per kind — and the ' +
       'project decides where a card you file starts — the BACKLOG by default for a card an ' +
       'agent files, waiting until a person or a sprint brings it in — unless you say ' +
       'otherwise; a status that requires something must be given it. A card in the BACKLOG ' +
-      'holds no sprint: giving it one moves it to CONSIDERING. A plan session\'s card lands ' +
+      'holds no sprint: giving it one moves it to CONSIDERING. A plan run\'s card lands ' +
       'where the console\'s do (R380).',
     inputSchema: {
       type: 'object',
@@ -714,12 +750,12 @@ const TOOLS = [
         reason: { type: 'string' },
         section: { type: 'string', description: 'Which part of the roadmap, e.g. "Phase 2 — …".' },
         sprint: {
-          type: 'integer',
-          minimum: 0,
+          type: ['integer', 'string'],
           description:
-            'The sprint to file this card into, by number — 1 for S1. 0 takes it out of its ' +
-            'sprint; leave it out to leave it alone. A CLOSED sprint refuses a card that is ' +
-            'not already in it, and only a person can reopen one — do not retry.',
+            'The sprint to file this card into: `S7` (or 7) when the project\'s teams have one S7, ' +
+            '"Core team · S7" when two teams do, a sprint id, or 0 / "" to take it out of its sprint; ' +
+            'leave it out to leave it alone. A COMPLETED sprint refuses a card that is not already in it, ' +
+            'and only a person can reopen one — do not retry. Sprint_list shows what there is.',
         },
         related: {
           type: 'array',
@@ -929,7 +965,7 @@ const TOOLS = [
   {
     name: 'roadmap_update',
     description:
-      'Edit an entry\'s title, body, section, sprint, tags, parent, related refs or the cards it ' +
+      'Edit a card\'s title, body, section, sprint, tags, parent, related refs or the cards it ' +
       'starts after. Use roadmap_set_status to move it.',
     inputSchema: {
       type: 'object',
@@ -943,12 +979,12 @@ const TOOLS = [
         body: { type: 'string' },
         section: { type: 'string' },
         sprint: {
-          type: 'integer',
-          minimum: 0,
+          type: ['integer', 'string'],
           description:
-            'The sprint to file this card into, by number — 1 for S1. 0 takes it out of its ' +
-            'sprint; leave it out to leave it alone. A CLOSED sprint refuses a card that is ' +
-            'not already in it, and only a person can reopen one — do not retry.',
+            'The sprint to file this card into: `S7` (or 7) when the project\'s teams have one S7, ' +
+            '"Core team · S7" when two teams do, a sprint id, or 0 / "" to take it out of its sprint; ' +
+            'leave it out to leave it alone. A COMPLETED sprint refuses a card that is not already in it, ' +
+            'and only a person can reopen one — do not retry. Sprint_list shows what there is.',
         },
         related: {
           type: 'array',
@@ -1027,7 +1063,7 @@ const TOOLS = [
   {
     name: 'roadmap_set_status',
     description:
-      'Move an entry to a status. Any status may move to any other — the rules are about what ' +
+      'Move a card to a status. Any status may move to any other — the rules are about what ' +
       'a status must carry, not a permitted path. IN_DEVELOPMENT needs a branch, MERGED the ' +
       'merge — the PR, the merge commit or the sha — and SHIPPED a version. Move a card to ' +
       'MERGED when its pull request lands; the branch may then be deleted. ' +
@@ -1076,7 +1112,7 @@ const TOOLS = [
   {
     name: 'roadmap_decline',
     description:
-      'Decline an entry, with a reason. This is the only exit an entry has — there is no delete. ' +
+      'Decline a card, with a reason. This is the only exit a card has — there is no delete. ' +
       'The reason is the point: it stops the idea being proposed again.',
     inputSchema: {
       type: 'object',
@@ -1153,10 +1189,10 @@ const TOOLS = [
         entryNumber: {
           type: ['string', 'integer'],
           description:
-            'The roadmap card or issue this entry describes — R156 — by ref: R91, i91, or a '
+            'The roadmap card or issue this changelog entry describes — R156 — by ref: R91, i91, or a '
             + 'bare number for a roadmap card (R221). Set it. Until R156 the only link was the '
             + 'ref you type into the prose, which cannot be queried, so a release could not '
-            + 'tell whether a card already had an entry and would write a second one beside '
+            + 'tell whether a card already had a changelog entry and would write a second one beside '
             + 'the first. Put the ref in the text as well; that is what a reader sees.',
         },
       },
@@ -1189,8 +1225,8 @@ const TOOLS = [
         entryNumber: {
           type: ['string', 'integer'],
           description:
-            'The roadmap card or issue this entry describes — R156 — by ref (R91, i91; a bare '
-            + 'number is a roadmap card). Set it on an older entry that has never been linked; '
+            'The roadmap card or issue this changelog entry describes — R156 — by ref (R91, i91; a bare '
+            + 'number is a roadmap card). Set it on an older changelog entry that has never been linked; '
             + 'omitting it leaves whatever link is already there.',
         },
       },
@@ -1211,9 +1247,9 @@ const TOOLS = [
   {
     name: 'task_current',
     description:
-      'What you are working on: the roadmap entry, THE PLAN agreed for it, its branch, and ' +
+      'What you are working on: the roadmap card, THE PLAN agreed for it, its branch, and ' +
       'everything already said and asked on this run. Call it first, and again whenever you ' +
-      'are unsure where you are — a resumed or confused session re-orients from this alone.',
+      'are unsure where you are — a resumed or confused agent session re-orients from this alone.',
     inputSchema: { type: 'object', properties: {} },
     handler: async (config) => {
       const { runId, project } = await requireRun(config);
@@ -1435,20 +1471,20 @@ const TOOLS = [
   {
     name: 'propose_entry',
     description:
-      'Record something an audit found, or a card a scoping session cut, as a proposed entry. ' +
+      'Record something an audit found, or a card a scoping run cut, as a proposed card. ' +
       '`kind` is your opinion: "issue" ' +
       '(broken, unsafe, or loses data — with a severity) or "roadmap" (it should also do this, ' +
       'or do it better — no severity). A PERSON decides, and may file it the other way — you ' +
-      'are not creating an entry, you are suggesting it. Default "issue", so an audit written ' +
+      'are not creating a card, you are suggesting it. Default "issue", so an audit written ' +
       'before there was a choice files what it always did. Severity is "critical" (broken, ' +
       'unsafe, or loses data), "medium" (it will hurt, but not today) or "minor" (worth doing, ' +
-      'nobody is bleeding). `section` is where you think it belongs; a scoping session names ' +
+      'nobody is bleeding). `section` is where you think it belongs; a scoping run names ' +
       'ONE for every card of the idea. A roadmap card MUST say what it starts after — `after`: ' +
       '`[]` for a card that starts after none, `"#2"` for the second card you proposed in this ' +
       'run (the number this tool answered with), `"R12"` for a card already on the roadmap. ' +
       'You can only name what has already been proposed, so file in build order. Write each ' +
-      'one as an entry would be written, and say where in the code you saw it. Only an audit ' +
-      'or a scoping session may use this.',
+      'one as a card would be written, and say where in the code you saw it. Only an audit ' +
+      'or a scoping run may use this.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1473,7 +1509,7 @@ const TOOLS = [
           type: 'string',
           description:
             'The roadmap section this belongs under, in your opinion. Optional. The person ' +
-            'accepting sees it as the default and may file it elsewhere. A scoping session ' +
+            'accepting sees it as the default and may file it elsewhere. A scoping run ' +
             'uses the same section on every card it cuts from one idea.',
         },
         after: {
@@ -1485,7 +1521,7 @@ const TOOLS = [
             'card you proposed in THIS run, by the number this tool answered with; it must ' +
             'already have been proposed, so propose what a card depends on before the card. ' +
             '`"R12"` or `"i7"` names a card already on the roadmap. A person adds the cards ' +
-            'in this order, and a coding session on one waits until what it starts after has ' +
+            'in this order, and a coding run on one waits until what it starts after has ' +
             'landed.',
         },
       },
@@ -1565,7 +1601,7 @@ const TOOLS = [
     name: 'ask_group',
     description:
       'Ask a ROUND of questions at once, and wait for all of them. Use it when you have several ' +
-      'things to settle that belong together — they arrive in the person\'s inbox under one ' +
+      'things to settle that belong together — they arrive in the person\'s Waiting on you page under one ' +
       'title, on one form, instead of interrupting them once per question. At most 12 in a ' +
       'round; ask the rest in the next one. Blocks for up to ten minutes; if the round is ' +
       'unfinished by then it returns a group_id for await_group.',
@@ -1575,7 +1611,7 @@ const TOOLS = [
         title: {
           type: 'string',
           description:
-            'What this round is called in their inbox. A CTO Interview uses "CTO Interview".',
+            'What this round is called in Waiting on you. A CTO Interview uses "CTO Interview".',
         },
         intro: {
           type: 'string',
@@ -1705,7 +1741,7 @@ const TOOLS = [
     name: 'await_answer',
     description:
       'Resume waiting for a question ask_user handed back. Between the two you experience one ' +
-      'natural blocking ask; the person experiences an inbox item.',
+      'natural blocking ask; the person experiences a Waiting on you item.',
     inputSchema: {
       type: 'object',
       properties: { question_id: { type: 'string' } },
@@ -2065,11 +2101,23 @@ function approvalTimeoutSeconds() {
 // The same goes for comments — nothing here removes one, and nothing there
 // does either.
 //
-// Nor is there a sprint_open, sprint_close or sprint_rename — R257. Opening,
-// closing and renaming a sprint are a person's acts on the page, and the API
-// says so structurally (POST/PATCH /sprints take a session, not a token). An
-// agent's whole reach here is reading a card's sprint and filing a card into
-// one with roadmap_create / roadmap_update `sprint`.
+// Nor is there a sprint_open, sprint_start, sprint_complete or sprint_rename —
+// R257, and a team's since R474. Opening, starting, completing and renaming a
+// sprint are a person's acts on the page, and the API says so structurally
+// (the /api/teams/{id}/sprints writes take a session, not a token). An
+// agent's whole reach here is reading the sprints (sprint_list) and a card's
+// sprint, and filing a card into one with roadmap_create / roadmap_update
+// `sprint`.
+
+/**
+ * R489. A card's sprint as a line: `Core team · S7 Name (active)`. The label
+ * is the server's one spelling; `S7` alone means nothing outside its team.
+ */
+function sprintLine(sprint) {
+  const label = sprint.label ?? sprint.ref ?? `S${sprint.number}`;
+  const state = String(sprint.state ?? '').toLowerCase();
+  return `${label}${sprint.name ? ` ${sprint.name}` : ''}${state ? ` (${state})` : ''}`;
+}
 
 function pick(source, keys) {
   const out = {};
@@ -2361,7 +2409,7 @@ function formatEntry(entry, { brief, comments, plan }) {
   // depend on which tool printed the card; a closed sprint says so.
   if (entry.sprint) {
     lines.push(
-      `  sprint: ${entry.sprint.ref} ${entry.sprint.name}${entry.sprint.state === 'CLOSED' ? ' (closed)' : ''}`,
+      `  sprint: ${sprintLine(entry.sprint)}`,
     );
   }
   if (entry.related?.length) {

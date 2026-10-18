@@ -963,7 +963,7 @@ export function cardLines(card, ink, url = null) {
   field('status', [card.statusDisplay ?? card.status, kind].filter(Boolean).join(' · '));
   field('section', card.section);
   field('tags', card.tags?.length ? card.tags.join(', ') : null);
-  field('sprint', card.sprint ? `${card.sprint.ref ?? card.sprint.number} ${card.sprint.name ?? ''}`.trim() : null);
+  field('sprint', card.sprint ? `${card.sprint.label ?? card.sprint.ref ?? card.sprint.number} ${card.sprint.name ?? ''}`.trim() : null);
   const item = card.workItem;
   field('branch', card.branch ?? item?.branch);
   field('work', item ? [item.statusDisplay ?? item.status, item.runnerName && `on ${item.runnerName}`]

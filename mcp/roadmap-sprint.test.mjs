@@ -22,7 +22,10 @@ const IN_S1 = {
   title: 'A run whose runner goes quiet',
   statusDisplay: 'IN DEVELOPMENT',
   section: 'Phase 7 — runs',
-  sprint: { number: 1, ref: 'S1', name: 'Notifications', state: 'OPEN' },
+  sprint: {
+    id: 'sp-1', teamId: 't-1', teamName: 'Core team', number: 1, ref: 'S1', label: 'Core team · S1',
+    name: 'Notifications', state: 'ACTIVE',
+  },
   body: 'The body.',
 };
 
@@ -50,6 +53,15 @@ async function fakePlatform({ entry = IN_S1, refuse = null } = {}) {
       if (refuse && url.includes('/roadmap')) {
         response.writeHead(404, { 'content-type': 'application/json' });
         return response.end(JSON.stringify({ status: 404, message: refuse }));
+      }
+      if (url.startsWith('/api/projects/board/sprints')) {
+        return json([
+          {
+            id: 'sp-1', ref: 'S1', label: 'Core team · S1', name: 'Notifications', state: 'ACTIVE',
+            goal: 'Ship the bell', counts: { cards: 9, landed: 4 },
+          },
+          { id: 'sp-2', ref: 'S2', label: 'Web · S2', name: '', state: 'UPCOMING', counts: { cards: 0, landed: 0 } },
+        ]);
       }
       if (url.startsWith('/api/projects/board/roadmap?')) {
         return json([entry]);
@@ -120,19 +132,30 @@ test('a card in a sprint says so, under its section', async (t) => {
 
   const { text } = await callTool(platform.url, 'roadmap_get', { number: 255 });
 
-  assert.match(text, /^  sprint: S1 Notifications$/m);
-  assert.ok(text.indexOf('section: Phase 7') < text.indexOf('sprint: S1'));
+  assert.match(text, /^  sprint: Core team · S1 Notifications \(active\)$/m);
+  assert.ok(text.indexOf('section: Phase 7') < text.indexOf('sprint: Core team'));
 });
 
-test('a closed sprint is printed as closed', async (t) => {
+test('a completed sprint is printed as completed', async (t) => {
   const platform = await fakePlatform({
-    entry: { ...IN_S1, sprint: { ...IN_S1.sprint, state: 'CLOSED' } },
+    entry: { ...IN_S1, sprint: { ...IN_S1.sprint, state: 'COMPLETED' } },
   });
   t.after(() => platform.close());
 
   const { text } = await callTool(platform.url, 'roadmap_get', { number: 255 });
 
-  assert.match(text, /^  sprint: S1 Notifications \(closed\)$/m);
+  assert.match(text, /^  sprint: Core team · S1 Notifications \(completed\)$/m);
+});
+
+test('a sprint written before teams (no label) still prints its ref', async (t) => {
+  const platform = await fakePlatform({
+    entry: { ...IN_S1, sprint: { number: 1, ref: 'S1', name: 'Notifications' } },
+  });
+  t.after(() => platform.close());
+
+  const { text } = await callTool(platform.url, 'roadmap_get', { number: 255 });
+
+  assert.match(text, /^  sprint: S1 Notifications$/m);
 });
 
 test('a card in no sprint prints no sprint line', async (t) => {
@@ -144,19 +167,25 @@ test('a card in no sprint prints no sprint line', async (t) => {
   assert.doesNotMatch(text, /sprint:/);
 });
 
-test('roadmap_update files a card into a sprint, and 0 takes it out', async (t) => {
+test('roadmap_update files a card into a sprint in any spelling, and 0 or "" takes it out', async (t) => {
   const platform = await fakePlatform();
   t.after(() => platform.close());
 
   await callTool(platform.url, 'roadmap_update', { number: 255, sprint: 1 });
+  await callTool(platform.url, 'roadmap_update', { number: 255, sprint: 'S1' });
+  await callTool(platform.url, 'roadmap_update', { number: 255, sprint: 'Core team · S1' });
   await callTool(platform.url, 'roadmap_update', { number: 255, sprint: 0 });
+  await callTool(platform.url, 'roadmap_update', { number: 255, sprint: '' });
   // Leaving it out leaves it alone: no `sprint` key reaches the platform.
   await callTool(platform.url, 'roadmap_update', { number: 255, title: 'Renamed' });
 
   const patches = platform.seen.filter((call) => call.method === 'PATCH');
   assert.deepEqual(
     patches.map((call) => call.body),
-    [{ sprint: 1 }, { sprint: 0 }, { title: 'Renamed' }],
+    [
+      { sprint: 1 }, { sprint: 'S1' }, { sprint: 'Core team · S1' }, { sprint: 0 }, { sprint: '' },
+      { title: 'Renamed' },
+    ],
   );
 });
 
@@ -164,15 +193,42 @@ test('roadmap_create can file the new card straight into a sprint', async (t) =>
   const platform = await fakePlatform();
   t.after(() => platform.close());
 
-  await callTool(platform.url, 'roadmap_create', { title: 'New', sprint: 1 });
+  await callTool(platform.url, 'roadmap_create', { title: 'New', sprint: 'Core team · S1' });
 
   const posted = platform.seen.find((call) => call.method === 'POST');
-  assert.deepEqual(posted.body, { title: 'New', sprint: 1 });
+  assert.deepEqual(posted.body, { title: 'New', sprint: 'Core team · S1' });
+});
+
+test('roadmap_list passes a string spelling through as ?sprint=', async (t) => {
+  const platform = await fakePlatform();
+  t.after(() => platform.close());
+
+  await callTool(platform.url, 'roadmap_list', { sprint: 'Core team · S1' });
+
+  const listed = platform.seen.find((call) => call.url.startsWith('/api/projects/board/roadmap?'));
+  assert.equal(new URLSearchParams(listed.url.split('?')[1]).get('sprint'), 'Core team · S1');
+});
+
+test('sprint_list prints one line per sprint, active and upcoming by default', async (t) => {
+  const platform = await fakePlatform();
+  t.after(() => platform.close());
+
+  const { text } = await callTool(platform.url, 'sprint_list', {});
+
+  const asked = platform.seen.find((call) => call.url.startsWith('/api/projects/board/sprints'));
+  assert.equal(new URLSearchParams(asked.url.split('?')[1]).get('state'), 'ACTIVE,UPCOMING');
+  assert.match(text, /^Core team · S1 Notifications — active — 4 of 9 landed$/m);
+  assert.match(text, /^    goal: Ship the bell$/m);
+  assert.match(text, /^Web · S2 — upcoming — 0 of 0 landed$/m);
+
+  await callTool(platform.url, 'sprint_list', { state: 'COMPLETED' });
+  const again = platform.seen.filter((call) => call.url.startsWith('/api/projects/board/sprints'));
+  assert.equal(new URLSearchParams(again[1].url.split('?')[1]).get('state'), 'COMPLETED');
 });
 
 test('a sprint the project does not have is refused in the API\'s own words', async (t) => {
   const platform = await fakePlatform({
-    refuse: 'board has no S4; its sprints are S1 Notifications.',
+    refuse: 'board has no S4; its sprints are Core team · S1 Notifications.',
   });
   t.after(() => platform.close());
 
@@ -181,5 +237,5 @@ test('a sprint the project does not have is refused in the API\'s own words', as
   // The sentence names what exists, so the agent recovers in one call — the
   // reason the server passes the API's message through and adds nothing.
   assert.equal(isError, true);
-  assert.equal(text, 'board has no S4; its sprints are S1 Notifications.');
+  assert.equal(text, 'board has no S4; its sprints are Core team · S1 Notifications.');
 });
