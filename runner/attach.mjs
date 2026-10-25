@@ -52,7 +52,7 @@ import { basename, dirname } from 'node:path';
 import { listSockets, socketPathFor } from './control.mjs';
 import {
   RESTART_FROM_ATTACH, addProject, addWorkspace, agentsOf, pathsOf, readConfigFile, reloadIfRunning,
-  removeProject, setAcceptsRulesFromConsole, setAgentEnabled, setQuality, slugsOf,
+  removeProject, setAcceptsRulesFromConsole, setAgentEnabled, setMaxPlanningRuns, setPaused, setQuality, slugsOf,
 } from './configure.mjs';
 import {
   TYPE_A_PATH, absolute, completePath, describe, inspectPath, listDirectories,
@@ -779,6 +779,25 @@ export function configMenu(file, runner = {}, gone = new Set()) {
       rulesOn
         ? { id: 'rules', label: 'Stop accepting permission rules from the console', hint: 'on now' }
         : { id: 'rules', label: 'Accept permission rules from the console', hint: 'off now' },
+      // R577: a number on the platform, not a switch in the file — the hello
+      // carries what the daemon was last told, so the row reads the live value.
+      // R571: the row that makes a queued line's "or press c" true. R288: the
+      // label is the change, the hint the current value.
+      {
+        id: 'pause',
+        // A usage pause has no toggle: the sweep would pause it again within a minute.
+        label: runner.pausedByUsage
+          ? 'Paused by cawdev for usage'
+          : runner.paused ? 'Resume this machine — claim new runs again' : 'Pause this machine — claim nothing new',
+        hint: runner.pausedByUsage
+          ? 'resumes by itself when the window resets; change the threshold on Settings → Machines'
+          : runner.paused ? 'paused now' : 'claiming now',
+      },
+      {
+        id: 'planning-limit',
+        label: 'Limit planning runs at once',
+        hint: runner.maxPlanningRuns ? `${runner.maxPlanningRuns} at once now` : 'no limit now',
+      },
       // R300: one row per served project, saying whether its branches are
       // scanned here now — the state the row would change, R288's rule.
       ...slugs.map((slug) => (qualityOf(file.projects[slug])
@@ -2572,6 +2591,32 @@ export class Attached {
       this.cards = this.cards.filter((card) => card.slug !== slug);
       this.planned = this.planned.filter((card) => card.slug !== slug);
       return this.reloadDaemon(file, next);
+    }
+    if (chosen.id === 'pause') {
+      if (this.runner.pausedByUsage) {
+        this.say(`  ${ink.muted('cawdev paused this machine for usage; it resumes by itself. Change the threshold on Settings → Machines.')}`);
+        return this.note('');
+      }
+      // Writes the platform, which only a person may do, and not the file.
+      if (!this.requireSignIn('pause or resume this machine')) return undefined;
+      const runner = await setPaused({
+        session: this.session, runnerId: this.runner.id, paused: this.runner.paused !== true, say, ink,
+      });
+      this.runner.paused = runner?.paused === true;
+      this.runner.pausedByUsage = runner?.pausedByUsage === true;
+      return this.note('');
+    }
+    if (chosen.id === 'planning-limit') {
+      // Writes the platform, which only a person may do, and not the file — so
+      // no reload: the daemon reads the number off its next heartbeat.
+      if (!this.requireSignIn('limit planning runs at once')) return undefined;
+      const answer = (await ask.line('  How many at once (0 for no limit)? ')).trim();
+      const limit = answer === '' ? NaN : Number(answer);
+      const runner = await setMaxPlanningRuns({
+        session: this.session, runnerId: this.runner.id, limit, say, ink,
+      });
+      this.runner.maxPlanningRuns = runner?.maxPlanningRuns ?? null;
+      return this.note('');
     }
     if (chosen.id === 'rules') {
       const next = await setAcceptsRulesFromConsole({

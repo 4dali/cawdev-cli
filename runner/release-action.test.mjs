@@ -8,7 +8,7 @@
 // Agents" started a CODE run, which meant the project's build tools, the
 // permission prompt and `bypassPermissions` where a machine granted it — for a
 // session asked to touch three files. So the assertions come in two halves:
-// what a release session HAS (the version files, git, `gh pr create`, `node`,
+// what a release session HAS (the version files, git, `node`,
 // the three cawdev writers the procedure uses), and what it has NOT — and the
 // second half is the one that proves the profile exists. Delete
 // `PROFILE_TOOLS.RELEASE` and the session falls through to the read-only list;
@@ -173,7 +173,7 @@ test('a release is prepared a working copy on the release branch, like a coding 
       assert.match(said(), /a release session may write: backend\/pom\.xml, openapi\.yaml, tools\/package\.json/);
     });
 
-test('it may write the version files, run git, gh pr create and node, and NOTHING else',
+test('it may write the version files, run git and node, and NOTHING else',
     async (t) => {
       const { spawnLine } = await daemonWith(t, { name: 'test-release-tools' });
       const line = spawnLine();
@@ -187,8 +187,8 @@ test('it may write the version files, run git, gh pr create and node, and NOTHIN
         assert.ok(tools.includes(`Edit(${file})`), `no Edit(${file}) in:\n${line}`);
       }
       assert.ok(tools.includes('Bash(git *)'), line);
-      assert.ok(tools.includes('Bash(gh pr create *)'), line);
-      assert.ok(tools.includes('Bash(gh pr view *)'), line);
+      // R565: no `gh` at all. cawdev opens the pull request when the session ends.
+      assert.ok(!tools.some((each) => each.startsWith('Bash(gh')), line);
       assert.ok(tools.includes('Bash(node *)'), line);
       // The three cawdev writers the procedure uses — an entry, an entry's
       // version, a card's status — and the reads, `ask_user` among them: the
@@ -211,9 +211,8 @@ test('it may write the version files, run git, gh pr create and node, and NOTHIN
       // on this project and a release is not a coding run.
       assert.ok(!tools.includes('Bash(mvn *)'),
         `a release session was spawned with the project's build tools:\n${line}`);
-      // `gh pr create`, not `gh`. It opens the pull request and cannot merge
-      // it; a release is merged by a person, with a merge commit.
-      assert.ok(!tools.includes('Bash(gh *)'), line);
+      // And the push guard, before the variadic `--allowedTools` (R565).
+      assert.match(line, /--settings \{.*push-guard\.mjs.*\} --disallowedTools Bash\(gh \*\) Bash\(glab \*\) --allowedTools/);
       assert.doesNotMatch(line, /gh pr merge/);
       // No bare writer, and no writer on an export: `ROADMAP.md`,
       // `ISSUES.md` and `CHANGELOG.md` are unwritable by hand as a permission.
@@ -238,7 +237,7 @@ test('the prompt says what it may do, then hands over the platform\'s procedure'
   assert.match(prompt, /^You are cutting a release in a working copy on branch `release-v9\.9\.9`/);
   assert.match(prompt, /`backend\/pom\.xml`, `openapi\.yaml`, `tools\/package\.json`/);
   assert.match(prompt, /There is no permission prompt in this session/);
-  assert.match(prompt, /cannot merge a pull\s+request, run a build, or run tests/);
+  assert.match(prompt, /cannot open or merge a\s+pull request, run a build, or run tests/);
   // The procedure is the platform's, composed with the version and the cards,
   // and it arrives whole.
   assert.ok(prompt.includes(OPENING), `the opening prompt was not handed over:\n${prompt}`);

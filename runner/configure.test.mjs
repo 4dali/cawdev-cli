@@ -11,7 +11,7 @@ import { test } from 'node:test';
 import { stripAnsi } from '../lib/ansi.mjs';
 import {
   CREATE_A_PROJECT, addProject, addWorkspace, reloadIfRunning, removeProject, resolveTokenId, setAcceptsRulesFromConsole,
-  setQuality, setAgentEnabled,
+  setQuality, setAgentEnabled, setPaused,
 } from './configure.mjs';
 
 const quiet = () => {};
@@ -680,4 +680,24 @@ test('a signal that cannot be sent says so and names the way out', async () => {
   });
   assert.deepEqual(reloaded, { running: true, applied: false, restartNeeded: [] });
   assert.match(stripAnsi(said.join('\n')), /Could not signal.*EPERM.*restart it to pick this up: cawdev, then q, then cawdev again/);
+});
+
+test('setPaused posts the pause call Settings → Machines makes, and nothing else — R571', async () => {
+  const seen = [];
+  const session = {
+    async request(path, options) {
+      seen.push([path, options.method, options.body]);
+      return { id: 'r1', paused: options.body.paused, pausedByUsage: false };
+    },
+  };
+  const said = [];
+  const paused = await setPaused({ session, runnerId: 'r1', paused: true, say: (line) => said.push(stripAnsi(line)) });
+  assert.deepEqual(seen[0], ['/api/runners/r1/pause', 'POST', { paused: true }]);
+  assert.equal(paused.paused, true);
+  assert.match(said.join('\n'), /paused: claiming nothing new/);
+
+  const resumed = await setPaused({ session, runnerId: 'r1', paused: false, say: (line) => said.push(stripAnsi(line)) });
+  assert.deepEqual(seen[1], ['/api/runners/r1/pause', 'POST', { paused: false }]);
+  assert.equal(resumed.paused, false);
+  assert.match(said.join('\n'), /resumed: claiming again/);
 });

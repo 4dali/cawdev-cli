@@ -67,7 +67,8 @@ The sequence is fixed, and the second step is the one people skip:
    "what is being worked on right now" without asking anyone.
 3. Build to the card's "Done when" list.
 4. Finish with a PR. Never push to `main`. As your session ends the platform
-   moves the *branch* on the development board, not the card: to `REVIEW` where
+   moves the *branch* on the development board, not the card: to `TEST` (the board
+   column, not the TEST stage of a run) where
    the project runs `require_review` and somebody is going to read it, and to
    `DONE` where it does not — a finish nobody was asked about (R132), because
    there is no reviewer coming.
@@ -79,9 +80,7 @@ The sequence is fixed, and the second step is the one people skip:
 `roadmap_statuses` will tell you, and it is worth reading rather than guessing:
 `IN_DEVELOPMENT` needs a branch, `MERGED` needs the merge — a pull request, a merge
 commit, or a sha — `SHIPPED` needs a version that is a real git tag, and
-`DECLINED` needs a reason. `REVIEW` needs nothing, deliberately: the pull
-request it would otherwise carry belongs to the run, and a project that reviews
-without opening pull requests has none to give it.
+`DECLINED` needs a reason.
 
 **A card you file may land in the `BACKLOG`** (R371). Where a new card goes
 when you name no status is the project's rule, per door, and the default for a
@@ -190,12 +189,12 @@ what you are allowed to do.
 | `done_when_tick` | Tick (or untick) one numbered item of the card's Done-when checklist as built, with one line of evidence (R368). `task_current` lists the items. Defaults to the run's own card and refuses another; the reviewer's column is a person's and no token can set it. |
 | `roadmap_set_status` | Move a card, carrying whatever the status requires. |
 | `roadmap_decline` | Decline with a reason. The only exit. |
-| `backlog_file` | File **feedback**, not a card — something a person should decide about. A WRITER accepts it as a card or an issue, or refuses it (R199). Tagged `agent` as a source, plus any `tags` you pass — `customer` when you relay what a user said (R372). |
+| `backlog_file` | File **feedback**, not a card — something a person should decide about. A WRITER accepts it as a card or an issue, or refuses it (R199). Tagged `agent` as a source, plus any `tags` you pass — `customer` when you relay what a user said (R372). Inside a run, what you find that is **not this card's** goes here, one item per suggestion: the platform stamps the item with the run, so the feedback page links the run and its card, and accepting it relates the new card to yours (R572). Every stage holds it, read-only ones included. |
 | `changelog_list` | The changelog, grouped by release, newest first. |
 | `changelog_get` | One entry. |
 | `changelog_add` | Add an entry; no version means `Unreleased`. |
 | `changelog_update` | Edit one, including moving it to a release when it ships. |
-| `quality_get` | The SonarQube reading — the default branch's gate, a named branch's gate and new problems (inside a run, this run's branch by default), and the open findings with links. Read-only: nothing here refreshes, scans or files (R302). |
+| `quality_get` | The SonarQube reading — the default branch's gate, a named branch's gate and new problems (inside a run, this run's branch by default), and the open findings with links (not those a person dismissed, R467). Read-only: nothing here refreshes, scans or files (R302). |
 
 ### Inside a run
 

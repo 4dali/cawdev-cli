@@ -55,6 +55,11 @@ export async function fakePlatform({
   workspaceRequests = [],
   resume = null,
   runLive = false,
+  /**
+   * R577: what the heartbeat answers with — the platform's view of this machine,
+   * which is where `maxPlanningRuns` reaches the daemon. Empty by default.
+   */
+  heartbeatAnswer = {},
   /** Overrides the state alone — see the run endpoint below. */
   runState = null,
   stashOnCancel = false,
@@ -119,6 +124,14 @@ export async function fakePlatform({
    * daemon must read as "nothing to ask".
    */
   workItemBranches = null,
+  /**
+   * i267: a function from a posted transition to why the platform refuses it,
+   * or null to accept. A string is a 400 with that message (the platform's
+   * `ApiException.badRequest`); `{ status, message }` picks the status. The
+   * transition is recorded either way, so a test can say what the daemon
+   * posted and what it did not.
+   */
+  refuseTransition = null,
 } = {}) {
   /** R346: every body POSTed to `…/work-item-merges`, in order. */
   const workItemMergeReadings = [];
@@ -210,7 +223,7 @@ export async function fakePlatform({
       }
       if (url.includes('/heartbeat') && request.method === 'POST') {
         heartbeats.push(body ? JSON.parse(body) : {});
-        return response.end(JSON.stringify({}));
+        return response.end(JSON.stringify(heartbeatAnswer));
       }
       if (url.endsWith('/queued-reasons') && request.method === 'POST') {
         // R148/R270: what the daemon currently says every queued run is
@@ -432,6 +445,12 @@ export async function fakePlatform({
         const transition = JSON.parse(body);
         transition.runId = url.split('/runs/')[1]?.split('/')[0];
         transitions.push(transition);
+        const refusal = refuseTransition?.(transition) ?? null;
+        if (refusal) {
+          const { status = 400, message } = typeof refusal === 'string' ? { message: refusal } : refusal;
+          response.statusCode = status;
+          return response.end(JSON.stringify({ message }));
+        }
         return response.end('{}');
       }
       if (url.match(/\/runs\/[^/]+$/) && request.method === 'GET') {
@@ -512,6 +531,10 @@ export async function fakePlatform({
     },
     seen,
     transitions,
+    /** R577: a run offered LATER — after the daemon has heard its heartbeat answer. */
+    offer(run) {
+      remaining.push(run);
+    },
     /** A workspace request asked for LATER — after the daemon booted, the way a person's /pr is. */
     askOfWorkspace(request) {
       pending.push(request);

@@ -249,6 +249,11 @@ test('a conflicting merge spawns a session that can write the conflicted file an
       assert.deepEqual(tools.filter((each) => each.startsWith('Bash')), ['Bash(git *)'],
         `a merge session was spawned with a shell beyond git:\n${tools.join(' ')}`);
 
+      // R565: and the push guard, before the variadic list, so even `git push`
+      // from this session can only go to its own branch.
+      const spawning = said().split('\n').find((each) => each.includes('spawning:'));
+      assert.match(spawning, /--settings \{.*push-guard\.mjs.*\} --disallowedTools Bash\(gh \*\) Bash\(glab \*\) --allowedTools/);
+
       // What it found is reported before anything is spawned, so the card can
       // name the files without anybody opening a transcript.
       const prepared = platform.mergeReports.find((each) => each.kind === 'prepared');

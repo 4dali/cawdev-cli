@@ -30,9 +30,9 @@ import { asker, askOne, mintForThisMachine, setUpThisMachine } from './bootstrap
 import { liveSockets, probeSocket, socketPathFor } from './control.mjs';
 import {
   addProject, addWorkspace, readConfigFile, reloadIfRunning, removeProject, setAcceptsRulesFromConsole,
-  setQuality, setAgentEnabled,
+  setMaxPlanningRuns, setQuality, setAgentEnabled, thisRunnerId,
 } from './configure.mjs';
-import { restartNeededFor } from '../lib/runner-config.mjs';
+import { restartNeededFor, runnerNameOf } from '../lib/runner-config.mjs';
 import { Select } from './select.mjs';
 import { storedSession } from './sign-in.mjs';
 import { loadToken } from './token-store.mjs';
@@ -69,6 +69,7 @@ const USAGE = `
   cawdev config rules on|off             accept permission rules from the console
   cawdev config quality on|off <slug>    scan that project's branches with
                                          SonarQube after a run's TEST stage
+  cawdev config planning-limit <n>       how many planning runs (PLAN, SCOPE, AUDIT, REVIEW) run here at once; 0 is no limit
   cawdev config show                     this machine's config, token redacted
 
   On a machine with no config, cawdev sets one up: it signs you in through the
@@ -473,6 +474,7 @@ export async function pickAction(ask, say, pick = askOne) {
       { id: 'rules-off', label: 'Stop accepting rules from the console' },
       { id: 'quality-on', label: 'Scan a project\'s branches with SonarQube after TEST' },
       { id: 'quality-off', label: 'Stop scanning a project\'s branches' },
+      { id: 'planning-limit', label: 'Limit planning runs at once' },
       { id: 'show', label: 'Show this machine\'s config' },
     ],
   }));
@@ -483,6 +485,9 @@ export async function pickAction(ask, say, pick = askOne) {
   }
   if (id === 'remove-project') {
     return ['remove-project', (await ask.line('  Which project (slug)? ')).trim()];
+  }
+  if (id === 'planning-limit') {
+    return ['planning-limit', (await ask.line('  How many at once (0 for no limit)? ')).trim()];
   }
   if (id === 'rules-on') return ['rules', 'on'];
   if (id === 'rules-off') return ['rules', 'off'];
@@ -545,6 +550,19 @@ export async function runAction([verb, ...rest], { configPath, file, url, sessio
       throw new Error('Name a project: cawdev config quality on|off <slug>');
     }
     await reload(await setQuality({ file, configPath, ask, say, ink, slug, enabled: sub === 'on' }));
+    return;
+  }
+  if (verb === 'planning-limit') {
+    // R577. Written to the PLATFORM, not the file, so no `reload`: there is no
+    // key for a daemon to re-read, and it learns the number from its heartbeat.
+    const [raw] = rest;
+    const limit = raw === undefined || String(raw).trim() === '' ? NaN : Number(raw);
+    if (!Number.isInteger(limit) || limit < 0 || limit > 50) {
+      throw new Error('Name a number: cawdev config planning-limit <0-50>');
+    }
+    await setMaxPlanningRuns({
+      session, runnerId: await thisRunnerId(session, runnerNameOf(file)), limit, say, ink,
+    });
     return;
   }
   throw new Error(`Not a cawdev config command: ${verb}. See cawdev --help.`);

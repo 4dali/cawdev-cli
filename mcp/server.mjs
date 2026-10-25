@@ -21,7 +21,11 @@ import {
   summaryOf,
   withinCeiling,
 } from '../lib/tool-rules.mjs';
+import {
+  isProtected, notAllowed, protectedChanges, protectedPolicy, protectedRefusal, relativeTo,
+} from '../lib/protected.mjs';
 import { findDestructive, withinScope } from '../lib/secrets.mjs';
+import { byCodeUnit } from '../lib/order.mjs';
 import { COMMITS_ITS_WORK, isUnfinished, leftOver, notDoneYet } from '../lib/finish-check.mjs';
 
 const NAME = 'cawdev';
@@ -929,7 +933,9 @@ const TOOLS = [
       'person should decide about: `kind` is your opinion, ISSUE (broken) or FEATURE (should ' +
       'also do / do better). A WRITER later accepts it as a roadmap card, accepts it as an ' +
       'issue, or refuses it with a reason. Use this when you are not sure it deserves a card; ' +
-      'use roadmap_create or issue_file when you are.',
+      'use roadmap_create or issue_file when you are. Inside a run, this is where something you ' +
+      'found that is NOT this card\'s goes — one item per suggestion: cawdev links it to this run ' +
+      'and its card, so you need not write either into the body.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1444,6 +1450,14 @@ const TOOLS = [
             return notDoneYet(left);
           }
         }
+        // R562. The diff gate: the branch against the commit it was cut from,
+        // so a shell `git checkout main -- pom.xml` is caught as an Edit is.
+        if (run && COMMITS_ITS_WORK.has(run.profile)) {
+          const refusal = await protectedGate(config, project, runId);
+          if (refusal) {
+            return refusal;
+          }
+        }
       }
 
       const message = await api(config, `/api/projects/${project}/runs/${runId}/messages`, {
@@ -1820,7 +1834,49 @@ async function decide(config, args) {
     // R110. The shield FIRST, and the ordering is the point — see shieldSays.
     // A hit does not deny; it skips the rules and goes straight to a person,
     // and it is recorded so somebody can see what was stopped.
-    const stopped = shieldSays(shieldPolicy(), toolName, input);
+    const policy = shieldPolicy();
+
+    // R562. A protected file, BEFORE the shield and the rules: no stored rule
+    // may cover it, and no session grant either. A path already allowed on this
+    // branch goes straight through; otherwise REFUSE denies and ASK raises a
+    // request that says plainly it is about a protected file.
+    const target = input.file_path ?? input.path ?? input.notebook_path;
+    if (target && policy.protected.globs.length && WRITE_TOOLS.has(toolName)
+      && isProtected(String(target), policy.root, policy.protected.globs)) {
+      const relative = relativeTo(String(target), policy.root) ?? String(target);
+      const allowed = await protectedAllowedNow(config, project, runId, policy.protected);
+      if (allowed.has(relative)) {
+        return allow(input, 'a person allowed this protected file');
+      }
+      await api(config, `/api/projects/${project}/runs/${runId}/blocks`, {
+        method: 'POST',
+        body: { kind: 'PROTECTED', detail: `${toolName} ${relative}` },
+      }).catch(() => {
+        // Bookkeeping, as for the shield below.
+      });
+      if (policy.protected.mode !== 'ASK') {
+        return deny(
+          `${relative} is protected in this project: an agent never changes it. Do not work ` +
+            `around it (no shell, no git checkout). Report blocked if the work needs it.`,
+        );
+      }
+      const asked = await api(config, `/api/projects/${project}/runs/${runId}/approvals`, {
+        method: 'POST',
+        body: {
+          toolName,
+          toolInput: JSON.stringify(input),
+          summary: `PROTECTED FILE — ${summaryOf(toolName, input)}`,
+          suggestion: null,
+          exactPattern: null,
+          exactWithinCeiling: false,
+          toolUseId: args.tool_use_id,
+          protectedPaths: [relative],
+        },
+      });
+      return await answerOf(config, project, runId, asked.id, input);
+    }
+
+    const stopped = shieldSays(policy, toolName, input);
     if (stopped) {
       await api(config, `/api/projects/${project}/runs/${runId}/blocks`, {
         method: 'POST',
@@ -1893,32 +1949,111 @@ async function decide(config, args) {
       },
     });
 
-    const decided = await pollForDecision(config, project, runId, asked.id);
-    if (decided?.state === 'ALLOWED') {
-      return allow(input, decided.reason ?? 'allowed by a person');
-    }
-    if (decided?.state === 'DENIED') {
-      return deny(
-        `${decided.reason ?? 'A person refused this.'} Do not try to work around it — report ` +
-          `blocked and say what you needed, or ask for a different approach.`,
-      );
-    }
-    // EXPIRED, or the poll gave up before the platform expired it. Same answer
-    // either way, and the difference is on the run for whoever reads it later.
-    // R339: a person may still allow it late, and if they do the session is
-    // sent a message saying so — so this says to carry on, not to stop.
-    return deny(
-      `Nobody answered this permission request in time. Do not retry it in a loop. Carry on ` +
-        `with whatever does not need it; if a person allows it later you will be sent a ` +
-        `message saying so, and may run it then. If nothing else can be done without it, ` +
-        `report blocked and say exactly what you needed to run and why.`,
-    );
+    return await answerOf(config, project, runId, asked.id, input);
   } catch (failure) {
     return deny(
       `cawdev could not be asked whether this is allowed (${failure.message}). Treating that as ` +
         `no. If this persists, report blocked rather than retrying.`,
     );
   }
+}
+
+/** The tools whose path is a file they change; Read, Grep and Glob carry a path too. */
+const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+
+/** Waits for the person and turns the decision into the answer the CLI reads. */
+async function answerOf(config, project, runId, approvalId, input) {
+  const decided = await pollForDecision(config, project, runId, approvalId);
+  if (decided?.state === 'ALLOWED') {
+    return allow(input, decided.reason ?? 'allowed by a person');
+  }
+  if (decided?.state === 'DENIED') {
+    return deny(
+      `${decided.reason ?? 'A person refused this.'} Do not try to work around it — report ` +
+        `blocked and say what you needed, or ask for a different approach.`,
+    );
+  }
+  // EXPIRED, or the poll gave up before the platform expired it. Same answer
+  // either way, and the difference is on the run for whoever reads it later.
+  // R339: a person may still allow it late, and if they do the session is
+  // sent a message saying so — so this says to carry on, not to stop.
+  return deny(
+    `Nobody answered this permission request in time. Do not retry it in a loop. Carry on ` +
+      `with whatever does not need it; if a person allows it later you will be sent a ` +
+      `message saying so, and may run it then. If nothing else can be done without it, ` +
+      `report blocked and say exactly what you needed to run and why.`,
+  );
+}
+
+/**
+ * The protected paths a person has allowed on this branch — the claim's list
+ * plus this run's own ALLOWED protected requests, read fresh (R562). Never
+ * throws: not knowing what was allowed means nothing was.
+ */
+async function protectedAllowedNow(config, project, runId, policy) {
+  const allowed = new Set(policy.allowed ?? []);
+  try {
+    const asked = await api(config, `/api/projects/${project}/runs/${runId}/approvals`);
+    for (const approval of asked ?? []) {
+      if (approval?.state === 'ALLOWED' && Array.isArray(approval.protectedPaths)) {
+        approval.protectedPaths.forEach((path) => allowed.add(path));
+      }
+    }
+  } catch {
+    // The claim's list stands.
+  }
+  return allowed;
+}
+
+/**
+ * The protected-file gate on `report done` — R562. Null when the branch is
+ * clean of unallowed protected changes (or nothing can be judged), else the
+ * refusal the session reads. In ASK mode a person is asked once, for all of
+ * them, and ALLOWED lets the run finish.
+ */
+async function protectedGate(config, project, runId) {
+  const policy = shieldPolicy().protected;
+  const base = process.env.CAWDEV_PROTECTED_BASE || null;
+  if (!policy.globs.length || !base) {
+    return null;
+  }
+  const root = process.env.CAWDEV_WORKSPACE ?? process.cwd();
+  const changed = await protectedChanges(root, base, policy.globs);
+  const allowed = await protectedAllowedNow(config, project, runId, policy);
+  const held = notAllowed(changed, [...allowed]);
+  if (!held.length) {
+    return null;
+  }
+  const list = held.join(', ');
+  await api(config, `/api/projects/${project}/runs/${runId}/blocks`, {
+    method: 'POST',
+    body: { kind: 'PROTECTED', detail: `branch changes ${list}` },
+  }).catch(() => {
+    // Bookkeeping.
+  });
+  const refusal = protectedRefusal(held, base);
+  if (policy.mode !== 'ASK') {
+    return refusal;
+  }
+  const asked = await api(config, `/api/projects/${project}/runs/${runId}/approvals`, {
+    method: 'POST',
+    body: {
+      toolName: 'ProtectedChange',
+      toolInput: JSON.stringify({ paths: held }),
+      summary: `Changes protected file(s): ${list}`,
+      suggestion: null,
+      exactPattern: null,
+      exactWithinCeiling: false,
+      protectedPaths: held,
+    },
+  });
+  const decided = await pollForDecision(config, project, runId, asked.id);
+  if (decided?.state === 'ALLOWED') {
+    return null;
+  }
+  return decided?.state === 'DENIED' && decided.reason
+    ? `${refusal} A person refused: ${decided.reason}`
+    : refusal;
 }
 
 function allow(updatedInput, reason) {
@@ -2013,10 +2148,18 @@ function shieldPolicy() {
       blockSecrets: parsed.blockSecrets !== false,
       blockDestructive: parsed.blockDestructive !== false,
       pathScope: Array.isArray(parsed.pathScope) ? parsed.pathScope : null,
+      // R562. Unreadable is REFUSE with no globs — never a way of allowing.
+      protected: protectedPolicy(parsed),
       root: process.env.CAWDEV_WORKSPACE ?? process.cwd(),
     };
   } catch {
-    return { blockSecrets: true, blockDestructive: true, pathScope: null, root: process.cwd() };
+    return {
+      blockSecrets: true,
+      blockDestructive: true,
+      pathScope: null,
+      protected: protectedPolicy(null),
+      root: process.cwd(),
+    };
   }
 }
 
@@ -2366,7 +2509,7 @@ function originWord(origin) {
   if (!origin || origin.kind === 'NONE') return null;
   switch (origin.kind) {
     case 'SONARQUBE': return 'SonarQube';
-    case 'FEEDBACK': return 'Feedback';
+    case 'FEEDBACK': return origin.label ? `Feedback (from ${origin.label})` : 'Feedback';
     case 'APPLICATION': return origin.label ? `an application (${origin.label})` : 'an application';
     case 'SESSION': return origin.label ? `a session (${origin.label})` : 'a session';
     default: return null;
@@ -2391,7 +2534,7 @@ function formatEntry(entry, { brief, comments, plan }) {
   if (entry.section) lines.push(`  section: ${entry.section}`);
   // R315. Sorted for the same reason the export is: a reader's shape must not
   // depend on the set's own insertion order.
-  if (entry.tags?.length) lines.push(`  tags: ${[...entry.tags].sort().map((t) => `#${t}`).join(' ')}`);
+  if (entry.tags?.length) lines.push(`  tags: ${[...entry.tags].sort(byCodeUnit).map((t) => `#${t}`).join(' ')}`);
   // R331. A username, never the email.
   if (entry.assignee) lines.push(`  assignee: ${entry.assignee.username}`);
   // R335. Not printed at MEDIUM, as the export does not write it.

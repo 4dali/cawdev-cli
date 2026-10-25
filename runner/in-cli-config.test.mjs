@@ -86,7 +86,14 @@ const status = (ui) => stripAnsi(ui.status);
 function pick(ui, id) {
   const at = ui.select.rows.findIndex((row) => row.id === id);
   assert.notEqual(at, -1, `no row ${id} in ${ui.select.rows.map((row) => row.id)}`);
-  ui.onKey(String(at + 1));
+  // R577: the menu grew past the nine rows a digit can reach, so the tail is
+  // walked to with the arrow and confirmed with enter.
+  if (at < 9) {
+    ui.onKey(String(at + 1));
+    return;
+  }
+  for (let step = 0; step < at; step += 1) ui.onKey('j');
+  ui.onKey('\r');
 }
 const type = (ui, text) => {
   for (const key of text) ui.onKey(key);
@@ -104,6 +111,28 @@ test('the menu names the change, and the hint carries the current state', () => 
   assert.match(labels['agent:agy'], /^Disable agy/);
   assert.match(labels.rules, /^Accept permission rules from the console · off now/);
   assert.match(labels.show, /runner\.config\.json/);
+});
+
+test('the planning-limit row says what the daemon was last told — R577', () => {
+  const hintOf = (runner) => configMenu(CONFIG, runner).rows.find((row) => row.id === 'planning-limit');
+  const none = hintOf(hello('/x/runner.config.json'));
+  assert.equal(none.label, 'Limit planning runs at once');
+  assert.equal(none.hint, 'no limit now');
+  assert.equal(hintOf(hello('/x/runner.config.json', { maxPlanningRuns: 3 })).hint, '3 at once now');
+});
+
+test('the pause row is the change and the hint is the value now — R571', () => {
+  const rowOf = (runner) => configMenu(CONFIG, runner).rows.find((row) => row.id === 'pause');
+  const running = rowOf(hello('/x/runner.config.json'));
+  assert.equal(running.label, 'Pause this machine — claim nothing new');
+  assert.equal(running.hint, 'claiming now');
+  const paused = rowOf(hello('/x/runner.config.json', { paused: true }));
+  assert.equal(paused.label, 'Resume this machine — claim new runs again');
+  assert.equal(paused.hint, 'paused now');
+  const usage = rowOf(hello('/x/runner.config.json', { paused: true, pausedByUsage: true }));
+  assert.equal(usage.label, 'Paused by cawdev for usage');
+  assert.match(usage.hint, /resumes by itself/);
+  assert.doesNotMatch(usage.label, /Resume this machine/);
 });
 
 test('an agent that is off is offered as "Enable", and rules that are on as "Stop"', () => {

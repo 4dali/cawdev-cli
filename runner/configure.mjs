@@ -18,6 +18,11 @@
 // the hello — applied, or these keys need a restart — never this file's guess
 // about which keys the daemon can take.
 //
+// R577: `setMaxPlanningRuns` is the one setting here that writes the PLATFORM
+// and not the file — a limit on planning runs is a per-machine value the
+// console also edits, so it lives where both can reach it. It therefore never
+// goes through `reloadIfRunning`: the daemon reads it off its next heartbeat.
+//
 // R288: the same functions have a SECOND door — the attached terminal's `c`
 // key — and that is why every question here comes in through a parameter.
 // `ask.line` and `pick` are the two shapes a question takes (a line, or one
@@ -455,6 +460,63 @@ export async function removeProject({
   say(`  ${ink.success('✓')} ${ink.muted(`This machine no longer serves ${slug}.`)}`
     + (paths.length ? ` ${ink.muted(`Delete ${paths.length === 1 ? 'its checkout' : 'its checkouts'} yourself if you no longer want ${paths.length === 1 ? 'it' : 'them'}.`)}` : ''));
   return next;
+}
+
+/**
+ * The id the platform knows this machine by — R577.
+ *
+ * Looked up by the name the daemon registers under (`runnerNameOf`), among the
+ * machines that are yours: the config file does not hold the id, and two
+ * people's laptops may both be called `laptop`.
+ */
+export async function thisRunnerId(session, name) {
+  const runners = await session.request('/api/runners');
+  const mine = (Array.isArray(runners) ? runners : [])
+    .filter((each) => each.yours && each.name === name);
+  if (mine.length === 0) {
+    throw new Error(`cawdev has no machine of yours called "${name}" — has its daemon run once?`);
+  }
+  if (mine.length > 1) {
+    throw new Error(`More than one machine of yours is called "${name}" (${mine.map((each) => each.id).join(', ')}) — set it on the Runners page.`);
+  }
+  return mine[0].id;
+}
+
+/**
+ * How many planning runs this machine runs at once — R577. 0 is no limit.
+ *
+ * Posted to the owner-only pause endpoint, whose "absent leaves it alone"
+ * means nothing else about the machine moves. Refused before any request when
+ * the number is not one, so a typo costs no round trip.
+ */
+export async function setMaxPlanningRuns({ session, runnerId, limit, say, ink = painter(3) }) {
+  if (!Number.isInteger(limit) || limit < 0 || limit > 50) {
+    throw new Error('A planning limit is a whole number from 0 (no limit) to 50.');
+  }
+  const runner = await session.request(`/api/runners/${runnerId}/pause`, {
+    method: 'POST',
+    body: { maxPlanningRuns: limit },
+  });
+  say(`  ${ink.success('✓')} ${ink.muted('planning runs at once:')} ${ink.text(limit ? String(limit) : 'no limit')}`
+    + ` ${ink.muted('— the daemon applies it on its next heartbeat')}`);
+  return runner;
+}
+
+/**
+ * Pause this machine or resume it — R73, offered in the attached terminal's `c`
+ * menu by R571 so the queued line's "press c" is true. Writes the platform,
+ * like `setMaxPlanningRuns`, through the call Settings → Machines makes; the
+ * daemon reads it off its next heartbeat and no file is touched.
+ */
+export async function setPaused({ session, runnerId, paused, say, ink = painter(3) }) {
+  const runner = await session.request(`/api/runners/${runnerId}/pause`, {
+    method: 'POST',
+    body: { paused: paused === true },
+  });
+  say(`  ${ink.success('✓')} ${ink.muted(paused ? 'paused:' : 'resumed:')} `
+    + `${ink.text(paused ? 'claiming nothing new' : 'claiming again')}`
+    + ` ${ink.muted('— the daemon applies it on its next heartbeat')}`);
+  return runner;
 }
 
 /** Turn `acceptsRulesFromConsole` on or off — R126. */

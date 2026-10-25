@@ -16,7 +16,7 @@
 
 import assert from 'node:assert/strict';
 import { spawn, execFile } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -46,14 +46,25 @@ const asking = (id, label, profile) => ({
   id, projectSlug: 'board', label, branch: null, profile,
 });
 
-async function daemonWith(t, { workspaces, offers, name, maxSessions }) {
-  const platform = await fakePlatform({ offers });
+async function daemonWith(t, { workspaces, offers, name, maxSessions, heartbeatAnswer, agentScript }) {
+  const platform = await fakePlatform({
+    offers,
+    ...(heartbeatAnswer ? { heartbeatAnswer, runLive: true } : {}),
+  });
   const home = await mkdtemp(join(tmpdir(), 'cawdev-cfg-'));
   const config = join(home, 'config.json');
+  // R577: an agent that stays up long enough for runs to overlap. /bin/echo is
+  // gone before the next offer is looked at, and races the working-copy watcher.
+  let agentCommand = '/bin/echo';
+  if (agentScript) {
+    agentCommand = join(home, 'agent.sh');
+    await writeFile(agentCommand, agentScript);
+    await chmod(agentCommand, 0o755);
+  }
   await writeFile(config, JSON.stringify({
     url: platform.url,
     name,
-    agentCommand: '/bin/echo',
+    agentCommand,
     pollSeconds: 1,
     ...(maxSessions ? { maxSessions } : {}),
     projects: { board: { workspaces } },
@@ -154,7 +165,7 @@ test('a coding run is still refused while the project is at its cap', async (t) 
   );
 });
 
-test('nothing bounds a machine any more, whatever the profile', async (t) => {
+test('with no planning limit, nothing bounds a machine, whatever the profile', async (t) => {
   const workspaces = [await aRepository(), await aRepository()];
   const { said, platform } = await daemonWith(t, {
     name: 'test-caps-machine',
@@ -174,4 +185,43 @@ test('nothing bounds a machine any more, whatever the profile', async (t) => {
   assert.doesNotMatch(said(), /on this machine \(every profile counts\)/,
     `the machine cap is still holding something back:\n${said()}`);
   assert.ok(platform, 'the daemon reached the platform');
+});
+
+test('a planning limit holds the third planning run, never an ASK or a coding run', async (t) => {
+  // R577. Two planning runs at once; PLAN, SCOPE and AUDIT are all planning and
+  // the AUDIT is the third. The ASK and the CODE are not counted at all.
+  const workspaces = [await aRepository()];
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-caps-planning-limit',
+    workspaces,
+    heartbeatAnswer: { maxPlanningRuns: 2 },
+    agentScript: '#!/bin/sh\nsleep 3\n',
+    offers: [],
+  });
+  // The limit arrives on the first heartbeat, so offer after it has been said.
+  assert.ok(await until(said, /planning runs limited to 2 at once/), `never told the limit:\n${said()}`);
+  // And the daemon says it enforces the limit, so the console can tell it from an old one.
+  assert.equal(JSON.parse(platform.registrations[0].capabilities).maxPlanningRuns, true);
+  platform.offer(asking('run-plan', 'work out R12', 'PLAN'));
+  platform.offer(asking('run-scope', 'cut the tool rules', 'SCOPE'));
+  platform.offer(asking('run-audit', 'read the tools directory', 'AUDIT'));
+  platform.offer(asking('run-ask', 'what did R12 decide?', 'ASK'));
+  platform.offer(coding('run-code', 'the card'));
+
+  const started = () => platform.transitions.filter((each) => each.state === 'RUNNING').map((each) => each.runId);
+  assert.ok(
+    await platform.until(() => started().length >= 4),
+    `fewer than four started:\n${said()}`,
+  );
+  assert.deepEqual(started().sort(), ['run-ask', 'run-code', 'run-plan', 'run-scope']);
+  assert.ok(
+    await platform.untilQueued((reasons) => reasons.some(
+      (each) => each.runId === 'run-audit' && /at most 2 planning runs/.test(each.why))),
+    `nothing said why the audit waited:\n${said()}`,
+  );
+  // And it goes when one of the first two is over.
+  assert.ok(
+    await platform.until(() => started().includes('run-audit'), 30000),
+    `the audit never started after a slot freed:\n${said()}`,
+  );
 });

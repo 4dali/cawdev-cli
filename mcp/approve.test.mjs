@@ -28,6 +28,7 @@ async function fakePlatform({
   sessionRules = [],
   sessionRulesStatus = 200,
   decide = null,
+  approvals = [],
   onApproval = () => {},
 } = {}) {
   const asked = [];
@@ -57,6 +58,9 @@ async function fakePlatform({
         return response.end('{"status":404,"error":"Not Found"}');
       }
       return json(sessionRules.map((pattern) => ({ pattern })));
+    }
+    if (url.endsWith('/approvals') && request.method === 'GET') {
+      return json(approvals);
     }
     if (url.endsWith('/approvals') && request.method === 'POST') {
       let body = '';
@@ -411,6 +415,99 @@ test('a call the shield stopped is offered no exact rule at all', async () => {
     assert.match(asked.summary, /stopped by the shield/);
     assert.equal(asked.exactPattern, null);
     assert.equal(asked.exactWithinCeiling, false);
+  } finally {
+    platform.close();
+  }
+});
+
+// --- R562: protected files --------------------------------------------------
+
+const edit = { file_path: '/work/secret/a.txt', content: 'x' };
+const shield = (extra) => ({
+  CAWDEV_WORKSPACE: '/work',
+  CAWDEV_SHIELD: JSON.stringify({ protectedPaths: ['secret/**'], ...extra }),
+});
+
+test('REFUSE denies an edit to a protected file and asks nobody', async () => {
+  const platform = await fakePlatform({ rules: ['Write'] });
+  try {
+    const decision = JSON.parse(await callTool(
+      platform.url, 'approve', { tool_name: 'Write', input: edit },
+      { ...shield({ protectedMode: 'REFUSE' }), CAWDEV_GRANTABLE: JSON.stringify(['Write']) }));
+    assert.equal(decision.behavior, 'deny');
+    assert.match(decision.message, /secret\/a\.txt is protected in this project/);
+    assert.equal(platform.asked.length, 0, 'a rule must not cover a protected file');
+  } finally {
+    platform.close();
+  }
+});
+
+test('ASK raises a request that carries the path and offers nothing to remember', async () => {
+  const platform = await fakePlatform({ decide: { state: 'ALLOWED', reason: 'ok' } });
+  try {
+    const decision = JSON.parse(await callTool(
+      platform.url, 'approve', { tool_name: 'Write', input: edit, tool_use_id: 'toolu_9' },
+      shield({ protectedMode: 'ASK' })));
+    assert.equal(decision.behavior, 'allow');
+    const [request] = platform.asked;
+    assert.deepEqual(request.protectedPaths, ['secret/a.txt']);
+    assert.match(request.summary, /^PROTECTED FILE — /);
+    assert.equal(request.suggestion, null);
+    assert.equal(request.exactPattern, null);
+  } finally {
+    platform.close();
+  }
+});
+
+test('a path a person already allowed on this run goes through without a request', async () => {
+  const platform = await fakePlatform({
+    approvals: [{ state: 'ALLOWED', protectedPaths: ['secret/a.txt'] }],
+  });
+  try {
+    const decision = JSON.parse(await callTool(
+      platform.url, 'approve', { tool_name: 'Write', input: edit },
+      shield({ protectedMode: 'ASK' })));
+    assert.equal(decision.behavior, 'allow');
+    assert.equal(platform.asked.length, 0);
+  } finally {
+    platform.close();
+  }
+});
+
+test('a path the claim lists as allowed goes through too', async () => {
+  const platform = await fakePlatform();
+  try {
+    const decision = JSON.parse(await callTool(
+      platform.url, 'approve', { tool_name: 'Write', input: edit },
+      shield({ protectedMode: 'REFUSE', protectedAllowed: ['secret/a.txt'] })));
+    assert.equal(decision.behavior, 'allow');
+  } finally {
+    platform.close();
+  }
+});
+
+test('an unreadable shield protects nothing it cannot name, and never fails open to ASK', async () => {
+  const platform = await fakePlatform({ decide: { state: 'ALLOWED' } });
+  try {
+    // No globs: an ordinary write is not protected, and is asked as before.
+    const decision = JSON.parse(await callTool(
+      platform.url, 'approve', { tool_name: 'Write', input: edit },
+      { CAWDEV_WORKSPACE: '/work', CAWDEV_SHIELD: '{not json' }));
+    assert.equal(decision.behavior, 'allow');
+    assert.equal(platform.asked[0].protectedPaths, undefined);
+  } finally {
+    platform.close();
+  }
+});
+
+test('a read of a protected path is not a change, and is asked about like any call', async () => {
+  const platform = await fakePlatform({ decide: { state: 'ALLOWED' } });
+  try {
+    const decision = JSON.parse(await callTool(
+      platform.url, 'approve', { tool_name: 'Read', input: { file_path: '/work/secret/a.txt' } },
+      shield({ protectedMode: 'REFUSE' })));
+    assert.equal(decision.behavior, 'allow');
+    assert.equal(platform.asked[0].protectedPaths, undefined);
   } finally {
     platform.close();
   }

@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  adapterFor, compareUrl, gitlabMergeability, hostFor, iidOf, mrUrlIn, repoOf,
+  adapterFor, compareUrl, configureBitbucket, gitlabMergeability, hostFor, iidOf, mrUrlIn, prIdOf, repoOf,
 } from './git-host.mjs';
 
 test('repoOf reads scp-style, https, and ssh:// with a port, subgroups kept', () => {
@@ -66,4 +66,48 @@ test('the mergeability mapping table', () => {
   }
   assert.equal(gitlabMergeability({ detailed_merge_status: 'mergeable' }), 'KNOWN');
   assert.equal(gitlabMergeability(null), 'KNOWN');
+});
+
+test('Bitbucket: declared, or by the origin host; the compare link contains /compare/', () => {
+  assert.equal(hostFor({ declared: 'BITBUCKET', originUrl: 'https://git.corp.example/x/y.git' }), 'bitbucket');
+  assert.equal(hostFor({ originUrl: 'git@bitbucket.org:team/app.git' }), 'bitbucket');
+  assert.equal(hostFor({ originUrl: 'https://user@bitbucket.org/team/app.git' }), 'bitbucket');
+  assert.equal(adapterFor('bitbucket').name, 'bitbucket');
+  const link = compareUrl('bitbucket', { host: 'bitbucket.org', path: 'team/app' }, null, 'r9-x');
+  assert.equal(link, 'https://bitbucket.org/team/app/branches/compare/r9-x%0Dmain');
+  assert.ok(link.includes('/compare/'));
+  assert.ok(adapterFor('bitbucket').fallbackLink({ host: 'bitbucket.org', path: 'a/b' }, 'dev', 'x').includes('/compare/'));
+});
+
+test('prIdOf reads the number at the end of a Bitbucket pull request URL', () => {
+  assert.equal(prIdOf('https://bitbucket.org/team/app/pull-requests/42'), '42');
+  assert.equal(prIdOf('https://bitbucket.org/team/app/branches/compare/x%0Dmain'), null);
+});
+
+test('a GitLab merge request squash-merged reports squash_commit_sha as its commit', async () => {
+  const { chmod, mkdtemp, writeFile } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = await mkdtemp(join(tmpdir(), 'cawdev-glab-'));
+  await writeFile(join(dir, 'glab'), [
+    '#!/bin/sh',
+    `echo '{"iid":7,"state":"merged","merged_at":"2026-01-02T00:00:00Z","merge_commit_sha":null,"squash_commit_sha":"abc123","web_url":"https://g/x/-/merge_requests/7"}'`,
+    '',
+  ].join('\n'));
+  await chmod(join(dir, 'glab'), 0o755);
+  const was = process.env.PATH;
+  process.env.PATH = `${dir}:${was}`;
+  try {
+    const viewed = await adapterFor('gitlab').view(dir, 'https://g/x/-/merge_requests/7');
+    assert.deepEqual(viewed, { state: 'MERGED', mergedAt: '2026-01-02T00:00:00Z', mergeCommit: 'abc123' });
+  } finally {
+    process.env.PATH = was;
+  }
+});
+
+test('Bitbucket with no token answers code -1 naming the config block', async () => {
+  configureBitbucket({});
+  const made = await adapterFor('bitbucket').create(process.cwd(), { branch: 'b', title: 't', body: 'x' });
+  assert.equal(made.code, -1);
+  assert.match(made.err, /"bitbucket": \{ "email"/);
 });

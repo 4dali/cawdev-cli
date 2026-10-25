@@ -17,17 +17,19 @@ import {
   access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile,
 } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
-
+import { fileURLToPath } from 'node:url';
 import { join, resolve } from 'node:path';
 import { spawnFailureSaid, workspaceProblem, workspaceProblemSaid } from './workspace-check.mjs';
 import { changedLines } from './changed-lines.mjs';
-import { adapterFor, hostFor, repoOf } from './git-host.mjs';
+import { adapterFor, configureBitbucket, hostFor, repoOf } from './git-host.mjs';
 import { describeTurn, totalsOf } from '../lib/usage.mjs';
 import { withinCeiling } from '../lib/tool-rules.mjs';
 import { serveControl } from './control.mjs';
 import { painter } from '../lib/ansi.mjs';
 import { bannerLines, tintLog } from './banner.mjs';
 import { codeMapOf } from '../lib/code-map.mjs';
+import { sonarqubeLaunch } from '../lib/sonarqube-mcp.mjs';
+import { parseProperties, sonarAsker, waitForAnalysis } from '../lib/sonar-analysis.mjs';
 import { usageLimitOf } from '../lib/usage-limit.mjs';
 import { TranscriptBatch } from '../lib/transcript-batch.mjs';
 import { parseUsage } from '../lib/usage-report.mjs';
@@ -37,24 +39,30 @@ import {
 import { AI_CONFIG, harnessPrompt, readRepoConfig } from '../lib/harness-prompt.mjs';
 import { loadToken, storedUrls } from './token-store.mjs';
 import {
-  CARD_WRITE, CAWDEV_READS, GIT_READS, beforeTheWorkExists, driftedFrom, readOnlyExpert,
+  CARD_WRITE, CAWDEV_READS, GIT_READS, SUGGEST, beforeTheWorkExists, driftedFrom, readOnlyExpert,
   toolsForStage,
 } from '../lib/stage-tools.mjs';
 import { capabilityIn, describeCall } from '../lib/tool-line.mjs';
 import { findSecret } from '../lib/secrets.mjs';
 import { BackgroundShells } from '../lib/background-shells.mjs';
 import { cliVersion, isBelow } from '../lib/version.mjs';
-import { reloadableFor, restartNeededFor } from '../lib/runner-config.mjs';
+import { reloadableFor, restartNeededFor, runnerNameOf } from '../lib/runner-config.mjs';
 import {
   createAutoWorkspace, discoverAutoWorkspaces, isAutoWorkspace,
 } from './auto-workspaces.mjs';
 import { agentOfCommand, needsEverything } from '../lib/agents.mjs';
+import { noteKey, pausedNote, pauseLogLine, reportedPauseNote } from './pause-note.mjs';
 import { cawdevToolNames, codexArgs, translateCodexEvent } from '../lib/codex.mjs';
 import {
   drivingPath, isAlive, killedByRestart, leftBehind, memoryMaxOf, probeScope, readDriving,
   restartSummary, scoped, snapshotOf, writeDriving,
 } from './restart.mjs';
-import { COMMITS_ITS_WORK, settleBranch } from '../lib/finish-check.mjs';
+import {
+  COMMITS_ITS_WORK, heldProtected, protectedHeld, settleBranch,
+} from '../lib/finish-check.mjs';
+import {
+  denyRules, notAllowed, protectedBase, protectedChanges, protectedLine, protectedPolicy,
+} from '../lib/protected.mjs';
 
 // --- configuration -----------------------------------------------------------
 
@@ -407,7 +415,7 @@ async function readConfig() {
      * credential does not belong in one.
      */
     token: process.env.CAWDEV_TOKEN ?? file.token ?? (await loadToken(url)),
-    name: process.env.CAWDEV_RUNNER_NAME ?? file.name ?? DEFAULTS.name,
+    name: runnerNameOf(file),
     agentCommands: file.agentCommands ?? (file.agentCommand ? [file.agentCommand] : null) ?? (process.env.CAWDEV_AGENT_COMMAND ? process.env.CAWDEV_AGENT_COMMAND.split(',').map(s => s.trim()) : null) ?? DEFAULTS.agentCommands,
     // Which projects this runner serves, and where their working copies are.
     projects: normaliseProjects(file.projects ?? {}),
@@ -438,6 +446,21 @@ async function readConfig() {
      * none. Raw here; `main` probes whether this machine can apply it.
      */
     sessionMemoryMax: file.sessionMemoryMax ?? null,
+    /**
+     * R565. Bitbucket Cloud has no CLI, so this machine calls its API with a
+     * token it keeps. `tokenEnv` names the variable the token is read from
+     * (never the file: a config sits beside code); `email` is the Atlassian
+     * account for an API token, absent for a workspace or repository access
+     * token; `apiUrl` is for tests. The variable is removed from every agent's
+     * environment — see `agentEnv`.
+     *
+     *   "bitbucket": { "email": "you@example.com", "tokenEnv": "BITBUCKET_TOKEN" }
+     */
+    bitbucket: {
+      email: file.bitbucket?.email ?? null,
+      tokenEnv: file.bitbucket?.tokenEnv ?? 'BITBUCKET_TOKEN',
+      apiUrl: file.bitbucket?.apiUrl ?? null,
+    },
     skillCache: file.skillCache ?? DEFAULTS.skillCache,
     skillPrepareSeconds: file.skillPrepareSeconds ?? DEFAULTS.skillPrepareSeconds,
     idleSeconds: file.idleSeconds ?? DEFAULTS.idleSeconds,
@@ -505,6 +528,10 @@ async function readConfig() {
  *   "dycrypt": { "path": "…", "allowedTools": ["Bash(mvn *)", "mcp__roadmap"] }
  *   "cawdev":  { "workspaces": ["/…/ws-1", "/…/ws-2", "/…/ws-3"] }
  *   "cawdev":  { "workspaces": [...], "quality": { "command": "sonar-scanner", "tokenEnv": "SONAR_TOKEN" } }
+ *
+ * (R565: a machine with a Bitbucket project also has a top-level
+ * `"bitbucket": { "email": "…", "tokenEnv": "BITBUCKET_TOKEN" }` block, beside
+ * `projects` and not inside one — see `readConfig`.)
  *
  * R300: the fourth form adds a `quality` block — see `qualityBlockOf` — and a
  * project with one has its branches scanned after a coding run's TEST stage.
@@ -648,6 +675,16 @@ function qualityBlockOf(slug, block) {
  * what most skills will want.
  */
 const SKILLS_HERE = {
+  /**
+   * R319. A Java process whose jar, token and server URL are all this
+   * machine's: see `sonarqubeLaunch`. `when` is the sentence the prompt gives
+   * the session about when to reach for it.
+   */
+  sonarqube: {
+    launch: 'sonarqube',
+    when: 'Before drafting a fix for a SonarQube finding, read the rule with `show_rule` '
+      + '(and the issue or hotspot it came from) instead of guessing from its one-line message.',
+  },
   codegraph: {
     /**
      * The npm package is a thin shim: the real artifact is a per-platform
@@ -745,7 +782,10 @@ async function api(config, path, { method = 'GET', body, token } = {}) {
   const text = await response.text();
   const parsed = text ? safeJson(text) : null;
   if (!response.ok) {
-    throw new Error(parsed?.message ?? `${method} ${path} -> ${response.status}`);
+    const error = new Error(parsed?.message ?? `${method} ${path} -> ${response.status}`);
+    // i267: the caller can tell a refusal (4xx) from a platform that is down.
+    error.status = response.status;
+    throw error;
   }
   return parsed;
 }
@@ -1198,7 +1238,7 @@ async function prepareSkillIndex(config, skill, local, forProject, cwd, baseComm
   try {
     const built = await runSkillCommand(skill.command, buildArgsFor(skill, local), {
       cwd,
-      env: { ...process.env, ...(local.env ?? {}) },
+      env: agentEnv(config, local.env ?? {}),
       timeoutMs: config.skillPrepareSeconds * 1000,
     });
 
@@ -1410,7 +1450,7 @@ async function resolveSkills(config, run, cwd, baseCommit, asked) {
   const attached = [];
   const notes = [];
 
-  for (const skill of asked) {
+  for (let skill of asked) {
     if (!skill?.key || !skill?.command || !Array.isArray(skill.args)) {
       notes.push(`A skill arrived that this daemon cannot read (${JSON.stringify(skill)}). `
         + 'It has not been attached.');
@@ -1425,7 +1465,21 @@ async function resolveSkills(config, run, cwd, baseCommit, asked) {
         + 'should look at the skill row.');
     }
 
-    const local = SKILLS_HERE[skill.key] ?? {};
+    let local = SKILLS_HERE[skill.key] ?? {};
+    if (local.launch === 'sonarqube') {
+      const storagePath = skillCacheFor(config, skill, run.projectSlug);
+      await mkdir(storagePath, { recursive: true }).catch(() => { });
+      const launch = sonarqubeLaunch({
+        skill, quality: config.projects?.[run.projectSlug]?.quality, sonarUrl: run.sonarUrl,
+        env: process.env, storagePath,
+      });
+      if (launch.skip) {
+        notes.push(launch.skip);
+        continue;
+      }
+      skill = { ...skill, args: launch.args };
+      local = { ...local, env: launch.env };
+    }
     if (local.indexDir) {
       notes.push(await prepareSkillIndex(config, skill, local, run, cwd, baseCommit));
     }
@@ -1858,6 +1912,38 @@ async function prepareMerge(cwd, branch, defaultBranch) {
 }
 
 /**
+ * Each live run's protected-file guard — R562: `{ globs, mode, allowed, base }`.
+ *
+ * Fixed once, after the working copy is prepared, and read at every door a run
+ * can finish through. A map rather than one more parameter on a dozen
+ * signatures; entries are dropped when the run's last word is said.
+ */
+const protectedGuards = new Map();
+
+/** The guard `settleBranch` and the merge push judge by, or null when nothing is protected. */
+async function guardOf(config, run) {
+  const guard = protectedGuards.get(run.id);
+  if (!guard?.globs.length || !guard.base) {
+    return null;
+  }
+  // The claim's `allowed` is a snapshot; a person may have allowed a change
+  // since. Read the run's own ALLOWED protected approvals fresh, or an ASK-mode
+  // run that was allowed would still fail here.
+  const allowed = new Set(guard.allowed ?? []);
+  try {
+    const asked = await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/approvals`);
+    for (const approval of asked ?? []) {
+      if (approval?.state === 'ALLOWED' && Array.isArray(approval.protectedPaths)) {
+        approval.protectedPaths.forEach((path) => allowed.add(path));
+      }
+    }
+  } catch {
+    // The claim's list stands.
+  }
+  return { ...guard, allowed: [...allowed] };
+}
+
+/**
  * What the session left behind — R155, and it is judged strictly.
  *
  * `pushed` is false unless the tree has no conflict markers left AND the push
@@ -1866,7 +1952,7 @@ async function prepareMerge(cwd, branch, defaultBranch) {
  * knowable; reporting it as success would land conflict markers, which is the
  * one way this feature could do real damage.
  */
-async function finishMerge(cwd, branch) {
+async function finishMerge(cwd, branch, guard = null) {
   const stillConflicted = await git(cwd, ['diff', '--name-only', '--diff-filter=U'])
     .then((said) => said.split('\n').map((line) => line.trim()).filter(Boolean))
     .catch(() => []);
@@ -1885,6 +1971,16 @@ async function finishMerge(cwd, branch) {
     await git(cwd, ['commit', '--no-edit'])
       .catch(() => git(cwd, ['commit', '-m', `Merge into ${branch}`]))
       .catch((failure) => log(`  could not commit the resolution: ${failure.message.split('\n')[0]}`));
+  }
+
+  // R562. The resolution is judged against the base the merge started from,
+  // before anything is pushed. Allowances are the branch's, and a merge run is
+  // on the same branch as the coding run that was allowed them.
+  const held = await heldProtected(cwd, guard)
+    .catch((failure) => [`(the branch could not be checked: ${failure.message.split('\n')[0]})`]);
+  if (held.length) {
+    log(`  not pushed: ${protectedHeld(held)}`);
+    return { pushed: false, mergeCommit: null, files: [], held };
   }
 
   const pushed = await pushBranch(cwd, branch);
@@ -1912,7 +2008,7 @@ async function finishMerge(cwd, branch) {
  * arrives second; see `RunService.settleAgentMerge`.
  */
 async function finishTheMerge(config, run, cwd, branch, said) {
-  const left = await finishMerge(cwd, branch);
+  const left = await finishMerge(cwd, branch, await guardOf(config, run));
   log(left.pushed
     ? `  ${branch} pushed at ${String(left.mergeCommit ?? '').slice(0, 7)}`
     : `  nothing was pushed: the conflict on ${branch} is still there`);
@@ -1935,7 +2031,9 @@ async function finishTheMerge(config, run, cwd, branch, said) {
   if (current?.live) {
     await finish(config, run, left.pushed ? 'FINISHED' : 'FAILED', left.pushed
       ? `Merged and pushed ${branch}.`
-      : `The conflict on ${branch} was not resolved; nothing was pushed.`);
+      : left.held
+        ? protectedHeld(left.held)
+        : `The conflict on ${branch} was not resolved; nothing was pushed.`);
   }
 }
 
@@ -2704,41 +2802,6 @@ function trimSlash(url) {
   return url.replace(/\/$/, '');
 }
 
-/** A GET against the SonarQube server a scan just reported to, authorised with the scanner's own token. */
-function sonarAsker(serverUrl, token) {
-  return async (path) => {
-    const response = await fetch(`${serverUrl}${path}`, { headers: { authorization: `Bearer ${token}` } });
-    if (!response.ok) {
-      throw new Error(`SonarQube answered ${response.status} to ${path.split('?')[0]}`);
-    }
-    return response.json();
-  };
-}
-
-/**
- * Waits for a queued analysis to settle — shared by every scan path, BRANCH,
- * MAIN and PROJECT alike. Throws rather than reports: every caller runs
- * inside `scanQuality`'s own try/catch, which turns it into an error reading.
- */
-async function waitForAnalysis(ask, ceTaskId, deadline, timeoutSeconds) {
-  let settled = null;
-  while (Date.now() < deadline) {
-    const { task: current } = await ask(`/api/ce/task?id=${encodeURIComponent(ceTaskId)}`);
-    if (['SUCCESS', 'FAILED', 'CANCELED'].includes(current?.status)) {
-      settled = current;
-      break;
-    }
-    await new Promise((wake) => setTimeout(wake, 3000));
-  }
-  if (!settled) {
-    throw new Error(`SonarQube had not finished analysing after ${timeoutSeconds}s.`);
-  }
-  if (settled.status !== 'SUCCESS') {
-    throw new Error(settled.errorMessage ?? `SonarQube ${settled.status.toLowerCase()} the analysis.`);
-  }
-  return settled;
-}
-
 /** The gate and the new-code measures, for a BRANCH or MAIN reading — never for PROJECT, which has neither. */
 async function reportBranchReading({ ask, reportTask, settled, key, branch, analysedAs, warning, headSha, report }) {
   const { projectStatus } = await ask(`/api/qualitygates/project_status?analysisId=${encodeURIComponent(settled.analysisId)}`);
@@ -2876,18 +2939,6 @@ async function scanAsScratchProject({ quality, run, cwd, branch, key, url, token
     warning: 'This server does not analyse branches; the branch was analysed as its own SonarQube project, '
       + 'counting problems on the lines it changed. No gate was computed.',
   });
-}
-
-/** `key=value` lines — the shape of the scanner's `report-task.txt`. */
-function parseProperties(text) {
-  const parsed = {};
-  for (const line of text.split('\n')) {
-    const at = line.indexOf('=');
-    if (at > 0) {
-      parsed[line.slice(0, at).trim()] = line.slice(at + 1).trim();
-    }
-  }
-  return parsed;
 }
 
 /**
@@ -3032,6 +3083,12 @@ async function firstRef(path, candidates) {
  * turn.
  */
 function briefLine(run) {
+  // R562. Every prompt that names the brief names the protected files first, so
+  // a session checks its plan against the list before it starts.
+  return (run.protectedLine ? `${run.protectedLine}\n\n` : '') + briefIndexLine(run);
+}
+
+function briefIndexLine(run) {
   const index = run.brief?.index ?? BRIEF.index;
   const text = run.brief?.indexText;
 
@@ -3098,6 +3155,9 @@ If a decision is genuinely theirs, use the cawdev MCP tool \`ask_user\` and wait
 
 ${run.branch ? `When what they asked is done, commit it on ${run.branch} — work left
 uncommitted is work nothing can push or propose. Never commit to or push main.
+You may commit on ${run.branch} and push it, and nothing else. Branches, pull
+requests and merges are opened from cawdev: there is no \`gh\` or \`glab\` in this
+session, and a push to any other branch is refused.
 
 ` : ''}Their instruction:
 
@@ -3137,11 +3197,16 @@ task, for context only. \`task_current\` carries the same note.
    with no right answer, something the entry does not settle — call \`ask_user\`
    and wait. Do not guess and carry on. Do not use it to check work you can
    check yourself.
-5. Finish with \`report\` kind "done", naming the branch and, if this repository
-   has a remote, the pushed branch or PR. If something stops you that a person
-   must resolve, use kind "blocked" instead and say what is in the way.
+5. ${SUGGEST_ELSEWHERE}
+6. Finish with \`report\` kind "done", naming the branch and, if this repository
+   has a remote, whether the branch is pushed. If something stops you that a
+   person must resolve, use kind "blocked" instead and say what is in the way.
 
-Commit your work. Never push to main.`;
+Commit your work. Never push to main.
+
+You may commit on ${run.branch} and push it, and nothing else. Branches, pull
+requests and merges are opened from cawdev: there is no \`gh\` or \`glab\` in this
+session, and a push to any other branch is refused.`;
 }
 
 // --- the transcript ----------------------------------------------------------
@@ -4154,6 +4219,21 @@ async function openPullRequest(cwd, run, title) {
     }
   }
 
+  // R565. A release's pull request is cawdev's to open, not the session's. The
+  // host's own default is the base — a release is not stacked on a sprint — and
+  // the body carries the one thing the person merging it must not get wrong.
+  if (run.profile === 'RELEASE') {
+    return openPullRequestFor(cwd, {
+      declared: run.gitHost ?? null,
+      branch: run.branch,
+      base: null,
+      title: run.label || run.branch,
+      body: 'Release opened by cawdev. Merge with a MERGE COMMIT, not a squash: a squash rewrites '
+        + 'the commit and leaves the tag pointing at something that is not on the default branch. '
+        + 'A release branch is not merged from the development board.',
+    });
+  }
+
   return openPullRequestFor(cwd, {
     declared: run.gitHost ?? null,
     branch: run.branch,
@@ -4246,20 +4326,20 @@ async function openPullRequestFor(cwd, { branch, base, title, body, declared = n
     }
     return {
       ok: false,
-      result: `${adapter.bin} said it opened ${printed}, but the host does not show a ${adapter.noun} for ${branch}.`,
+      result: `${adapter.bin ?? adapter.name} said it opened ${printed}, but the host does not show a ${adapter.noun} for ${branch}.`,
     };
   }
   // The one failure somebody can fix in a minute, said with the fix — and the
   // link to open it by hand meanwhile, which `findPullRequest` builds without the CLI.
-  if (opened.code === -1 && /not installed/.test(opened.err)) {
+  if (opened.code === -1) {
     const compare = await findPullRequest(cwd, branch, { declared, base }).catch(() => null);
     return {
       ok: false,
-      result: `${opened.err} Install it and sign in (${adapter.installHint}), `
+      result: `${opened.err} Set it up (${adapter.installHint}), `
         + `then ask again${compare ? ` — or open it yourself: ${compare}` : '.'}`,
     };
   }
-  return { ok: false, result: opened.err || opened.out || `${adapter.bin} ${adapter.name === 'gitlab' ? 'mr' : 'pr'} create failed without saying why.` };
+  return { ok: false, result: opened.err || opened.out || `${adapter.bin ?? adapter.name} ${adapter.name === 'gitlab' ? 'mr' : 'pr'} create failed without saying why.` };
 }
 
 /**
@@ -4350,7 +4430,7 @@ async function mergePullRequest(cwd, branch, { method = null, declared = null } 
     failure: await classifyMergeFailure(cwd, url, merged, adapter),
     // Unchanged: `gh`'s own words still reach the card. The classification is a
     // word beside them, never a replacement for them.
-    result: merged.err || merged.out || `${adapter.bin} ${adapter.name === 'gitlab' ? 'mr' : 'pr'} merge failed without saying why.`,
+    result: merged.err || merged.out || `${adapter.bin ?? adapter.name} ${adapter.name === 'gitlab' ? 'mr' : 'pr'} merge failed without saying why.`,
   };
 }
 
@@ -4575,6 +4655,9 @@ async function classifyMergeFailure(cwd, url, merged, adapter) {
  * produced, and if the platform has more to say it can say it to the next run.
  */
 async function settleActions(config, run, cwd) {
+  // First, so a stray branch is on the run's transcript before cawdev queues
+  // its own pull request on top of it.
+  await auditPushes(config, run, cwd).catch((failure) => log(`  could not audit the pushes: ${failure.message}`));
   const actions = await api(
     config,
     `/api/projects/${run.projectSlug}/runs/${run.id}/actions/claim`,
@@ -4611,62 +4694,96 @@ async function settleActions(config, run, cwd) {
 /** How often the merge pass runs, in minutes. A merge is a human-timescale event. */
 const MERGE_CHECK_MINUTES = 10;
 
+/** `Map<ref, sha>` of the remote's heads and tags, or null when it cannot be read. */
+async function remoteRefs(cwd) {
+  const listed = await git(cwd, ['ls-remote', '--heads', '--tags', 'origin'], { timeoutMs: 60_000 });
+  const refs = new Map();
+  for (const line of listed.split('\n')) {
+    const [sha, ref] = line.trim().split(/\s+/);
+    // An annotated tag lists twice; the peeled `^{}` line is the commit.
+    if (sha && ref && !ref.endsWith('^{}')) {
+      refs.set(ref, sha);
+    }
+  }
+  return refs;
+}
+
 /**
- * What `gh` says about the branch's pull request.
+ * R565. After a writing session, say so when it pushed anything but its own
+ * branch — for every agent CLI, because only Claude Code's hook can refuse it
+ * on the way. A new or moved ref is the session's when its commit exists in this
+ * checkout AND is on a local branch: that keeps another person's concurrent
+ * push, whose objects we never fetched, from being blamed on the session.
+ *
+ * Deletions cannot be attributed to the session (a teammate may have merged
+ * and deleted a branch in the meantime), so they are not flagged.
+ */
+async function auditPushes(config, run, cwd) {
+  const before = run.remoteBefore;
+  if (!before || !run.branch || !cwd) {
+    return;
+  }
+  run.remoteBefore = null; // once: settleActions is reached from several paths
+  const now = await remoteRefs(cwd);
+  for (const [ref, sha] of now) {
+    if (ref === `refs/heads/${run.branch}` || before.get(ref) === sha) {
+      continue;
+    }
+    if (run.profile === 'RELEASE' && ref.startsWith('refs/tags/')) {
+      continue;
+    }
+    const here = await git(cwd, ['cat-file', '-e', `${sha}^{commit}`]).then(() => true, () => false);
+    if (!here) {
+      continue;
+    }
+    const onBranch = (await git(cwd, ['for-each-ref', '--contains', sha, 'refs/heads']).catch(() => '')).trim();
+    if (!onBranch) {
+      continue;
+    }
+    log(`  !! this session pushed ${ref}, outside its branch ${run.branch}`);
+    await sayOnTheRun(config, run,
+      `This session pushed \`${ref}\`, which is outside its branch \`${run.branch}\`. `
+      + 'Branches, pull requests and merges are opened from cawdev.');
+  }
+}
+
+/**
+ * What the git host says about the branch's pull request — through the host's
+ * own adapter (`gh`, `glab` or Bitbucket's API), R565.
  *
  * The pull request URL is preferred over the branch name when we have a real
- * one, because `gh pr view <branch>` stops finding anything once the branch is
- * deleted — which is precisely when this question gets interesting. A URL keeps
- * answering after the branch it belonged to is gone.
+ * one, because looking a pull request up by branch stops finding anything once
+ * the branch is deleted — which is precisely when this question gets
+ * interesting. A URL keeps answering after the branch it belonged to is gone.
  *
  * A `/compare/` URL is not a pull request: `findPullRequest` falls back to one
- * as a link somebody can click, and asking `gh` about it would be asking about
- * a page that does not exist.
+ * as a link somebody can click, and asking the host about it would be asking
+ * about a page that does not exist.
  */
-async function askGitHub(cwd, branch, prUrl) {
+async function askHost(cwd, branch, prUrl, declared = null) {
   const target = prUrl && !prUrl.includes('/compare/') ? prUrl : branch;
   if (!target) {
     return null;
   }
-  const out = await new Promise((resolvePromise) => {
-    const child = spawn(
-      'gh',
-      ['pr', 'view', target, '--json', 'state,mergedAt,mergeCommit'],
-      { cwd, stdio: ['ignore', 'pipe', 'ignore'] },
-    );
-    let text = '';
-    child.stdout.on('data', (chunk) => (text += chunk));
-    child.on('error', () => resolvePromise(null));
-    // `close`, not `exit` — see git() above.
-    child.on('close', (code) => resolvePromise(code === 0 ? text.trim() : null));
-  });
-  if (!out) {
-    return null;
-  }
-
-  const parsed = safeJson(out);
-  if (!parsed?.state) {
-    return null;
-  }
-  // gh's states are OPEN, CLOSED and MERGED. CLOSED here means closed WITHOUT
-  // merging — gh reports a merged PR as MERGED, never as CLOSED — which is the
-  // distinction worth keeping: it is a card that needs a person, not a status
-  // change.
-  const state = { OPEN: 'OPEN', MERGED: 'MERGED', CLOSED: 'CLOSED' }[parsed.state];
-  if (!state) {
+  const { adapter } = await hostOf(cwd, declared);
+  const viewed = await adapter.view(cwd, target);
+  // OPEN, CLOSED and MERGED. CLOSED here means closed WITHOUT merging — a merged
+  // pull request is MERGED, never CLOSED — which is the distinction worth
+  // keeping: it is a card that needs a person, not a status change.
+  if (!viewed?.state) {
     return null;
   }
   return {
-    state,
-    mergeCommit: parsed.mergeCommit?.oid ?? null,
-    mergedAt: parsed.mergedAt ?? null,
+    state: viewed.state,
+    mergeCommit: viewed.mergeCommit ?? null,
+    mergedAt: viewed.mergedAt ?? null,
   };
 }
 
 /**
- * What `gh` says about a hand-taken branch's pull request — R346.
+ * What the host says about a hand-taken branch's pull request — R346.
  *
- * `pr list --head`, not `pr view <branch>`: the latter stops finding the pull
+ * Listed by head, not viewed by branch: the latter stops finding the pull
  * request once the branch is deleted, and this matches on the pull request's own
  * head branch name, which does not change. Fork pull requests are dropped: a
  * fork's branch of the same name is not this branch.
@@ -4675,23 +4792,12 @@ async function askGitHub(cwd, branch, prUrl) {
  * reused branch name can bring back an older one, which the platform also
  * refuses. Otherwise the highest-numbered row speaks.
  */
-async function askGitHubForBranch(cwd, branch, openedAt) {
+async function askHostForBranch(cwd, branch, openedAt, declared = null) {
   if (!branch) {
     return null;
   }
-  const out = await new Promise((resolvePromise) => {
-    const child = spawn(
-      'gh',
-      ['pr', 'list', '--head', branch, '--state', 'all', '--limit', '10', '--json',
-        'number,url,state,mergedAt,mergeCommit,baseRefName,headRefName,isCrossRepository'],
-      { cwd, stdio: ['ignore', 'pipe', 'ignore'] },
-    );
-    let text = '';
-    child.stdout.on('data', (chunk) => (text += chunk));
-    child.on('error', () => resolvePromise(null));
-    child.on('close', (code) => resolvePromise(code === 0 ? text.trim() : null));
-  });
-  const parsed = out ? safeJson(out) : null;
+  const { adapter } = await hostOf(cwd, declared);
+  const parsed = await adapter.listByHead(cwd, branch);
   if (!Array.isArray(parsed)) {
     return null;
   }
@@ -4707,14 +4813,13 @@ async function askGitHubForBranch(cwd, branch, openedAt) {
   if (chosen.state === 'MERGED' && !merged.length) {
     return null; // Only a merge from before the item existed: not this item's.
   }
-  const state = { OPEN: 'OPEN', MERGED: 'MERGED', CLOSED: 'CLOSED' }[chosen.state];
-  if (!state) {
+  if (!chosen.state) {
     return null;
   }
   return {
-    state,
+    state: chosen.state,
     prUrl: chosen.url ?? null,
-    mergeCommit: chosen.mergeCommit?.oid ?? null,
+    mergeCommit: chosen.mergeCommit ?? null,
     mergedAt: chosen.mergedAt ?? null,
     baseRefName: chosen.baseRefName ?? null,
   };
@@ -4776,7 +4881,7 @@ async function askGit(cwd, head, defaultBranch) {
 /**
  * What became of one branch.
  *
- * `gh` first, because it is the only thing that can see a SQUASH merge: a
+ * The host first, because it is the only thing that can see a SQUASH merge: a
  * squashed branch's commits never appear on the default branch at all, so the
  * ancestry test below would confidently and wrongly say "not merged".
  *
@@ -4784,8 +4889,8 @@ async function askGit(cwd, head, defaultBranch) {
  * that has left the remote. Proving a merge is possible; disproving one is not,
  * and UNKNOWN is the honest answer rather than a guess dressed as a reading.
  */
-async function readMergeState(cwd, { branch, defaultBranch, baseBranch, head, prUrl }) {
-  const viaGh = await askGitHub(cwd, branch, prUrl).catch(() => null);
+async function readMergeState(cwd, { branch, defaultBranch, baseBranch, head, prUrl, gitHost = null }) {
+  const viaGh = await askHost(cwd, branch, prUrl, gitHost).catch(() => null);
   if (viaGh) {
     return viaGh;
   }
@@ -4901,7 +5006,7 @@ async function checkRunMerges(config, pending, fetched) {
 
 /**
  * R346: the hand-taken items. A squash or rebase merge leaves no head on the
- * default branch for the git reading to find, so ask `gh` about the pull
+ * default branch for the git reading to find, so ask the host about the pull
  * request. An older platform answers 404 and this returns in silence.
  */
 async function checkWorkItemMerges(config, fetched) {
@@ -4932,7 +5037,7 @@ async function checkWorkItemMerges(config, fetched) {
       fetched.add(cwd);
       await git(cwd, ['fetch', '--prune', 'origin']).catch(() => null);
     }
-    const reading = await askGitHubForBranch(cwd, item.branch, item.openedAt).catch(() => null);
+    const reading = await askHostForBranch(cwd, item.branch, item.openedAt, item.gitHost ?? null).catch(() => null);
     readings.push({
       workItemId: item.workItemId,
       state: reading?.state ?? 'UNKNOWN',
@@ -5216,9 +5321,13 @@ const PROFILE_TOOLS = {
   // it was asked to judge — and there is still no set_status here, because
   // `DONE` is the person's word (R74) and a reviewer that could move the card
   // would be giving the verdict it is explicitly told not to give.
+  //
+  // R572. And `backlog_file`: what the reviewer notices that is not this
+  // card's is a suggestion for a person, not a finding on this card.
   REVIEW: [
     ...READ_ONLY_CAWDEV,
     'mcp__cawdev__roadmap_comment',
+    SUGGEST,
     ...READ_FILES,
     ...GIT_READS,
   ],
@@ -5267,10 +5376,15 @@ const PROFILE_TOOLS = {
   // R302. Less the reads that need the work to exist — `quality_get` — the
   // same narrowing `toolsForStage` applies to a walk's PLAN stage, by the same
   // name: a plan run spawned as one process comes through here and not there.
+  //
+  // R572. `backlog_file` too, on every plan run: a planner reads more of the
+  // code than anybody and finds what is not this card's. It files a pending
+  // suggestion and nothing else; see `SUGGEST` in stage-tools.mjs.
   PLAN: (run) => [
     ...beforeTheWorkExists(READ_ONLY_CAWDEV),
     ...READ_FILES,
     ...GIT_READS,
+    SUGGEST,
     ...(run?.entryNumber ? [] : [CARD_WRITE]),
   ],
   // R96. Read the whole repository, ask in rounds, write the brief, commit it.
@@ -5315,11 +5429,11 @@ const PROFILE_TOOLS = {
   // release may genuinely need to ask. Nothing that creates a card, proposes
   // one, or comments.
   //
-  // The shell is `git` in full — it commits, tags and pushes — `gh pr create`
-  // and `gh pr view`, and `node` for the export scripts. NOT `Bash(gh *)`: it
-  // can open the release's pull request and it cannot merge it, and that is a
-  // permission rather than a sentence in the prompt. A release is merged by a
-  // person, with a merge commit, because a squash orphans the tag.
+  // The shell is `git` in full — it commits, tags and pushes — and `node` for
+  // the export scripts. No `gh` at all (R565): cawdev opens the release's pull
+  // request itself when the session ends, from the branch it pushed, and
+  // `push-guard.mjs` refuses a push to any other branch. A release is merged
+  // by a person, with a merge commit, because a squash orphans the tag.
   //
   // And `Write`/`Edit` on the version files the platform named on the claim,
   // and nothing else. `ROADMAP.md`, `ISSUES.md` and `CHANGELOG.md` are
@@ -5332,8 +5446,6 @@ const PROFILE_TOOLS = {
     'mcp__cawdev__roadmap_set_status',
     ...READ_FILES,
     'Bash(git *)',
-    'Bash(gh pr create *)',
-    'Bash(gh pr view *)',
     'Bash(node *)',
     ...releaseWrites(run),
   ],
@@ -5485,6 +5597,43 @@ function argsForProfile(agentArgs, profile, run, expertAgents = [], skills = [])
  * re-derived the plan from a précis would be planning again, which is the one
  * thing the gate exists to stop it doing after somebody approved the first one.
  */
+/**
+ * R576. A plan that ignores the other unfinished cards produces two plans that
+ * rewrite the same paragraph. The plan stage holds no writer (R108), so the
+ * session says what it found in labelled sections and cawdev applies them when
+ * the plan is recorded.
+ */
+const CONSIDER_UNFINISHED = `**Look at the other unfinished cards.** Two plans that change the same files
+collide when the second is built, and a plan written without looking cannot know.
+Call \`roadmap_list\` for PLANNED, CONFIRMED and IN_DEVELOPMENT (those have plans)
+and for CONSIDERING and NEW (those have a brief), then \`roadmap_get\` each card
+that touches the same area or the same files and read its plan.
+- A card that has started (IN_DEVELOPMENT, or \`roadmap_get\` shows a branch or runs)
+  and has to land first goes on the \`**Comes after:**\` line. Do not ask about it.
+- A conflict with a card that has not started (BACKLOG, CONSIDERING, PLANNED, NEW,
+  or CONFIRMED with no branch) is the person's to settle: \`ask_user\`, one question
+  per conflicting card, naming only that card's ref — never this card's ref and never
+  two refs, because cawdev finds the answer again by the one ref in the question.
+  Offer choices such as "this card goes after it", "it goes after this card", "leave
+  both, they do not fight". Then record the conflict under \`**Conflicts decided:**\`,
+  and if this card goes after it, add it to \`**Comes after:**\` too.
+- If \`ask_user\` hands back a \`question_id\`, call \`await_answer\` once. With
+  still no answer, list the conflict under \`**Conflicts undecided:**\` and carry on —
+  nobody may be watching.
+Write these before the \`**Done when:**\` list, in this shape:
+
+**Comes after:** R570, i12
+**Conflicts decided:**
+- R571 — both rewrite the claim view's prompt paragraph; decided: R571 goes first.
+**Conflicts undecided:**
+- R572 — both add a migration for agent_question; nobody answered.
+
+\`**Comes after:**\` is one line (\`none\` when there is nothing). Each list item starts
+with the card's ref and says why the two collide. cawdev applies this when the plan
+is recorded: it sets this card to start after those cards and writes a comment on
+each conflicting card saying what was decided and by whom. You cannot do either,
+so do not try.`;
+
 /** Longer than ask_user's own ten-minute wait — see the cawdev server of spawnCodex. */
 const CAWDEV_TOOL_TIMEOUT_SEC = 660;
 
@@ -5523,6 +5672,20 @@ const WAIT_FOR_COMMANDS = 'This stage ends when your turn ends: run every comman
   + 'background is lost, and the stage is run again. The same goes for delegating: call '
   + '`Agent` with `run_in_background: false` and wait for its answer — an agent still '
   + 'working when your turn ends has its work lost, and the stage is run again.';
+
+/**
+ * R572. What a session finds that is not its card's goes to the backlog as it
+ * finds it. R470's run wrote a real follow-up into its final report — "a
+ * separate change, not this card's … a person should decide" — and nobody files
+ * from a report. `backlog_file` stamps the item with this run, so the feedback
+ * page links back to the run and its card without the session writing either.
+ */
+const SUGGEST_ELSEWHERE = 'Something worth doing that is NOT this card\'s — a bug next door, '
+  + 'a fix outside the scope, a follow-up the work revealed — goes to `backlog_file`, one item '
+  + 'per suggestion, when you find it: say what you saw, where in the code, and what should '
+  + 'happen instead. cawdev links it to this run and this card, and a person accepts or '
+  + 'refuses it. Do not widen this card to do it, and do not leave it only in your report: '
+  + 'a suggestion in a report is one nobody files. Your report may name what you filed.';
 
 /**
  * @param hasPlan whether the card has a plan of record — the same test
@@ -5716,10 +5879,11 @@ this was resolved without opening your transcript.`;
 cawdev platform.
 
 Your permissions, so you do not spend turns discovering them: \`git\` in full;
-\`gh pr create\` and \`gh pr view\`; \`node\`; and Write/Edit on exactly these files —
+\`node\`; and Write/Edit on exactly these files —
 ${list} — and nothing else. There is no permission prompt in this session: a
-command outside those is refused and nobody is asked. You cannot merge a pull
-request, run a build, or run tests.
+command outside those is refused and nobody is asked. You cannot open or merge a
+pull request, run a build, or run tests — cawdev opens the pull request when you
+finish, from the branch you pushed.
 
 If a decision is genuinely the person's, use \`ask_user\` and wait.
 
@@ -5989,7 +6153,11 @@ card you created a moment ago. cawdev stores what you report as the card's plan 
 record when this phase ends, and that is the only copy anybody wants: two plans in
 two places is how one of them goes stale.
 
+${CONSIDER_UNFINISHED}
+
 **End with a Done-when list.** ${DONE_WHEN_PLAN}
+
+**What is not this card's.** ${SUGGEST_ELSEWHERE}
 
 Then \`report\` kind "done" with the plan itself.${asked}`;
   }
@@ -6019,6 +6187,8 @@ Everything a reviewer reads goes here. Include code pointers so the developer
 can find it.
 
 Do not commit, do not push, do not make edits. The branch is not yours to change.
+
+**What is not this card's.** A finding about THIS card's work is a comment. ${SUGGEST_ELSEWHERE}
 
 Then \`report\` kind "done".`;
   }
@@ -6274,7 +6444,23 @@ const running = new Map();
  * uncommitted work and all, until somebody discards the run — they are not
  * free, whatever `running` says, and must not be reset for the next claim.
  */
-const told = { paused: false, autoResume: false, heldWorkspaces: [] };
+const told = {
+  paused: false, pausedByUsage: false, limits: [], autoResume: false, heldWorkspaces: [], maxPlanningRuns: null,
+};
+
+/**
+ * The queued line for a paused machine — R571. Rebuilt only when the KIND of
+ * pause, the window, its percent or its reset moves (`noteKey`), so the minutes
+ * left in the sentence never make `noteQueued` log once per heartbeat.
+ */
+let pausedNoteCache = { key: null, text: '' };
+function queuedPauseNote() {
+  const key = noteKey(told);
+  if (pausedNoteCache.key !== key) {
+    pausedNoteCache = { key, text: pausedNote(told, Date.now()) };
+  }
+  return pausedNoteCache.text;
+}
 
 /**
  * How this daemon paints its own output — R62.
@@ -6496,7 +6682,7 @@ async function pickWorkspace(slug, project, offered, held, probed, autoMax = 0, 
   return { workspace: free[0], why: null };
 }
 
-function noteQueued(run, why) {
+function noteQueued(run, why, reported = why) {
   // Once per REASON, not once per run — R70, now that there are two gates a run
   // can be held by. A run refused by the machine's cap and then, when a session
   // ends, by the project's checkouts is waiting for a different thing, and
@@ -6510,7 +6696,8 @@ function noteQueued(run, why) {
   // knowledge that exists nowhere but here. The platform sees a queued run; only
   // this daemon knows it is queued because the checkout is busy rather than
   // because nothing has picked it up.
-  noted.set(run.id, { label: run.label, projectSlug: run.projectSlug, why });
+  // `reported` is what the platform is told; null says nothing (a pause: R571).
+  noted.set(run.id, { label: run.label, projectSlug: run.projectSlug, why, reported });
   log(`${why}; leaving "${run.label}" queued`);
 }
 
@@ -6575,6 +6762,9 @@ function snapshotRuns() {
   return runs;
 }
 
+/** i267: the statuses that mean "this run is not yours now" on the move to RUNNING. */
+const PLATFORM_REFUSALS = new Set([400, 404, 409, 410]);
+
 async function startRun(config, offered, workspace, source = null) {
   const run = offered.run;
   const project = config.projects[run.projectSlug];
@@ -6619,6 +6809,7 @@ async function startRun(config, offered, workspace, source = null) {
     // The claim carries everything needed to prepare the working copy, so the
     // runner never touches the project API — which is session-only anyway.
     defaultBranch = claimed.defaultBranch;
+    run.pushDefaultBranch = claimed.defaultBranch ?? null;
     // Whether somebody was shown the uncommitted work and started anyway.
     allowDirty = claimed.allowDirty === true;
     // Or whether the uncommitted work is THIS BRANCH'S OWN: the platform named
@@ -6712,6 +6903,8 @@ async function startRun(config, offered, workspace, source = null) {
     plan = claimed.plan ?? null;
     lifecycle = Array.isArray(claimed.workflow) ? claimed.workflow : [];
     shield = claimed.shield ?? null;
+    // R562. Every session is told the list up front, whichever profile it is.
+    run.protectedLine = protectedLine(protectedPolicy(shield));
     if (instincts.length) {
       log(`  instincts: ${instincts.map((each) => each.key).join(', ')}`);
     }
@@ -6781,6 +6974,37 @@ async function startRun(config, offered, workspace, source = null) {
         briefing = briefing ? `${said}\n\n${briefing}` : said;
         baseCommit = await git(resolve(path), ['rev-parse', 'HEAD']).catch(() => baseCommit);
       }
+      // R562. The base is fixed ONCE, here, after the working copy is prepared
+      // and never recomputed: a MERGE moves HEAD, and a base recomputed after
+      // it would call main's own commits the agent's. For a MERGE it is the
+      // tip of the branch being merged INTO — what the branch brings with it.
+      const policy = protectedPolicy(shield);
+      if (policy.globs.length) {
+        const baseName = run.baseBranch ?? defaultBranch;
+        const fixed = run.profile === 'MERGE'
+          ? await git(resolve(path), ['rev-parse', `origin/${baseName || 'main'}`])
+            .catch(() => git(resolve(path), ['rev-parse', baseName || 'main']))
+            .catch(() => null)
+          : await protectedBase(resolve(path), baseName, baseCommit);
+        const base = fixed || baseCommit || null;
+        protectedGuards.set(run.id, { ...policy, base });
+        // Checked before the session starts, as the card asks. It does not
+        // refuse to start: the session is the one that can fix it, and the
+        // prompt now says so.
+        if (!base) {
+          log('  !! protected paths: no base to judge this branch against, so a protected '
+            + 'change cannot be caught when the run finishes');
+        }
+        const already = notAllowed(
+          await protectedChanges(resolve(path), base, policy.globs).catch((failure) => {
+            log(`  !! protected paths: could not read the branch's changes: ${failure.message}`);
+            return [];
+          }), policy.allowed);
+        if (already.length) {
+          log(`  !! this branch already changes protected file(s): ${already.join(', ')}`);
+        }
+        run.protectedLine = protectedLine(policy, already);
+      }
       if (run.profile === 'MERGE') {
         // R155. The daemon does the merge, BEFORE anything is spawned, and what
         // git conflicts on becomes the session's whole write scope. A clean
@@ -6797,16 +7021,38 @@ async function startRun(config, offered, workspace, source = null) {
       }
     }
     log(`  working copy ${cwd ?? path} is on ${branch ?? 'no branch of its own'}`);
+    // R565. What the remote held before the session, so `auditPushes` can say
+    // what the session added to it. Every agent CLI is audited, not only Claude.
+    if (writesCodeProfile(run) && run.branch) {
+      run.remoteBefore = await remoteRefs(cwd ?? resolve(path)).catch(() => null);
+    }
 
-    await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/transition`, {
-      method: 'POST',
-      // Where it ran, sent with the move to RUNNING because that is the one
-      // moment it is known. With three checkouts of one project, a run that
-      // does not say which it used makes "what is uncommitted on this run"
-      // unanswerable — and a console showing one run's files against another
-      // run's path is worse than one showing nothing.
-      body: { state: 'RUNNING', workspace: workspace ?? null },
-    });
+    // i267. A REFUSED move (400, 404, 409 or 410; PLATFORM_REFUSALS) is the platform saying whose run this is:
+    // it was cancelled while this machine prepared, or put back in the queue.
+    // That is never this run's failure, and the FAILED post below would write
+    // the refusal text over whatever the platform holds as the run's exit.
+    // Nothing is posted; the platform's state stands and, if the run really is
+    // QUEUED, the next poll offers it again and claims it properly. Anything
+    // else (401, 403, 408, 429, a network error, a 5xx) is not the platform
+    // saying whose run this is and still fails the run, as before.
+    try {
+      await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/transition`, {
+        method: 'POST',
+        // Where it ran, sent with the move to RUNNING because that is the one
+        // moment it is known. With three checkouts of one project, a run that
+        // does not say which it used makes "what is uncommitted on this run"
+        // unanswerable — and a console showing one run's files against another
+        // run's path is worse than one showing nothing.
+        body: { state: 'RUNNING', workspace: workspace ?? null },
+      });
+    } catch (refused) {
+      if (PLATFORM_REFUSALS.has(refused.status)) {
+        log(`  the platform did not let this run start (${refused.message}); leaving it as the platform has it`);
+        protectedGuards.delete(run.id);
+        return;
+      }
+      throw refused;
+    }
 
     if (merge?.clean) {
       // R155. Nothing conflicted, so there is nothing for a session to decide
@@ -6846,6 +7092,13 @@ async function startRun(config, offered, workspace, source = null) {
     control?.forget(run.id);
   }
 }
+
+/**
+ * R577: what the planning limit counts — every run that takes no checkout,
+ * except ASK, which never waits. Counted by the run's profile, never its stage:
+ * a CODE run has a PLAN stage and is not one of these.
+ */
+function countsAsPlanning(run) { return !writesCodeProfile(run) && run.profile !== 'ASK'; }
 
 /**
  * Whether this run is the kind that takes a checkout, before the child exists.
@@ -7287,11 +7540,149 @@ function gateTimeoutSeconds() {
  * the pipes are the agent's own. `cawdevCommand` is what the next daemon reads
  * off the driving note to tell this session's orphan from a reused pid.
  */
+// --- the agent pushes its own branch and nothing else (R565) ----------------------
+//
+// A guard against mistakes, not a security boundary: an agent with a shell and
+// the operator's credentials can always find a way round it. The wall is branch
+// protection on the host (tools/runner/README.md says so). What this adds is
+// that Claude Code is refused the obvious moves — a host CLI, a push to another
+// branch, a force — with a reason it can read, and that every agent CLI is
+// AUDITED afterwards (`auditPushes`).
+
+const PUSH_GUARD = fileURLToPath(new URL('./push-guard.mjs', import.meta.url));
+
+/** The variables `push-guard.mjs` reads. Empty tags means "this profile pushes no tag". */
+function pushGuardEnv(run) {
+  return {
+    CAWDEV_PUSH_BRANCH: run.branch ?? '',
+    CAWDEV_DEFAULT_BRANCH: run.pushDefaultBranch ?? '',
+    CAWDEV_PUSH_TAGS: run.profile === 'RELEASE' ? '1' : '',
+  };
+}
+
+/**
+ * `--settings` with the PreToolUse hook, and `gh`/`glab` disallowed outright.
+ *
+ * Measured on Claude Code 2.1.309, the way R562's spike is recorded below: a
+ * scratch repository, `--setting-sources ''`, `--permission-mode
+ * bypassPermissions`, haiku asked to run `gh --version`, `git push origin
+ * HEAD:other` and `git push origin <its branch>`. The first two were refused
+ * with the guard's reason and never ran; the third went through. So `--settings`
+ * hooks DO load under `--setting-sources ''`, and the guard holds under bypass.
+ */
+function pushGuardArgs() {
+  return [
+    '--settings',
+    JSON.stringify({
+      hooks: {
+        PreToolUse: [{
+          matcher: 'Bash',
+          hooks: [{ type: 'command', command: `"${process.execPath}" "${PUSH_GUARD}"` }],
+        }],
+      },
+    }),
+    '--disallowedTools', 'Bash(gh *)', 'Bash(glab *)',
+  ];
+}
+
+/**
+ * `args` with the guard placed BEFORE `--allowedTools` (which is variadic and
+ * would swallow it) — when the session is allowed `git` in full. Every Claude
+ * Code spawn goes through this one function, so the coding path, the stage path
+ * and the profile path cannot come apart.
+ */
+function withPushGuard(args) {
+  const at = args.indexOf('--allowedTools');
+  if (at < 0 || !args.slice(at + 1).includes('Bash(git *)')) {
+    return args;
+  }
+  return [...args.slice(0, at), ...pushGuardArgs(), ...args.slice(at)];
+}
+
+/**
+ * The environment an agent (or a skill's command) is spawned with — R565: this
+ * process's own, minus the variable holding the Bitbucket token, plus `extra`.
+ * `GH_TOKEN` and `GITLAB_TOKEN` stay: an operator's `git push` may authenticate
+ * through them. `extra` is applied last but is stripped too, because callers
+ * hand over `{ ...process.env }`.
+ */
+function agentEnv(config, extra = {}) {
+  const env = { ...process.env, ...extra };
+  delete env[config?.bitbucket?.tokenEnv ?? 'BITBUCKET_TOKEN'];
+  return env;
+}
+
 function spawnScoped(config, command, args, options) {
   const line = scoped(command, args, config.sessionScope);
-  const child = spawn(line.command, line.args, options);
+  // Every agent CLI passes through here, so the Bitbucket token is out of its
+  // environment whatever the caller spread into `options.env`.
+  const child = spawn(line.command, line.args, { ...options, env: agentEnv(config, options.env) });
   child.cawdevCommand = command;
   return child;
+}
+
+/**
+ * Keeps an Edit away from the project's protected files at the CLI itself —
+ * R562 — by editing the argument list in place, once, for every path to it.
+ *
+ * Measured, not assumed, on Claude Code 2.1.307 (the way i138's spike is
+ * recorded above): a scratch repo, `--setting-sources ''`, a stub MCP
+ * `--permission-prompt-tool`, haiku asked to Write `secret/a.txt`.
+ *
+ *   A  acceptEdits       + --disallowedTools 'Edit(./secret/**)'  → refused, file not written
+ *   B  bypassPermissions + --disallowedTools 'Edit(./secret/**)'  → refused, file not written
+ *   C  acceptEdits       + --settings ask 'Edit(./secret/**)'     → reached the approve tool
+ *   D  bypassPermissions + --settings ask 'Edit(./secret/**)'     → reached the approve tool
+ *   (control: acceptEdits with no rule wrote the file and never asked.)
+ *
+ * Two things the spike found that the plan did not expect. Only `Edit(path)`
+ * rules are matched — `Write(path)` is rejected as "not matched by file
+ * permission checks", Edit covering every file-editing tool — so a single Edit
+ * rule per glob is the whole list. And the ask rule works under
+ * bypassPermissions too, so "allow everything" does not turn ASK into silence.
+ *
+ * `--disallowedTools` is variadic, so it goes in BEFORE `--allowedTools`.
+ * Bash is not covered by any of this (`git checkout main -- pom.xml` changes a
+ * file with no Edit call): the diff gate at every finish door is the real
+ * guard, and this is the early warning.
+ *
+ *   - a session with the prompt tool (CODE) in ASK mode: ask rules in a
+ *     settings file, so the call reaches `approve` and a person is asked;
+ *   - everything else, in either mode: deny rules. These profiles have no
+ *     prompt tool, so nobody could be asked, and "cannot" stays "cannot".
+ *
+ * Codex and Antigravity have no flag equivalent; they get the prompt and the
+ * diff gate only.
+ */
+async function protectFiles(args, run, shield, { readOnlyStage, mcpDirectory }) {
+  const policy = protectedPolicy(shield);
+  if (!policy.globs.length) {
+    return;
+  }
+  const asks = (!run.profile || run.profile === 'CODE') && !readOnlyStage;
+  const rules = denyRules(policy.globs);
+  const at = args.indexOf('--allowedTools');
+  if (asks && policy.mode === 'ASK') {
+    const settingsPath = join(mcpDirectory, 'protected-settings.json');
+    // One --settings only: a second would risk replacing the push guard's hook.
+    // So when the guard's inline settings are there, the ask rules join them in
+    // the file and the flag points at the file.
+    // The guard's own flag, by its content: an operator's `--settings` in the
+    // agent args is theirs and is left as it is.
+    const inline = args.findIndex((arg, i) => arg === '--settings'
+      && String(args[i + 1]).startsWith('{') && String(args[i + 1]).includes(PUSH_GUARD));
+    const guarded = inline !== -1 ? JSON.parse(args[inline + 1]) : {};
+    await writeFile(settingsPath,
+      JSON.stringify({ ...guarded, permissions: { ask: rules } }, null, 2));
+    if (inline !== -1 && guarded.hooks) {
+      args[inline + 1] = settingsPath;
+    } else {
+      args.splice(at === -1 ? args.length : at, 0, '--settings', settingsPath);
+    }
+  } else {
+    args.splice(at === -1 ? args.length : at, 0, '--disallowedTools', ...rules);
+  }
+  log(`  protected paths (${policy.mode}): ${policy.globs.join(', ')}`);
 }
 
 async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, resume,
@@ -7428,7 +7819,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       // says what to run and the machine says under what conditions, and a
       // settings blob that could add environment variables would be a channel
       // from a database row into a spawned process.
-      env: { ...process.env, ...(local.env ?? {}) },
+      env: agentEnv(config, local.env ?? {}),
     };
   }
 
@@ -7452,13 +7843,21 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       // model becomes a thing people click through. A server this list does not
       // name keeps the per-tool suggestion, because nobody declared it as a
       // capability — see `suggestionFor`.
+      //
+      // R319: SonarQube is NOT named — its server holds writers beside its
+      // readers, so a whole-server "allow" would cover them. It keeps the
+      // per-tool suggestion.
       CAWDEV_SKILL_SERVERS: JSON.stringify(
-        attached.map(({ skill }) => skill.toolPrefix ?? `mcp__${skill.serverName}`)),
+        attached.filter(({ skill }) => skill.serverName !== 'sonarqube')
+          .map(({ skill }) => skill.toolPrefix ?? `mcp__${skill.serverName}`)),
       // R110. The policy, and the checkout it is measured against. The CHECK is
       // the server's — it is the process Claude Code asks before a tool call,
       // and there is nowhere else the answer can be given in time.
       CAWDEV_SHIELD: JSON.stringify(shield ?? {}),
       CAWDEV_WORKSPACE: cwd,
+      // R562. The commit the branch was cut from, fixed once by the runner, for
+      // `report done`'s diff gate. Empty means nothing to judge against.
+      CAWDEV_PROTECTED_BASE: protectedGuards.get(run.id)?.base ?? '',
     },
   };
   await writeFile(mcpConfigPath, JSON.stringify({ mcpServers }, null, 2));
@@ -7641,7 +8040,8 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     // R303. Only a REQUIRED server changes the prompt, and only where the
     // stage can reach it — the same gate `mustUse` applies, so the prompt and
     // the nudge never disagree about what a stage owes.
-    mcpServers: attached.map(({ skill }) => ({
+    mcpServers: attached.map(({ skill, local }) => ({
+      when: serversCanBeReached ? local?.when : undefined,
       name: skill.name ?? skill.key,
       prefix: skill.toolPrefix ?? `mcp__${skill.serverName}`,
       required: serversCanBeReached && skill.mode === 'REQUIRED',
@@ -7695,7 +8095,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   const agentCmd = config.agentCommands.find((each) => agentOfCommand(each) === 'claude')
     ?? 'claude';
 
-  const args = [
+  let args = [
     '--mcp-config',
     mcpConfigPath,
     // Only when there is something in it. An empty plugin loads nothing and
@@ -7709,6 +8109,8 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
           skills)]
       : argsForProfile(agentArgs, run.profile, run, expertAgents, skills))),
   ];
+  args = withPushGuard(args);
+  await protectFiles(args, run, shield, { readOnlyStage, mcpDirectory });
   log(`  spawning: ${agentCmd} ${args.join(' ')} (prompt on stdin)`);
 
   return new Promise((resolvePromise) => {
@@ -7718,13 +8120,13 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
       // rather than leaving orphaned children behind.
       detached: true,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
+      env: agentEnv(config, {
         CAWDEV_URL: config.url,
         CAWDEV_TOKEN: runToken,
         CAWDEV_PROJECT: run.projectSlug,
         CAWDEV_GRANTABLE: JSON.stringify(ceiling),
-      },
+        ...pushGuardEnv(run),
+      }),
     });
 
     child.cawdevProjectSlug = run.projectSlug;
@@ -8701,6 +9103,9 @@ async function sayOnTheRun(config, run, text) {
 async function spawnAntigravity(config, run, runToken, cwd, baseCommit, resume, projectServers,
     skills, stageExperts, cannotDelegate, instincts, briefing, plan, lifecycle, stage, carried,
     agyCmd, granted, usage = null) {
+  if (run.protectedLine) {
+    log('  protected paths are enforced at finish only for Antigravity');
+  }
   if (!granted.everything) {
     // Antigravity needs it even to read: no per-tool allow-list exists on it.
     const summary = needsEverything('agy', thisMachine(config), run, { readsWithout: false });
@@ -9067,6 +9472,9 @@ async function spawnCodex(config, run, runToken, cwd, baseCommit, resume, projec
   };
 
   const mayWrite = writesCodeProfile(run) && !readOnlyStage;
+  if (protectedPolicy(shield).globs.length) {
+    log('  protected paths are enforced at finish only for Codex');
+  }
   if (mayWrite && !granted.everything) {
     // It must commit and push, which its sandbox refuses, and there is no
     // allow-list for its shell — so everything, or nothing. Read-only runs
@@ -9083,7 +9491,7 @@ async function spawnCodex(config, run, runToken, cwd, baseCommit, resume, projec
   // The token reaches cawdev's server through `env_vars` — from Codex's own
   // environment, never its command line — and is blanked for the shell.
   const cawdevEnv = { CAWDEV_URL: config.url, CAWDEV_TOKEN: runToken, CAWDEV_PROJECT: run.projectSlug };
-  const childEnv = { ...process.env, ...cawdevEnv };
+  const childEnv = agentEnv(config, { ...cawdevEnv, ...pushGuardEnv(run) });
 
   // By name, so a later server replaces an earlier one whole — the ordering
   // argument of the Claude Code path: the repository's own first, then R76's
@@ -9363,6 +9771,7 @@ async function finish(config, run, state, summary, cwd = null) {
     const settled = await settleBranch(cwd, run.branch, {
       push: pushBranch,
       label: run.entryRef ?? 'cawdev',
+      protected: await guardOf(config, run),
     }).catch((failure) => ({ ok: false, reason: `Checking the branch failed: ${failure.message}` }));
     if (!settled.ok) {
       log(`  not finished: ${settled.reason}`);
@@ -9377,6 +9786,7 @@ async function finish(config, run, state, summary, cwd = null) {
     method: 'POST',
     body: { state, summary },
   }).catch((failure) => log(`  could not finish the run: ${failure.message}`));
+  protectedGuards.delete(run.id);
 }
 
 // --- cancellation ------------------------------------------------------------
@@ -9527,10 +9937,12 @@ function capabilities(config) {
   return JSON.stringify({
     projects: Object.keys(config.projects),
     // How many checkouts each project has here — R47 — which since R109 is the
-    // ONLY cap this machine reports, and the only one it enforces. The
-    // machine-wide `maxSessions` is gone: it bounded processes, a delegated
-    // expert costs none, and a gate measuring the wrong thing while looking
-    // like it worked is worse than no gate.
+    // only cap this machine reports as a number of its own. The machine-wide
+    // `maxSessions` is gone: it bounded processes, a delegated expert costs
+    // none, and a gate measuring the wrong thing while looking like it worked
+    // is worse than no gate. R577 adds a second, opt-in gate — a limit on
+    // planning runs, set from the console — which is not a config number and
+    // so is announced by `maxPlanningRuns` below instead.
     workspaces: Object.fromEntries(
       Object.entries(config.projects).map(([slug, project]) => [slug, project.workspaces.length]),
     ),
@@ -9548,6 +9960,12 @@ function capabilities(config) {
     // offered only to a machine that says this, and a machine that does not
     // is told why on the queue rather than handed a base it would ignore.
     baseBranches: true,
+    // R577. This daemon enforces the per-machine limit on planning runs that
+    // the platform hands it on the heartbeat. The same shape as
+    // `baseBranches`: an older daemon ignores the number silently, so the
+    // console says so beside the field rather than letting a limit that does
+    // nothing look like one that works.
+    maxPlanningRuns: true,
     // R270. This daemon knows an offer can carry `waitForClean`, and honours it
     // in `pickWorkspace` — taking the preferred checkout only when clean, and
     // refusing to fall back to a dirty one at all. The same shape as
@@ -9561,7 +9979,7 @@ function capabilities(config) {
     // `glab`. An older daemon would fail the unknown kind, so the platform
     // hands the request only to a daemon that says so.
     createBranch: true,
-    gitHosts: ['github', 'gitlab'],
+    gitHosts: ['github', 'gitlab', 'bitbucket'],
   });
 }
 
@@ -9656,6 +10074,16 @@ async function main() {
   process.on('SIGHUP', holdHup);
 
   const config = await readConfig();
+  // R565. Bitbucket's token, from the variable the config names. Said once, so
+  // the log shows where it comes from — and whether it is there at all.
+  configureBitbucket({
+    email: config.bitbucket.email,
+    token: process.env[config.bitbucket.tokenEnv],
+    apiUrl: config.bitbucket.apiUrl,
+  });
+  log(process.env[config.bitbucket.tokenEnv]
+    ? `bitbucket: API token from $${config.bitbucket.tokenEnv}${config.bitbucket.email ? ` (as ${config.bitbucket.email})` : ' (as a bearer token)'}`
+    : `bitbucket: no token in $${config.bitbucket.tokenEnv}, so Bitbucket projects cannot be opened or merged from here`);
   // The checkouts made on demand by an earlier run of this daemon, found
   // again by their name — nothing about them is in the config.
   await syncAutoWorkspaces(config.projects);
@@ -9777,6 +10205,14 @@ async function main() {
     // that takes an answer the platform then refuses reads as cawdev being
     // broken, which is R58's rule about `a` applied to this one.
     acceptsConsoleRules: config.acceptsRulesFromConsole === true,
+    // R577: the planning limit the platform last told us, or null. Kept in
+    // step by the heartbeat handler, so a terminal that attaches later reads
+    // what is true now.
+    maxPlanningRuns: told.maxPlanningRuns,
+    // R571: whether the platform says this machine is paused, and by whom. Kept
+    // in step by the heartbeat handler, so `c` offers Pause or Resume truthfully.
+    paused: told.paused,
+    pausedByUsage: told.pausedByUsage,
     projects: Object.keys(config.projects),
     // How many checkouts each has — R62. The per-project half of R47's
     // gate, which the bar shows as `cawdev 1/2`. Added rather than
@@ -9996,12 +10432,34 @@ async function main() {
       // R73/R80. The heartbeat's answer is what the platform decided about
       // this machine, and it changes what the queue loop does next.
       if (me && typeof me === 'object') {
-        if (told.paused !== !!me.paused) {
-          log(me.paused
-            ? 'paused from the console: claiming nothing new, finishing what is running'
-            : 'unpaused from the console');
+        const pausedNow = !!me.paused;
+        const byUsageNow = pausedNow && !!me.pausedByUsage;
+        const moved = pauseLogLine(told, me);
+        if (moved) {
+          log(moved);
         }
-        told.paused = !!me.paused;
+        told.paused = pausedNow;
+        told.pausedByUsage = byUsageNow;
+        told.limits = Array.isArray(me.limits) ? me.limits : [];
+        if (advertised.paused !== pausedNow || advertised.pausedByUsage !== byUsageNow) {
+          advertised.paused = pausedNow;
+          advertised.pausedByUsage = byUsageNow;
+          control?.publish({ type: 'runner', runner: advertised });
+        }
+        // R577. Not a switch but a number: how many planning runs at once. The
+        // claim loop reads it fresh on every pass, so a change lands on the
+        // next heartbeat. Lowering it stops nothing — what is open finishes.
+        const limit = Number.isInteger(me.maxPlanningRuns) && me.maxPlanningRuns > 0
+          ? me.maxPlanningRuns
+          : null;
+        if (told.maxPlanningRuns !== limit) {
+          log(limit
+            ? `planning runs limited to ${limit} at once from the console`
+            : 'no planning limit any more');
+          advertised.maxPlanningRuns = limit;
+          control?.publish({ type: 'runner', runner: advertised });
+        }
+        told.maxPlanningRuns = limit;
         told.autoResume = !!me.autoResume;
         told.heldWorkspaces = Array.isArray(me.heldWorkspaces)
           ? me.heldWorkspaces.map((each) => each.path).filter(Boolean)
@@ -10161,8 +10619,11 @@ async function main() {
         break;
       }
 
-      // ONE gate — R109. There were two; `maxSessions` bounded this machine
-      // and is gone, for the reason written where it used to be applied.
+      // ONE gate by default — R109. There were two; `maxSessions` bounded this
+      // machine and is gone, for the reason written where it used to be applied.
+      // R577 adds an opt-in second gate for the runs that take no checkout
+      // (everything but ASK), a number set from the console and read off the
+      // heartbeat; with none set the machine behaves as it did.
       //
       // A project's workspaces bound its CODING runs and nothing else: they are
       // checkouts, and only a coding run needs one.
@@ -10201,7 +10662,7 @@ async function main() {
         // left to finish; that is the default because killing a machine's work
         // to stop it taking more is the surprising reading.
         if (told.paused) {
-          noteQueued(offered.run, 'this machine is paused from the console');
+          noteQueued(offered.run, queuedPauseNote(), reportedPauseNote());
           skipped += 1;
           continue;
         }
@@ -10210,7 +10671,25 @@ async function main() {
         }
         const writes = writesCodeProfile(offered.run);
 
-        // ONE gate now — R109 removed the machine's.
+        // R577. The second gate, and the only one an operator opts into from the
+        // console: at most this many PLAN, SCOPE, AUDIT or REVIEW runs at once.
+        // A run stays in `taken` from its claim until startRun's finally, so the
+        // count covers all of its stages, the gap before the spawn and the time
+        // it sits waiting on you — which is why the reason says so. Here and not
+        // in the platform's queue: a run bound to no machine is offered to all
+        // of them, and another may take what this one refuses.
+        const planning = countsAsPlanning(offered.run);
+        if (planning && told.maxPlanningRuns) {
+          const open = [...taken.values()].filter((claim) => claim.planning).length;
+          if (open >= told.maxPlanningRuns) {
+            noteQueued(offered.run, `this machine runs at most ${told.maxPlanningRuns} planning run${told.maxPlanningRuns === 1 ? '' : 's'} at once and ${open} ${open === 1 ? 'is' : 'are'} open — one waiting on you still counts`);
+            skipped += 1;
+            continue;
+          }
+        }
+
+        // ONE gate by default — R109 removed the machine's. (R577's planning
+        // limit, above, is off until somebody sets it.)
         //
         // `maxSessions` bounded agent PROCESSES on this laptop, and R70's own
         // note said why: a queue of runs is otherwise a fork bomb with better
@@ -10286,6 +10765,7 @@ async function main() {
         taken.set(offered.run.id, {
           projectSlug: slug,
           writes,
+          planning,
           workspace,
           label: offered.run.label,
         });
@@ -10305,7 +10785,9 @@ async function main() {
       // R148. Say it where a person can read it. Fire-and-forget: a daemon
       // that died because the platform was slow to take a nicety would be
       // worse than one that said nothing.
-      const reasons = [...noted.entries()].map(([runId, note]) => ({ runId, why: note.why }));
+      const reasons = [...noted.entries()]
+        .filter(([, note]) => note.reported)
+        .map(([runId, note]) => ({ runId, why: note.reported }));
       const reasonsBody = JSON.stringify(reasons);
       if (reasonsBody !== lastSentReasons) {
         lastSentReasons = reasonsBody;

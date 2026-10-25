@@ -970,6 +970,15 @@ files at all. R47 removes the need for this by giving each run a workspace.
    — the branch rewrote the same lines — the run fails **naming the stash and
    the command to recover it**, because work parked somewhere nobody was told
    about is work lost.
+
+   **A refused move to RUNNING is never the run's failure** (i267). The move
+   can be refused only when the platform no longer holds this claim: the run
+   was cancelled while the checkout was prepared, or put back in the queue. The
+   daemon then logs `the platform did not let this run start`, posts nothing,
+   and leaves the run exactly as the platform has it; if it is QUEUED, the next
+   poll offers it again and it is claimed properly. Only 400, 404, 409 and 410
+   count as a refusal; any other status (401, 403, 408, 429), a network error or
+   a 5xx still fails the run.
 3. **Spawns the agent** in that directory, in its own process group, with the
    run token in its environment and an `.mcp.json` pointing at cawdev's MCP
    server. **Your own token never reaches the child.**
@@ -1167,6 +1176,63 @@ Before this, R325's run finished with a file modified and nothing pushed, and
 the next run in that checkout refused to start on top of it. A checkout with no
 remote commits what is left and asks nothing of a push.
 
+## Git hosts: GitHub, GitLab and Bitbucket — and what the agent may push (R565)
+
+Branches, pull requests and merges are opened **from cawdev** and performed by
+this daemon, with credentials that live on this machine. The platform never
+holds one. A project says which host it is on (`/projects/*/settings`, "Git
+host"), or the daemon works it out from `origin`.
+
+| Host | How the daemon talks to it |
+|---|---|
+| GitHub | `gh`, signed in (`gh auth login`) |
+| GitLab | `glab`, signed in (`glab auth login --hostname <host>`) |
+| Bitbucket Cloud (bitbucket.org) | its REST API, with a token this machine keeps |
+
+Bitbucket Server / Data Center is not supported.
+
+**Bitbucket's token** goes in the environment, and the config names the
+variable — never the token itself:
+
+```json
+{
+  "bitbucket": { "email": "you@example.com", "tokenEnv": "BITBUCKET_TOKEN" }
+}
+```
+
+With `email`, the token is an Atlassian API token and is sent as Basic
+`email:token`. Without it, it is a workspace or repository access token, sent
+as a Bearer token. `tokenEnv` defaults to `BITBUCKET_TOKEN`. The daemon logs,
+once at boot, where it reads the token from (or that it is missing). That
+variable is **removed from the environment of every agent session** it starts;
+`GH_TOKEN` and `GITLAB_TOKEN` are not, because `git push` may authenticate
+through them.
+
+**After updating, restart the daemon.** A daemon that predates this does not
+advertise `bitbucket` in its `gitHosts`, and cawdev will not address a
+Bitbucket project's pull request or merge to it: the button says "No machine of
+yours runs a cawdev runner that speaks Bitbucket. Restart the daemon to update
+it."
+
+### What the agent may push
+
+A coding session may commit on its card's branch and push **that branch and
+nothing else**. For Claude Code the daemon passes a `PreToolUse` hook
+(`push-guard.mjs`) and disallows `gh` and `glab`: a host CLI, a force, a delete,
+`--mirror`, `--all`, a `+` refspec, or a push to any other branch is refused
+with a reason the session reads. A release session may also push its own tag.
+
+After **any** writing session, for Claude, Codex and Antigravity alike, the
+daemon compares the remote with what it held before and, if the session pushed a
+ref other than its branch, says so on the run: *"This session pushed `<ref>`,
+which is outside its branch …"*. Deletions cannot be attributed to a session and
+are not flagged.
+
+**This is a guard against mistakes, not a security boundary.** An agent with a
+shell and your credentials can get round a pattern match (`git -c alias.x='!…'`,
+a host CLI called through a script). **The real wall is branch protection on the
+host: protect the default branch and require a pull request.** Do that.
+
 ## What a project's rules can ask of it (R40)
 
 A project may decide that a finished run **pushes its branch**, **opens a pull
@@ -1339,6 +1405,19 @@ whole windows crosses the line, and *Ask before starting at %* makes a start
 bound to it state the numbers first. There is nothing to configure here and
 nothing to upgrade: the platform sets the same `paused` flag a person's click
 sets, and this daemon already obeys it on the next beat.
+
+**A queued run says why a paused machine leaves it queued (R571).** The daemon
+logs and shows one of two lines, from `pause-note.mjs` (pure, tested):
+`this machine is paused from the console (resume it on Settings → Machines, or
+press c)` for a person's pause, and `cawdev paused this machine for usage: its
+five-hour window is at 92%, back in 1h 20m — it resumes by itself` for the
+platform's. The attached terminal's `c` menu has a **Pause this machine** /
+**Resume this machine** row, which makes the first line's "press c" true: it
+writes the platform through `POST /api/runners/{id}/pause` (`setPaused` in
+`configure.mjs`), never the config file, and the daemon reads it off its next
+heartbeat. A running daemon needs a **restart** to show these lines and to tell
+attached terminals about a pause; an older one keeps saying *paused from the
+console* and has no pause row in `c`.
 
 ## Trying it without spending Claude usage
 
