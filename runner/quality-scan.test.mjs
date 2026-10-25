@@ -18,9 +18,9 @@ import assert from 'node:assert/strict';
 import { spawn, execFile } from 'node:child_process';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { test } from 'node:test';
 import { fakePlatform } from './test-platform.mjs';
@@ -166,8 +166,19 @@ async function aSonarQube() {
 }
 
 async function daemonWith(t, { name, quality, sonarProjectKey = 'board-key', sonarUrl = null,
-    sonarBranches = null, token = 'sqp_the_machines_token', refusesBranches = false, agentWrites = false }) {
+    sonarBranches = null, token = 'sqp_the_machines_token', refusesBranches = false, agentWrites = false,
+    versionFiles = [], workspaceFiles = {} }) {
   const workspace = await aRepository();
+  // R587: files committed in the checkout (a package.json, say), and the
+  // claim's list of which of them declare the project's version.
+  for (const [file, text] of Object.entries(workspaceFiles)) {
+    await mkdir(dirname(join(workspace, file)), { recursive: true });
+    await writeFile(join(workspace, file), text);
+  }
+  if (Object.keys(workspaceFiles).length > 0) {
+    await run('git', ['add', '.'], { cwd: workspace });
+    await run('git', ['commit', '-q', '-m', 'version files'], { cwd: workspace });
+  }
   const sonar = await aSonarQube();
   const platform = await fakePlatform({
     offers: [CODING],
@@ -176,6 +187,7 @@ async function daemonWith(t, { name, quality, sonarProjectKey = 'board-key', son
     sonarProjectKey,
     sonarUrl: sonarUrl ?? sonar.url,
     sonarBranches,
+    versionFiles,
   });
   const home = await mkdtemp(join(tmpdir(), 'cawdev-quality-cfg-'));
   const scanner = await aStubScanner(home, { refusesBranches });
@@ -524,4 +536,56 @@ test('a quality block with an unknown whenBranchesRefused refuses to boot, namin
   const [code] = await once(daemon, 'exit');
   assert.notEqual(code, 0, said);
   assert.match(said, /quality\.whenBranchesRefused must be "skip", "main" or "project", not "sometimes"/);
+});
+
+// --- R587: the scan carries the project's version ------------------------------
+
+const versionArg = (invocation) => invocation.args.find((arg) => arg.startsWith('-Dsonar.projectVersion='));
+
+test('R587: a declared version file that parses puts sonar.projectVersion on the branch scan', async (t) => {
+  const { platform, said, invocations } = await daemonWith(t, {
+    name: 'test-quality-version',
+    quality: {},
+    versionFiles: ['missing/pom.xml', 'package.json'],
+    workspaceFiles: { 'package.json': '{"name":"x","version":"1.2.3"}' },
+  });
+  assert.ok(await untilStageBegan(platform, 'MEMORY'), said());
+  const [invocation] = await invocations();
+  assert.equal(versionArg(invocation), '-Dsonar.projectVersion=1.2.3', invocation.args.join(' '));
+  assert.match(said(), /quality: version 1\.2\.3 \(package\.json\)/);
+});
+
+test('R587: no declared version files means no version on argv, and the log says so', async (t) => {
+  const { platform, said, invocations } = await daemonWith(t, { name: 'test-quality-no-version', quality: {} });
+  assert.ok(await untilStageBegan(platform, 'MEMORY'), said());
+  const [invocation] = await invocations();
+  assert.equal(versionArg(invocation), undefined, invocation.args.join(' '));
+  assert.match(said(), /quality: no version file declared: scanned without a version/);
+});
+
+test('R587: the main analysis (whenBranchesRefused main) carries it on the retry', async (t) => {
+  const { platform, said, invocations } = await daemonWith(t, {
+    name: 'test-quality-version-main',
+    quality: { whenBranchesRefused: 'main' },
+    refusesBranches: true,
+    versionFiles: ['package.json'],
+    workspaceFiles: { 'package.json': '{"version":"1.2.3"}' },
+  });
+  assert.ok(await untilStageBegan(platform, 'MEMORY'), said());
+  const ran = await invocations();
+  assert.equal(ran.length, 2, JSON.stringify(ran));
+  assert.equal(versionArg(ran[1]), '-Dsonar.projectVersion=1.2.3');
+});
+
+test('R587: a scratch project scan carries it too', async (t) => {
+  const { platform, said, invocations } = await daemonWith(t, {
+    name: 'test-quality-version-scratch',
+    quality: { whenBranchesRefused: 'project' },
+    sonarBranches: 'REFUSED',
+    versionFiles: ['package.json'],
+    workspaceFiles: { 'package.json': '{"version":"1.2.3"}' },
+  });
+  assert.ok(await untilStageBegan(platform, 'MEMORY'), said());
+  const [invocation] = await invocations();
+  assert.equal(versionArg(invocation), '-Dsonar.projectVersion=1.2.3');
 });

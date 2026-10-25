@@ -30,6 +30,7 @@ import { bannerLines, tintLog } from './banner.mjs';
 import { codeMapOf } from '../lib/code-map.mjs';
 import { sonarqubeLaunch } from '../lib/sonarqube-mcp.mjs';
 import { parseProperties, sonarAsker, waitForAnalysis } from '../lib/sonar-analysis.mjs';
+import { workspaceVersion } from '../lib/version-files.mjs';
 import { usageLimitOf } from '../lib/usage-limit.mjs';
 import { TranscriptBatch } from '../lib/transcript-batch.mjs';
 import { parseUsage } from '../lib/usage-report.mjs';
@@ -2704,9 +2705,16 @@ async function scanQuality(config, run, cwd, branch) {
     workDir = await mkdtemp(join(tmpdir(), 'cawdev-sonar-'));
     const deadline = Date.now() + quality.timeoutSeconds * 1000;
     const remaining = () => Math.max(1000, deadline - Date.now());
+    // R587: the version the CODE at this checkout declares. Never a guess and
+    // never `git describe`: a version that moves per commit would move
+    // SonarQube's new-code baseline at every scan.
+    const found = await workspaceVersion(cwd, run.versionFiles);
+    const version = found?.version ?? null;
+    log(versionLogLine(found, run.versionFiles));
     const scannerArgs = (withBranch) => [
       `-Dsonar.host.url=${url}`,
       `-Dsonar.projectKey=${key}`,
+      ...(version ? [`-Dsonar.projectVersion=${version}`] : []),
       ...(withBranch ? [`-Dsonar.branch.name=${branch}`] : []),
       `-Dsonar.scm.revision=${headSha}`,
       `-Dsonar.working.directory=${workDir}`,
@@ -2727,7 +2735,7 @@ async function scanQuality(config, run, cwd, branch) {
         // function's own try/catch, which `return somePromise` would skip —
         // control leaves before the promise settles.
         return await scanAsScratchProject(
-          { quality, run, cwd, branch, key, url, token, headSha, workDir, deadline, report });
+          { quality, run, cwd, branch, key, url, token, headSha, workDir, deadline, report, version });
       }
       // 'main', and known refused: no reason to run the branch scan first.
       const ran = await runSkillCommand(quality.command, scannerArgs(false), { cwd, env, timeoutMs: remaining() });
@@ -2760,7 +2768,7 @@ async function scanQuality(config, run, cwd, branch) {
       if (/sonar\.branch\.name.*(Developer Edition|above is required)/is.test(ran.said)) {
         if (quality.whenBranchesRefused === 'project') {
           return await scanAsScratchProject(
-            { quality, run, cwd, branch, key, url, token, headSha, workDir, deadline, report });
+            { quality, run, cwd, branch, key, url, token, headSha, workDir, deadline, report, version });
         }
         if (quality.whenBranchesRefused !== 'main') {
           return report({
@@ -2868,7 +2876,14 @@ function shortHash(text) {
  * always `NONE`: a quality gate over a whole scratch project would judge
  * code this branch did not write.
  */
-async function scanAsScratchProject({ quality, run, cwd, branch, key, url, token, headSha, workDir, deadline, report }) {
+/** The one line the scan logs about its version: found, declared but empty, or never declared (R587). */
+function versionLogLine(found, declared) {
+  if (found) return `  quality: version ${found.version} (${found.file})`;
+  if (declared?.length > 0) return '  quality: no version found in the declared version files: scanned without a version';
+  return '  quality: no version file declared: scanned without a version';
+}
+
+async function scanAsScratchProject({ quality, run, cwd, branch, key, url, token, headSha, workDir, deadline, report, version = null }) {
   const baseName = run.baseBranch ?? run.defaultBranch ?? 'main';
   const ref = await firstRef(cwd, [`origin/${baseName}`, baseName]);
   const mergeBase = ref ? await git(cwd, ['merge-base', 'HEAD', ref]).catch(() => null) : null;
@@ -2882,6 +2897,7 @@ async function scanAsScratchProject({ quality, run, cwd, branch, key, url, token
     `-Dsonar.host.url=${url}`,
     `-Dsonar.projectKey=${scratchKey}`,
     `-Dsonar.projectName=${key} · ${branch}`,
+    ...(version ? [`-Dsonar.projectVersion=${version}`] : []),
     `-Dsonar.scm.revision=${headSha}`,
     `-Dsonar.working.directory=${workDir}`,
   ];
@@ -6858,6 +6874,9 @@ async function startRun(config, offered, workspace, source = null) {
     // R316. Whether the project SAYS its server refuses branches — null is
     // "not sure, try the branch scan first", today's behaviour.
     run.sonarBranches = claimed.sonarBranches ?? null;
+    // R587. The project's declared version files: the scan reads the first it
+    // can parse from the workspace and sends it as sonar.projectVersion.
+    run.versionFiles = Array.isArray(claimed.versionFiles) ? claimed.versionFiles : [];
     // R69. Whether this is the same conversation picked back up, and which one.
     // Null on an ordinary claim, which is nearly all of them.
     resume = claimed.resume ?? null;

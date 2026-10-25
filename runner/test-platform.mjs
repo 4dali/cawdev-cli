@@ -118,6 +118,8 @@ export async function fakePlatform({
   sonarUrl = null,
   /** R316: what the claim says about whether the server analyses branches — null is "not sure". */
   sonarBranches = null,
+  /** R587: the project's declared version files, as the claim says them. */
+  versionFiles = [],
   /**
    * R346: what `GET …/work-item-branches` answers. Null falls through to the
    * catch-all's `{}` — the shape of a platform older than R346, which the
@@ -278,6 +280,7 @@ export async function fakePlatform({
           sonarProjectKey,
           sonarUrl,
           sonarBranches,
+          versionFiles,
           allowDirty,
           resume,
           mcpServers,

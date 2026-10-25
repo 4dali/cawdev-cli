@@ -189,6 +189,50 @@ test('a finding line carries its link and the card it became; one that was not f
   assert.match(text, /These findings are the default branch's/);
 });
 
+test('R587: the analysed version follows the gate, and when new code starts follows the analysis date', async (t) => {
+  const platform = await fakePlatform({
+    reading: { ...A_READING, project: { ...A_READING.project, analysedVersion: '1.1.1', newCodeSince: '2026-09-19T08:00:00Z' } },
+  });
+  t.after(() => platform.close());
+
+  const text = await callTool(platform.url, {});
+
+  assert.match(text, /^Default branch: gate OK · v1\.1\.1 · 3 bugs/m);
+  assert.match(text, /analysed 2026-09-20T10:00:00Z · new code since 2026-09-19T08:00:00Z/);
+});
+
+test('R587: a version that already starts with v is not shown as vv', async (t) => {
+  const platform = await fakePlatform({
+    reading: { ...A_READING, project: { ...A_READING.project, analysedVersion: 'v2.0' } },
+  });
+  t.after(() => platform.close());
+
+  const text = await callTool(platform.url, {});
+
+  assert.match(text, /^Default branch: gate OK · v2\.0 · 3 bugs/m);
+});
+
+test('R587: the failing gate conditions are named, ratings as letters', async (t) => {
+  const platform = await fakePlatform({
+    reading: {
+      ...A_READING,
+      project: {
+        ...A_READING.project,
+        gate: 'ERROR',
+        gateConditions: [
+          { metric: 'new_violations', comparator: 'GT', threshold: '0', actual: '1287' },
+          { metric: 'new_reliability_rating', comparator: 'GT', threshold: '1', actual: '3' },
+        ],
+      },
+    },
+  });
+  t.after(() => platform.close());
+
+  const text = await callTool(platform.url, {});
+
+  assert.match(text, /^Default branch: gate ERROR · failing: new_violations 1287 > 0, new_reliability_rating C worse than A · 3 bugs/m);
+});
+
 test('a failed read is the headline, and the gate it kept is dated, not current', async (t) => {
   // Seen on a throwaway stack: the timer's 401 landed between two calls, and
   // the row kept its numbers. The verdict a session skims for must not be

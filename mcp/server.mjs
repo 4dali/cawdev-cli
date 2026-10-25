@@ -2390,6 +2390,14 @@ function formatFileDeps(map, path) {
 /** How many finding lines a reading prints before saying "and N more" — R302. */
 const FINDING_LINES = 50;
 
+/** One failed gate condition, as SonarQube words it: `new_violations 1287 > 0`. A rating's step is its letter. */
+function describeCondition({ metric, comparator, threshold, actual }) {
+  const letter = (step) => ('12345'.includes(step) && step.length === 1 ? 'ABCDE'['12345'.indexOf(step)] : step);
+  if (metric.endsWith('_rating')) return `${metric} ${letter(actual)} worse than ${letter(threshold)}`;
+  const symbol = { GT: '>', LT: '<', EQ: '=', NE: '!=' }[comparator] ?? comparator;
+  return `${metric} ${actual} ${symbol} ${threshold}`;
+}
+
 /**
  * The reading as a session should read it — R302: one line for the default
  * branch, one for the branch asked about, then the open findings.
@@ -2415,6 +2423,12 @@ function formatQualityReading(reading, branch) {
     const parts = project.error
       ? [`the last read failed: ${project.error}`, `before that: gate ${project.gate ?? 'NONE'}`]
       : [`gate ${project.gate ?? 'NONE'}`];
+    // R587: which version was analysed, right after the verdict it belongs to.
+    if (project.analysedVersion) parts.push(`v${project.analysedVersion.replace(/^v/i, '')}`);
+    // R587: the conditions the gate failed on, the cause a session would otherwise guess at.
+    if (project.gateConditions?.length) {
+      parts.push(`failing: ${project.gateConditions.map(describeCondition).join(', ')}`);
+    }
     parts.push(
       `${count(project.bugs)} bugs`,
       `${count(project.vulnerabilities)} vulnerabilities`,
@@ -2423,6 +2437,7 @@ function formatQualityReading(reading, branch) {
       `coverage ${percent(project.coverage)}`,
     );
     if (project.analysedAt) parts.push(`analysed ${project.analysedAt}`);
+    if (project.newCodeSince) parts.push(`new code since ${project.newCodeSince}`);
     if (project.dashboardUrl) parts.push(project.dashboardUrl);
     lines.push(`Default branch: ${parts.join(' · ')}`);
   }
