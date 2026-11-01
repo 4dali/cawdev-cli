@@ -50,7 +50,12 @@ export class Session {
     }
   }
 
-  async request(path, { method = 'GET', body } = {}) {
+  /**
+   * The one place a request leaves: the cookie, the XSRF header, the cookies
+   * that come back, and the 401 rule. `request` reads JSON from it and
+   * `requestBytes` reads bytes; neither may grow a copy of this.
+   */
+  async #send(path, { method = 'GET', body, redirect } = {}) {
     const response = await fetch(`${this.url}${path}`, {
       method,
       headers: {
@@ -63,9 +68,9 @@ export class Session {
           : {}),
       },
       body: body ? JSON.stringify(body) : undefined,
+      ...(redirect ? { redirect } : {}),
     });
     this.#remember(response);
-    const text = await response.text();
     if (response.status === 401 && this.email !== null) {
       // The cookie stopped meaning anything: expired, signed out elsewhere, or
       // the account revoked. Until this every action failed one at a time with
@@ -74,12 +79,34 @@ export class Session {
       this.email = null;
       this.onExpired?.();
     }
+    return response;
+  }
+
+  async request(path, { method = 'GET', body } = {}) {
+    const response = await this.#send(path, { method, body });
+    const text = await response.text();
     if (!response.ok) {
       const failure = new Error(messageIn(text) ?? `${method} ${path} failed: HTTP ${response.status}`);
       failure.status = response.status;
       throw failure;
     }
     return text ? JSON.parse(text) : null;
+  }
+
+  /**
+   * A GET whose answer is bytes — a screenshot (R605). Redirects are refused:
+   * these are the platform's own bytes, and a redirect is somebody else's.
+   */
+  async requestBytes(path) {
+    const response = await this.#send(path, { redirect: 'error' });
+    if (!response.ok) {
+      const failure = new Error(
+        messageIn(await response.text()) ?? `GET ${path} failed: HTTP ${response.status}`,
+      );
+      failure.status = response.status;
+      throw failure;
+    }
+    return Buffer.from(await response.arrayBuffer());
   }
 
   /** One open GET, purely to be handed the CSRF cookie before the first POST. */

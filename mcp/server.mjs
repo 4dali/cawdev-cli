@@ -26,6 +26,7 @@ import {
 } from '../lib/protected.mjs';
 import { findDestructive, withinScope } from '../lib/secrets.mjs';
 import { byCodeUnit } from '../lib/order.mjs';
+import { describeCondition } from '../lib/gate-condition.mjs';
 import { COMMITS_ITS_WORK, isUnfinished, leftOver, notDoneYet } from '../lib/finish-check.mjs';
 
 const NAME = 'cawdev';
@@ -2006,6 +2007,36 @@ async function protectedAllowedNow(config, project, runId, policy) {
 }
 
 /**
+ * R318: what a branch scan made of the finding the card was filed from, in the
+ * words the console uses (frontend `core/proven-words.ts`): still reported
+ * beats not checked beats fixed. Null when the card has no finding to prove.
+ */
+function provenLine(row) {
+  const findings = row.findings ?? [];
+  if (!findings.length) return null;
+  const name = (finding) => {
+    const rule = finding.rule ? finding.rule.replace(/^[^:]*:/, '') : finding.key;
+    const file = finding.path ? finding.path.split('/').pop() : null;
+    return file ? `${rule} in ${file}` : rule;
+  };
+  const named = (verdict) => findings.filter((finding) => finding.verdict === verdict).map(name).join(', ');
+  const plural = (n, noun) => `${n} new ${noun}${n === 1 ? '' : 's'}`;
+  const bugs = row.newBugs ?? null;
+  const vulnerabilities = row.newVulnerabilities ?? null;
+  let clause = null;
+  if (bugs !== null || vulnerabilities !== null) {
+    const parts = [];
+    if (bugs) parts.push(plural(bugs, 'bug'));
+    if (vulnerabilities) parts.push(vulnerabilities === 1 ? '1 new vulnerability' : `${vulnerabilities} new vulnerabilities`);
+    clause = parts.length ? parts.join(' and ') : '0 new problems';
+  }
+  const tail = clause ? ` · ${clause}` : '';
+  if (named('STILL_OPEN')) return `Still reported: ${named('STILL_OPEN')}${tail}`;
+  if (named('UNCHECKED')) return `Not checked: ${named('UNCHECKED')} (restart the daemon)`;
+  return named('FIXED') ? `Fixed ${named('FIXED')}${tail}` : null;
+}
+
+/**
  * The protected-file gate on `report done` — R562. Null when the branch is
  * clean of unallowed protected changes (or nothing can be judged), else the
  * refusal the session reads. In ASK mode a person is asked once, for all of
@@ -2390,14 +2421,6 @@ function formatFileDeps(map, path) {
 /** How many finding lines a reading prints before saying "and N more" — R302. */
 const FINDING_LINES = 50;
 
-/** One failed gate condition, as SonarQube words it: `new_violations 1287 > 0`. A rating's step is its letter. */
-function describeCondition({ metric, comparator, threshold, actual }) {
-  const letter = (step) => ('12345'.includes(step) && step.length === 1 ? 'ABCDE'['12345'.indexOf(step)] : step);
-  if (metric.endsWith('_rating')) return `${metric} ${letter(actual)} worse than ${letter(threshold)}`;
-  const symbol = { GT: '>', LT: '<', EQ: '=', NE: '!=' }[comparator] ?? comparator;
-  return `${metric} ${actual} ${symbol} ${threshold}`;
-}
-
 /**
  * The reading as a session should read it — R302: one line for the default
  * branch, one for the branch asked about, then the open findings.
@@ -2467,6 +2490,8 @@ function formatQualityReading(reading, branch) {
       if (row.dashboardUrl) parts.push(row.dashboardUrl);
       lines.push(`Branch ${asked.branch}: ${parts.join(' · ')}`);
       if (row.warning) lines.push(`  ${row.warning}`);
+      const proven = provenLine(row);
+      if (proven) lines.push(`  ${proven}`);
     }
   } else if (branch === null) {
     lines.push('No branch was read: outside a run, name one to see its gate and new problems.');

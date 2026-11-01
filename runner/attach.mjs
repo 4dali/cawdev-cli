@@ -46,9 +46,11 @@
 // curses library.
 
 import { spawn } from 'node:child_process';
-import { rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { readFile, rm } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { connect } from 'node:net';
-import { basename, dirname } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { listSockets, socketPathFor } from './control.mjs';
 import {
   RESTART_FROM_ATTACH, addProject, addWorkspace, agentsOf, pathsOf, readConfigFile, reloadIfRunning,
@@ -60,21 +62,31 @@ import {
 import { clip, keyList, padVisible, painter, stripAnsi, visibleWidth, wrap } from '../lib/ansi.mjs';
 import { restartNeededFor } from '../lib/runner-config.mjs';
 import {
-  BOARD_COLUMNS, MIN_ZONE_HEIGHT, PROMPT_ROWS, SplitScreen, readerFrame, tabsLine, visibleSessions, actionsFor, composeFrame,
-  carriesOnHere, builtNothing, cardLines, columnOf, cardTitleFor, commandWords, wordsText, subtitleFor, agentModelFor, wordWrap, isAutoCheckout, isPullRequest, parseNew, roadmapStrip, sessionTag, splitLayout, titleFor, toneFor,
-  windowLines,
+  BOARD_COLUMNS, PROMPT_ROWS, SplitScreen, boardPreviewLines, moveInStrip, readerFrame, stripColumns, tabsLine, visibleSessions, actionsFor, composeFrame,
+  batchStartedLines, carriesOnHere, builtNothing, cardLines, columnOf, cardTitleFor, commandWords, wordsText, subtitleFor, agentModelFor, wordWrap, isAutoCheckout, isPullRequest, parseNew, roadmapStrip, sessionTag, titleFor,
+  windowLines, showWaitingLine,
 } from './split.mjs';
+import {
+  CARD_MIN_HEIGHT, cardGrid, cardStatus, nowLine, seedOf, sessionCardLines, stageWalk,
+} from './session-cards.mjs';
 import { KNOWN_AGENTS, agentOfCommand } from '../lib/agents.mjs';
 import { loadPrefs, savePrefs } from './prefs.mjs';
 import { oneLine } from './brand.mjs';
 import { Scrollback } from './scrollback.mjs';
+import { removeStaleLock, staleLockOf } from './git-lock.mjs';
 import { Session, signInThroughBrowser, storedSession } from './sign-in.mjs';
 import { clearSession } from './session-store.mjs';
+import { branchDiff, fileAt, foldedByDefault, layoutDiff } from './diff-view.mjs';
+import { cardsFrom, importCards, resultLines } from './card-import.mjs';
 import { clearHistory, loadHistory, pushHistory } from './history.mjs';
 import {
   History, KeyStream, Line, Pastes, commonPrefix, completionLines, completions, keysIn,
 } from './input.mjs';
 import { Select, WRITE_MY_OWN, pickFromLine, plainLines } from './select.mjs';
+import {
+  isImage, localCopy, openerFor, parseComments, printable, roundListing, shotsDir, showGate,
+  thumbnailEscape, thumbnailProtocol,
+} from './shots.mjs';
 
 // Re-exported because they were this file's before R81 moved them into the
 // shared ANSI helpers — and `keysIn` and `keyList` before R83 moved them beside
@@ -83,6 +95,15 @@ import { Select, WRITE_MY_OWN, pickFromLine, plainLines } from './select.mjs';
 export { clip, keyList, keysIn, stripAnsi, visibleWidth, wrap };
 
 const ESC = '\x1b';
+
+/** How many times `/review`'s merge is read again (five seconds apart) before it stops following. */
+const REVIEW_FOLLOW_TRIES = 120;
+/**
+ * What a session merging its card refuses (`refuseWhileMerging`): every act on
+ * its branch or its checkout. `/view`, `/open` and the commands that name
+ * another card stay.
+ */
+const DISABLED_WHILE_MERGING = new Set(['pr', 'continue', 'clean', 'drop', 'close', 'cancel', 'develop', 'review']);
 
 /** Colours for a run's state. Muted, because the transcript is the content. */
 const STATE_COLOUR = {
@@ -216,6 +237,19 @@ export function permissionDecision(approval, key, machine = {}) {
   }
 }
 
+/** What the "started" line adds when `--show` or `--no-show` was given. */
+function shownWord(show) {
+  return show === true ? ', shown before its PR' : show === false ? ', not shown before its PR' : '';
+}
+
+const A_SHOW_GATE = 'a SHOW gate is decided after looking — a, /accept or /comments';
+
+/** What a window's title says a session is stopped on. */
+function waitingWord(kind) {
+  return kind === 'show' ? 'waiting for you'
+    : kind === 'question' ? 'waiting for an answer' : 'waiting for permission';
+}
+
 /**
  * A pending permission request, drawn — R51 and R60's three answers.
  *
@@ -243,6 +277,22 @@ export function permissionBanner(pending, width, ink = painter(3), machine = {})
   // Called with a pending record by the client, and with the approval itself by
   // the rule's own tests — the banner is about the request either way.
   const approval = pending.approval ?? pending;
+  // R605. A SHOW gate is not a permission: nobody is asked to allow a call, they
+  // are asked to look. None of y / s / Y / M / n does anything on it.
+  const gate = showGate(approval);
+  if (gate) {
+    const count = gate.ids.length;
+    return [
+      `${ink.bold(ink.warn(' show '))} ${clip(`waiting for you — ${count} screenshot${count === 1 ? '' : 's'}, round ${gate.round}`, Math.max(8, width - 8))}`,
+      ink.muted(` ${approval.toolName} · waiting since ${approval.askedAt?.slice(11, 19) ?? ''}`),
+      ...wrapChoices([
+        `${ink.success('a')} look and decide`,
+        `${ink.success('/accept')}`,
+        `${ink.success('/comments')} …`,
+        `${ink.muted('/open on cawdev')}`,
+      ], width, ' · '),
+    ];
+  }
   const covers = approval.suggestion ?? `every ${approval.toolName}`;
 
   // The two standing-rule keys, asked here exactly as `permissionDecision`
@@ -301,7 +351,7 @@ export function permissionBanner(pending, width, ink = painter(3), machine = {})
   // A stage gate's summary is the whole PLAN, many lines long: one row here,
   // and how much more there is — `/view` reads it whole. Clipped as one
   // string, its newlines went through and filled the prompt.
-  const [first = '', ...more] = String(approval.summary ?? '').split('\n');
+  let [first = '', ...more] = String(approval.summary ?? '').split('\n');
   const rest = more.filter((line) => line.trim()).length;
   const tail = rest ? ` (+${rest} lines)` : '';
   return [
@@ -823,6 +873,20 @@ function withAgent(body, agent) {
   return agent ? { ...body, agent } : body;
 }
 
+/**
+ * The note a branch is sent back with when its merge hit a conflict — the
+ * order the next session on the card reads first. What to do, in that order,
+ * and what not to touch.
+ */
+export function conflictOrder(review, why) {
+  return [
+    `The merge of ${review.branch} into ${review.base} stopped on a conflict: ${why}`,
+    '',
+    `Merge origin/${review.base} into ${review.branch} and resolve every conflict, keeping what both sides meant.`,
+    'Change nothing else on this card. Run the tests, then commit the merge and push the branch.',
+  ].join('\n');
+}
+
 /** What was started, saying with which agent when one was named. */
 function withWho(what, agent) {
   return agent ? `${what} with ${agent}` : what;
@@ -838,6 +902,8 @@ function refOf(word) {
 
 /** How many matching commands advanced mode's prompt shows at once. */
 const SPLIT_COMPLETIONS = 6;
+/** How often the cards' rain moves a step (session-cards.mjs `RAIN`): eight a second. */
+const RAIN_STEP_MS = 120;
 
 /** The slash commands, and the one place they are described. */
 const COMMANDS = [
@@ -848,17 +914,25 @@ const COMMANDS = [
   ['/config', "this machine's config — the same as c"],
   ['/cancel', 'cancel the session you are watching'],
   ['/log', "the daemon's own log, on or off"],
-  ['/advanced-mode', 'one window per session around the prompt, for the projects you tick (@slug names them), or back'],
-  ['/new', 'start a session here: /new plan|dev R3, /new plan|dev <the task>, /new ask … (@project)'],
-  ['/card', 'add an idea to Considering — no session: /card <the idea> (@project)'],
+  ['/advanced-mode', 'a card per session above the prompt, for the projects you tick (@slug names them), or back; /view shows one session\'s log'],
+  ['/new', 'start a session here: /new plan|dev R3, /new plan|dev <the task>, /new ask … (@project); --show / --no-show on dev: shown before its PR, or not; several cards in order: /new plan|dev|plan+dev R3 R5 R7 (dev: --in-order [--branch name] for one branch)'],
+  ['/import', 'file the cards of a JSON file: /import <file.json> (@project); --dry-run only checks; --status <S> where cards naming none land; a taken title is skipped, --allow-duplicates files it'],
+  ['/card', 'add an idea to Considering — no session: /card <the idea> (@project) (--show: shown before its PR)'],
   ['/agent', 'which agent /new uses: /agent claude|codex|agy, /agent default, /agent to see it'],
   ['/develop', 'start the development of the card a finished plan was about, or of one named: /develop R30 (--codex) (@project)'],
   ['/pr', "open the pull request of a finished session's branch"],
+  ['/review', "the branch's diff, here: /review for the session's card, /review R42 (@project); then d Done, c changes requested, m merge — or /review done|changes <note>|merge|agent-merge"],
   ['/continue', 'pick a failed or stopped session back up on this machine — the console\'s Carry on'],
+  ['/clean', 'remove the git lock a crash left in a stopped session\'s checkout (index.lock: File exists), then /continue'],
   ['/projects', 'which projects advanced mode shows — tick one or several'],
+  ['/board', 'focus advanced mode\'s roadmap strip (b too): arrows browse cards and show their full title and description'],
   ['/refresh', "read the cards and their statuses from cawdev again — advanced mode's roadmap"],
-  ['/open', "open the session's pull request in your browser — on a finished plan, its card and plan; on one waiting for you, its page on cawdev"],
-  ['/view', "a card here in the terminal: /view R29, /view <words of its title> (@project), /view card for the session's; /view alone reads what a session waits on in full, or opens it on cawdev"],
+  ['/open', "open the session's pull request in your browser — on a finished plan, its card and plan; on one waiting for you or at SHOW, its page on cawdev"],
+  ['/view', "in advanced mode, a session's log over the whole screen: /view for the focused one, /view 2 for card 2, /view R29 for the session on R29 (v too); a card here in the terminal: /view R29 with no session on it, /view <words of its title> (@project), /view card for the session's; /view alone reads what a session waits on in full (at SHOW, looks and decides), or, outside advanced mode, opens it on cawdev"],
+  ['/matrix', 'the rain on advanced mode\'s cards, on or off: /matrix on|off, remembered'],
+  ['/shots', 'the screenshots a session waiting at SHOW took: /shots, /shots 2, /shots all, /shots round 1'],
+  ['/accept', 'accept the screenshots — the pull request opens'],
+  ['/comments', 'send comments on the screenshots: /comments <text>, #2 for one screenshot'],
   ['/drop', 'delete the checkout a finished session was made on demand for'],
   ['/close', "close an ended session's window"],
   ['/reload', 'quit and start again on the code on disk — the runner too, when nothing is running'],
@@ -977,6 +1051,15 @@ export class Attached {
      * otherwise make a picker titled with the first one's command look current.
      */
     this.deciding = null;
+    /**
+     * The round a SHOW gate names, as the platform's sealed list confirms it —
+     * R605. `{runId, approvalId, slug, round, shots, confirmed, rounds, select}`.
+     * Read when the person asks to look, not before: nobody is asked about
+     * screenshots on a terminal that never opens them.
+     */
+    this.showing = null;
+    /** The comment lines written so far at a SHOW gate — R605 — `{lines}`. */
+    this.commenting = null;
     this.status = '';
     this.showLog = false;
     this.asked = new Set();
@@ -1068,7 +1151,9 @@ export class Attached {
     this.screen.open();
     this.history = new History(await loadHistory(this.session.url).catch(() => []));
     // `/agent`'s choice, from last time — see prefs.mjs.
-    this.agent = (await loadPrefs(this.session.url).catch(() => ({}))).agent ?? null;
+    const prefs = await loadPrefs(this.session.url).catch(() => ({}));
+    this.agent = prefs.agent ?? null;
+    this.matrix = prefs.matrix !== false;
     // Raw mode only where there is a terminal to put in it. Through a pipe
     // there are no keys, the transcript is the whole output, and that is the
     // honest degradation rather than a broken one.
@@ -1124,6 +1209,15 @@ export class Attached {
     // busy session emits hundreds of lines a second, and a write per line means
     // an erase-and-redraw of the whole footer per line.
     const tick = setInterval(() => {
+      // The cards' rain moves one step every RAIN_STEP_MS, and only while
+      // somebody can see it: not under the reader, not with `/matrix off`.
+      if (this.split && !this.reader && this.matrix !== false) {
+        const step = Math.floor(Date.now() / RAIN_STEP_MS);
+        if (step !== this.rainTick) {
+          this.rainTick = step;
+          this.dirty = true;
+        }
+      }
       if (this.dirty || this.pending.length) {
         this.flush();
       }
@@ -1441,6 +1535,12 @@ export class Attached {
     return run ? this.approvals.get(run.id) ?? null : null;
   }
 
+  /** The pending approval, when it is a SHOW gate — R605 — else null. */
+  showOn(run) {
+    const pending = this.pendingOn(run);
+    return pending && showGate(pending.approval) ? pending : null;
+  }
+
   /**
    * What the watched session is stopped on — R58, and since R137 both shapes.
    *
@@ -1606,13 +1706,19 @@ export class Attached {
     this.dirty = true;
 
     const mine = this.deciding?.approvalId === pending.approval.id;
-    const onScreen = this.select?.kind === 'permission' || this.input?.kind === 'reason';
+    const onScreen = this.select?.kind === 'permission' || this.input?.kind === 'reason'
+      || this.select?.kind === 'show' || this.select?.kind === 'show-round'
+      || this.input?.kind === 'comments';
     if (mine && onScreen) {
       this.mode = 'keys';
       this.select = null;
       this.input = null;
       this.history.reset();
       this.deciding = null;
+    }
+    if (mine) {
+      this.showing = null;
+      this.commenting = null;
     }
 
     const by = record?.decidedByEmail;
@@ -1665,8 +1771,22 @@ export class Attached {
       this.confirming = null;
     }
 
+    if (this.split?.boardFocus && this.mode === 'keys') {
+      return this.onBoardKey(key);
+    }
+    if (this.split && key === 'b') {
+      return void this.toggleBoard();
+    }
     if (this.split && (key === '\t' || key === `${ESC}[Z`)) {
       return this.cycleFocus(key === '\t' ? 1 : -1);
+    }
+    if (['\r', '\n', 'i', 'd', 'x'].includes(key) && this.refuseWhileMerging()) {
+      return undefined;
+    }
+    if (this.split && key === 'v') {
+      // A card's log — `/view`'s, over the whole screen.
+      const meta = this.commandTarget();
+      return meta ? this.viewSession(meta) : this.note('no session yet — /new starts one');
     }
     if (this.split && key === 'd') {
       // On a finished plan's window, `d` is that plan's `/develop`: the card
@@ -1711,6 +1831,12 @@ export class Attached {
         this.showLog = !this.showLog;
         return this.note(this.showLog ? "printing the daemon's log" : 'printing the session');
       case 'a': {
+        // R605: at a SHOW gate `a` is look-and-decide, not an answer.
+        const shown = this.showOn(this.current());
+        if (shown) {
+          if (!this.requireSignIn('look and decide')) return undefined;
+          return void this.lookAndDecide(this.current());
+        }
         // R58: the refusal is here rather than at the API, so nobody types an
         // answer into a session that is not going to take it.
         const asking = this.askingOn(this.current());
@@ -1727,8 +1853,12 @@ export class Attached {
       case 's':
       case 'Y':
       case 'M':
+        // R605: `s` on a SHOW gate used to accept the round and open the pull
+        // request in one key, without anybody having looked.
+        if (this.showOn(this.current())) return this.note(A_SHOW_GATE);
         return void this.allow(key);
       case 'n': {
+        if (this.showOn(this.current())) return this.note(A_SHOW_GATE);
         if (!this.pendingOn(this.current())) {
           return this.note('nothing is waiting for permission on this one');
         }
@@ -1783,13 +1913,19 @@ export class Attached {
 
   /** Everything open, closed. Returns whether there was anything. */
   closeEverything() {
-    const open = this.mode !== 'keys' || Boolean(this.reader);
+    const open = this.mode !== 'keys' || Boolean(this.reader) || Boolean(this.split?.boardFocus);
     this.reader = null;
+    if (this.split?.boardFocus) {
+      this.split.lastBoardFocus = this.split.boardFocus;
+      this.split.boardFocus = null;
+    }
     this.mode = 'keys';
     this.select = null;
     this.input = null;
     this.answering = null;
     this.deciding = null;
+    this.showing = null;
+    this.commenting = null;
     this.history.reset();
     this.dirty = true;
     // A config question closed this way is cancelled, not left waiting — R288.
@@ -2032,6 +2168,15 @@ export class Attached {
     this.mode = 'keys';
     this.history.reset();
 
+    if (kind === 'comments') {
+      // R605. Before the empty-line rule, on purpose: here an empty line SENDS.
+      return this.commentLine(this.pastes.expand(typed), back);
+    }
+    if (kind === 'review-note') {
+      // Empty sends nothing and goes back to the diff: a verdict with no note is refused anyway.
+      if (!typed) return this.reopenReview();
+      return void this.reviewChanges(this.pastes.expand(typed));
+    }
     if (kind === 'config') {
       // Before the empty-line rule, on purpose: every config question shows a
       // default in its label, and enter on an empty line TAKES it — R288.
@@ -2114,7 +2259,8 @@ export class Attached {
     // A question's or a permission's list holds only the start of what is
     // asked; `/` leaves it for a command — `/view` reads it whole, `/open`
     // answers it on cawdev — and `a` (or `y`/`n`) brings the choice back.
-    if (key === '/' && (select.kind === 'question' || select.kind === 'permission')) {
+    if (key === '/' && (select.kind === 'question' || select.kind === 'permission'
+        || select.kind === 'show' || select.kind === 'show-round')) {
       this.mode = 'keys';
       this.select = null;
       this.answering = null;
@@ -2138,6 +2284,9 @@ export class Attached {
       // is being written when none is is one the next reader will believe.
       this.answering = null;
       this.deciding = null;
+      if (select.kind === 'show' || select.kind === 'show-round') {
+        this.commenting = null;
+      }
       if (select.kind === 'config') {
         this.configuring?.cancel?.();
       }
@@ -2191,6 +2340,9 @@ export class Attached {
       }
       return void this.answer(row.label);
     }
+    if (select.kind === 'show' || select.kind === 'show-round') {
+      return this.choseShow(select, row, typed);
+    }
     if (select.kind === 'permission') {
       if (row.id === 'refuse') {
         return this.type('reason', 'refuse, because ▸', '', select);
@@ -2206,7 +2358,9 @@ export class Attached {
     }
     if (select.kind === 'planned') {
       const [slug, ref] = String(row.id).split(' ');
-      return void this.startNew(['dev', ref, `@${slug}`]).then(() => this.refreshPlanned());
+      const flags = this.plannedFlags ?? [];
+      this.plannedFlags = null;
+      return void this.startNew(['dev', ref, `@${slug}`, ...flags]).then(() => this.refreshPlanned());
     }
     if (select.kind === 'card-project') {
       // `/card` asked which project; the same card, with it named.
@@ -2243,6 +2397,13 @@ export class Attached {
       this.mode = 'keys';
       this.configuring?.answer?.(typed);
       return undefined;
+    }
+    if (this.input?.kind === 'comments' && !this.select) {
+      // The plain path's half of R605: lines are held until an empty one.
+      const back = this.input.back;
+      this.input = null;
+      this.mode = 'keys';
+      return this.commentLine(String(text), back);
     }
     if (this.select) {
       const picked = pickFromLine(this.select, typed);
@@ -2403,6 +2564,22 @@ export class Attached {
     if (!run) return;
 
     const pending = this.pendingOn(run);
+    if (pending && !this.announced.has(pending.approval.id) && showGate(pending.approval)) {
+      // R605. Not a permission: nobody is shown three lengths of yes. It says
+      // what is waiting and, in a terminal that can draw a picker, opens the
+      // one that looks and decides.
+      this.announced.add(pending.approval.id);
+      const ink = this.ink;
+      const about = pending.approval.id;
+      const gate = showGate(pending.approval);
+      this.sayAbout(about, '');
+      this.sayAbout(about, `${ink.bold(ink.warn(' show '))} ${ink.muted('from')} ${ink.bold(this.tagOf(run))}`);
+      this.sayAbout(about, `  ${ink.text(`${gate.ids.length} screenshot${gate.ids.length === 1 ? '' : 's'}, round ${gate.round} — a looks and decides`)}`);
+      if (this.mode === 'keys' && this.session.signedIn) {
+        void this.lookAndDecide(run);
+      }
+      return;
+    }
     if (pending && !this.announced.has(pending.approval.id)) {
       this.announced.add(pending.approval.id);
       const ink = this.ink;
@@ -2838,6 +3015,10 @@ export class Attached {
 
   async runCommand(text) {
     const [word, ...rest] = commandWords(text.slice(1));
+    // A merge asked for once is confirmed by the very next command, or not at all.
+    if (this.reviewing && !(word === 'review' && rest[0] === 'merge')) this.reviewing.confirmingMerge = false;
+    // `/develop R30` and `/review R30` name another card; bare, they are this one's.
+    if (DISABLED_WHILE_MERGING.has(word) && !rest.length && this.refuseWhileMerging()) return undefined;
     switch (word) {
       case 'help':
         this.say('');
@@ -2848,7 +3029,7 @@ export class Attached {
         this.say('');
         this.say(this.ink.bold(' keys'));
         this.say(this.ink.muted('   enter prompt · / command · L runs · 1-9 pick a run · c config'));
-        this.say(this.ink.muted('   a answer · y/s/Y/n permission · x cancel · g log · q quit'));
+        this.say(this.ink.muted('   a answer, or look and decide at SHOW · y/s/Y/n permission · x cancel · g log · q quit'));
         this.say(this.ink.muted('   in a list: ↑↓ move · 1-9 pick · enter choose · esc leave'));
         this.say(this.ink.muted('   while typing: ↑↓ history · tab complete · esc back · ctrl+c twice quits'));
         this.say('');
@@ -2883,25 +3064,48 @@ export class Attached {
       }
       case 'projects':
         return this.askSplitProjects();
+      case 'board': {
+        const want = rest[0] === 'off' ? false : rest[0] === 'on' ? true : undefined;
+        return this.toggleBoard(want);
+      }
       case 'refresh':
         return void this.refreshCards();
       case 'new':
         return void this.startNew(rest);
       case 'card':
         return void this.addCard(rest);
+      case 'import':
+        return void this.importFile(rest);
       case 'agent':
         return void this.chooseAgent(rest[0]);
       case 'develop':
         return void this.develop(rest);
       case 'pr':
         return void this.openPullRequest();
+      case 'review':
+        return void this.review(rest);
       case 'continue':
         return void this.carryOn();
+      case 'clean':
+        return void this.cleanLock();
       case 'open':
         return void this.openInBrowser();
-      case 'view':
+      case 'shots':
+      case 'accept':
+      case 'comments':
+        return void this.showCommand(word, rest);
+      case 'view': {
+        // In advanced mode a window's number, or a ref one of them is on, is
+        // that session's log; any other words are a card, as everywhere.
+        const session = this.split ? this.windowNamed(rest) : null;
+        if (session) return this.viewSession(session);
         if (rest.length) return void this.viewCard(rest);
+        if (this.showOn(this.runOf(this.commandTarget()))) return this.showCommand('view', []);
+        if (this.split && this.commandTarget()) return this.viewSession(this.commandTarget());
         return this.waitingOn(this.commandTarget()) ? this.openReader() : this.viewOnCawdev();
+      }
+      case 'matrix':
+        return void this.chooseMatrix(rest[0]);
       case 'drop':
         return void this.dropCheckout();
       case 'close':
@@ -3006,9 +3210,17 @@ export class Attached {
         // what was known.
         agent: run.agent !== undefined ? run.agent : meta.agent ?? null,
         model: run.model !== undefined ? run.model : meta.model ?? null,
+        // The stage it is on and the walk it is part of, for its card's
+        // progress line; a daemon older than the field sends neither.
+        stage: run.stage ?? null,
+        stages: run.stages ?? meta.stages ?? null,
+        // A stage is a process with its own start; the card's clock is the
+        // session's, from the first one this terminal saw.
+        startedAt: meta.startedAt ?? run.startedAt ?? null,
         ended: false,
         // A carried-on run the daemon has taken: the ask is answered.
         carryAsked: false,
+        lockCleaned: false,
       });
       if (!known) {
         this.sessions.set(run.id, meta);
@@ -3231,6 +3443,9 @@ export class Attached {
     if (!this.windows().some((meta) => meta.id === this.split.focus)) {
       this.split.focus = this.windows()[0]?.id ?? null;
     }
+    if (this.split.boardFocus && !this.split.projects.has(this.split.boardFocus.slug)) {
+      this.leaveBoard();
+    }
     this.leaveHiddenWatch();
     this.say(this.ink.muted(`showing ${slugs.join(', ')} — /projects changes it`));
     this.dirty = true;
@@ -3251,6 +3466,11 @@ export class Attached {
       // The projects this mode shows; null is every one this machine serves.
       projects: shown,
       focus: null,
+      boardFocus: null,
+      lastBoardFocus: null,
+      boardScroll: 0,
+      cardCache: new Map(),
+      cardLoading: new Set(),
       messages: [],
       enteredWatching: this.watching,
       mark: new Map([...this.lines].map(([id, lines]) => [id, lines.length])),
@@ -3265,8 +3485,8 @@ export class Attached {
     void this.refreshPlanned();
     this.split.plannedTimer = setInterval(() => void this.refreshPlanned(), 30_000);
     this.split.plannedTimer.unref?.();
-    this.say(this.ink.muted('advanced mode — tab moves between windows · /new starts a session'
-      + ' · /projects picks what is shown · /advanced-mode leaves'));
+    this.say(this.ink.muted('advanced mode — tab moves between cards · b browses the roadmap · v shows one\'s log'
+      + ' · /new starts a session · /projects picks what is shown · /advanced-mode leaves'));
     if (shown) {
       this.say(this.ink.muted(`showing ${[...shown].join(', ')}`));
     }
@@ -3310,10 +3530,233 @@ export class Attached {
   }
 
   cycleFocus(step) {
+    if (this.split?.boardFocus) this.leaveBoard();
     const windows = this.windows();
     if (!windows.length) return this.note('no session windows yet — /new starts one');
     const at = windows.findIndex((meta) => meta.id === this.split.focus);
     return this.focusWindow(windows[(at + step + windows.length) % windows.length].id);
+  }
+
+  /**
+   * `b` or `/board`: put focus into the roadmap strip at the top so arrows walk
+   * its columns and cards, showing each card's full title and description in a
+   * preview panel directly below the strip.
+   */
+  async toggleBoard(want = !this.split?.boardFocus) {
+    if (!this.split) {
+      return this.note('the roadmap strip is in advanced mode — /advanced-mode starts it');
+    }
+    if (!want) {
+      return this.leaveBoard();
+    }
+    const width = this.split.screen.width;
+    let columns = stripColumns(width, this.cards, this.shownProjects());
+    if (!columns.length && this.session.signedIn) {
+      await this.refreshPlanned();
+      if (!this.split) return undefined;
+      columns = stripColumns(width, this.cards, this.shownProjects());
+    }
+    if (!columns.length) {
+      return this.note('no cards on the roadmap strip here yet');
+    }
+    const picked = moveInStrip(columns, this.split.lastBoardFocus, 0, 0);
+    this.split.boardFocus = picked;
+    this.split.boardScroll = 0;
+    this.dirty = true;
+    void this.loadBoardCard(picked.slug, picked.ref);
+    return this.note('');
+  }
+
+  /** Return focus from the roadmap strip to the session cards. */
+  leaveBoard() {
+    if (!this.split?.boardFocus) return this.note('');
+    this.split.lastBoardFocus = this.split.boardFocus;
+    this.split.boardFocus = null;
+    this.split.boardScroll = 0;
+    this.dirty = true;
+    return this.note('');
+  }
+
+  /** Step `(dCol, dRow)` in the roadmap strip and fetch the newly focused card's description. */
+  moveBoardFocus(dCol, dRow) {
+    if (!this.split) return undefined;
+    const columns = stripColumns(this.split.screen.width, this.cards, this.shownProjects());
+    const next = moveInStrip(columns, this.split.boardFocus, dCol, dRow);
+    if (!next) {
+      return this.leaveBoard();
+    }
+    this.split.boardFocus = next;
+    this.split.lastBoardFocus = next;
+    this.split.boardScroll = 0;
+    this.dirty = true;
+    void this.loadBoardCard(next.slug, next.ref);
+    return this.note('');
+  }
+
+  /** Scroll the focused card's description inside the preview panel. */
+  scrollBoard(by) {
+    if (!this.split?.boardFocus) return undefined;
+    const max = this.split.boardMax ?? 0;
+    this.split.boardScroll = Math.min(Math.max(0, (this.split.boardScroll ?? 0) + by), max);
+    this.dirty = true;
+    return undefined;
+  }
+
+  /** Read and cache a card's full record (`body`, metadata) for the board preview panel. */
+  async loadBoardCard(slug, ref) {
+    if (!this.split) return;
+    const key = `${slug}:${ref}`;
+    if (this.split.cardCache.has(key) || this.split.cardLoading.has(key)) return;
+    const existing = this.cards.find((card) => card.slug === slug && card.ref === ref);
+    if (existing?.body !== undefined) {
+      this.split.cardCache.set(key, existing);
+      return;
+    }
+    if (!this.session.signedIn) return;
+    this.split.cardLoading.add(key);
+    this.dirty = true;
+    try {
+      const detail = await this.session.request(`/api/projects/${slug}/roadmap/${ref}`);
+      if (detail && this.split) {
+        this.split.cardCache.set(key, detail);
+      }
+    } catch {
+      // The strip's own title and status remain shown even if reading the body fails.
+    } finally {
+      if (this.split) {
+        this.split.cardLoading.delete(key);
+        this.dirty = true;
+      }
+    }
+  }
+
+  /** The focused roadmap card, merged with its cached full record (`body`, `section`, …). */
+  boardCardOf(focus) {
+    if (!focus) return null;
+    const base = this.cards.find((card) => card.slug === focus.slug && card.ref === focus.ref);
+    const cached = this.split?.cardCache?.get(`${focus.slug}:${focus.ref}`);
+    if (!base && !cached) return null;
+    return { ...base, ...cached, slug: focus.slug, ref: focus.ref };
+  }
+
+  /** Keys while focus is in the top roadmap strip (`this.split.boardFocus`). */
+  onBoardKey(key) {
+    const focus = this.split.boardFocus;
+    switch (key) {
+      case `${ESC}[A`: case `${ESC}OA`: case 'k':
+        return this.moveBoardFocus(0, -1);
+      case `${ESC}[B`: case `${ESC}OB`: case 'j':
+        return this.moveBoardFocus(0, 1);
+      case `${ESC}[D`: case `${ESC}OD`: case 'h':
+        return this.moveBoardFocus(-1, 0);
+      case `${ESC}[C`: case `${ESC}OC`: case 'l':
+        return this.moveBoardFocus(1, 0);
+      case `${ESC}[6~`: case ' ':
+        return this.scrollBoard(this.split.boardRoom ?? 1);
+      case `${ESC}[5~`:
+        return this.scrollBoard(-(this.split.boardRoom ?? 1));
+      case 'p':
+        this.leaveBoard();
+        return void this.startNew(['plan', focus.ref, `@${focus.slug}`]);
+      case 'd':
+        this.leaveBoard();
+        return void this.startNew(['dev', focus.ref, `@${focus.slug}`]);
+      case 'v': case '\r': case '\n':
+        return void this.showCard(focus.slug, focus.ref);
+      case ESC: case 'b':
+        return this.leaveBoard();
+      case '\t': case `${ESC}[Z`:
+        this.leaveBoard();
+        return this.cycleFocus(key === '\t' ? 1 : -1);
+      case '/':
+        return this.type('command', 'cawdev ▸', '/');
+      default:
+        if (/^[1-9]$/.test(key)) {
+          this.leaveBoard();
+          return this.onKey(key);
+        }
+        return undefined;
+    }
+  }
+
+  /**
+   * What a session's card says (session-cards.mjs `cardLines`): its kind, its
+   * card, where it stands, the agent and checkout, the stage it is on, and ONE
+   * line of what it is doing — or, while it waits on you, what it waits on.
+   * Its log is `/view`'s.
+   */
+  cardOf(meta, n, rect, now = Date.now()) {
+    const ink = this.ink;
+    const run = this.runs.find((each) => each.id === meta.id);
+    const shownGate = this.showOn(run);
+    // A SHOW gate is an approval too, but not one to allow: it is looked at.
+    const pending = shownGate ? null : this.pendingOn(run);
+    const asking = this.askingOn(run);
+    const view = meta.view ?? {};
+    const room = rect.width - 4;
+    const waiting = shownGate ? 'waiting · screenshots'
+      : pending ? 'waiting · permission'
+        : asking ? (asking.yours ? 'waiting on you' : 'waiting · a question') : null;
+    const who = agentModelFor(meta);
+    // R605. At SHOW the card says what it is waiting for, in amber; the agent,
+    // model and path come back once the gate is settled.
+    const gate = shownGate ? showGate(shownGate.approval) : null;
+    const subtitle = gate
+      ? ink.warn(showWaitingLine(gate, gate.ids.length))
+      : (who ? `${ink.strong(who)} ` : '') + ink.muted(subtitleFor(meta, room - (who ? who.length + 1 : 0)));
+    const progress = !meta.ended
+      ? stageWalk(meta.stages, meta.stage, room, ink)
+      : meta.commits !== undefined && (view.profile ?? 'CODE') === 'CODE' && view.state === 'FINISHED'
+        ? ink.muted(`${meta.commits} commit${meta.commits === 1 ? '' : 's'}${view.branch ? ` on ${view.branch}` : ''}`)
+        : '';
+    const doing = pending
+      ? ink.warn(`◆ ${pending.approval?.toolName ?? 'a tool'}: ${String(pending.approval?.summary ?? '').split('\n')[0]}`)
+      : asking
+        ? ink.warn(`◆ ${String(asking.question?.question ?? '').split('\n')[0]}`)
+        : nowLine(meta, this.lines.get(meta.id) ?? []);
+    const keys = pending ? 'y once · s session · n refuse · /view reads it'
+      : asking?.yours ? 'a answers · /view reads it whole'
+        : shownGate ? 'a to look and decide' : actionsFor(meta);
+    const merging = meta.merging;
+    if (merging) {
+      const failed = merging.state === 'failed';
+      const resolving = merging.state === 'resolving';
+      return {
+        n,
+        profile: view.profile ?? meta.profile ?? null,
+        title: `${merging.ref} ${view.entryTitle ?? view.label ?? meta.label ?? ''}`.trim(),
+        status: failed ? { key: 'stopped', mark: '✕', word: 'merge failed' }
+          : resolving ? { key: 'waiting', mark: '⟳', word: 'conflict · back to dev' }
+            : { key: 'merging', mark: '⇢', word: 'merging' },
+        lines: [
+          ink.muted(`${merging.branch} → ${merging.base}`),
+          failed ? ink.danger(`why: ${merging.why}`)
+            : resolving ? ink.warn(`why: ${merging.why}`)
+              : ink.muted('nothing to do here: it closes once it lands'),
+        ],
+        footer: failed ? '/review to look again'
+          : resolving ? `its development starts again here to resolve it` : '',
+        focused: meta.id === this.split.focus,
+        seed: seedOf(meta.id),
+        tick: this.rainTick ?? 0,
+        rain: this.matrix !== false,
+        base: merging.base,
+      };
+    }
+    return {
+      n,
+      profile: view.profile ?? meta.profile ?? null,
+      title: view.entryRef
+        ? `${view.entryRef} ${view.entryTitle ?? view.label ?? meta.label ?? ''}`.trim()
+        : (view.label ?? meta.label ?? 'a session'),
+      status: cardStatus(meta, waiting, now),
+      lines: [subtitle, progress || null, doing ? (pending || asking ? doing : ink.text(doing)) : null],
+      footer: keys,
+      focused: !this.split.boardFocus && meta.id === this.split.focus,
+      seed: seedOf(meta.id),
+      tick: this.rainTick ?? 0,
+      rain: this.matrix !== false,
+    };
   }
 
   /** The whole alternate screen, as rows — see split.mjs. */
@@ -3339,7 +3782,7 @@ export class Attached {
       ? `${tag}${this.input.label} ${this.input.line.render(
         Math.max(8, inner - visibleWidth(tag) - visibleWidth(this.input.label) - 1), ink)}`
       : tag + ink.muted(`enter prompts ${current ? `“${current.label}”` : 'the focused session'}`
-        + ' · / commands · tab next window');
+        + ' · / commands · b board · tab next card · v its log');
     // A question or a request on screen says which window it came from.
     const from = banner.length ? [ink.bold(ink.warn(` from ${this.tagOf(current)}`))] : [];
     // Under the banner and right above the line, so a long one never pushes
@@ -3361,56 +3804,76 @@ export class Attached {
     // The roadmap across the top: as tall as its fullest column needs, never
     // more than a third of the screen, and never so tall that no window fits
     // under it — a short terminal drops it before it drops the sessions.
-    const stripRoom = Math.min(Math.max(4, Math.floor(height / 3)), height - promptRows - MIN_ZONE_HEIGHT);
+    const stripRoom = Math.min(Math.max(4, Math.floor(height / 3)), height - promptRows - CARD_MIN_HEIGHT);
+    if (this.split.boardFocus) {
+      this.split.boardFocus = moveInStrip(
+        stripColumns(width, this.cards, this.shownProjects()),
+        this.split.boardFocus,
+        0,
+        0,
+      );
+    }
     // A rule under it, from the strip's own room: the roadmap is the board and
     // the windows are the sessions, and without it the strip's last card line
     // ran straight into the first window's border.
     const stripLines = stripRoom >= 4
-      ? [...roadmapStrip(width, stripRoom - 1, this.cards, ink, this.shownProjects()),
+      ? [...roadmapStrip(width, stripRoom - 1, this.cards, ink, this.shownProjects(), this.split.boardFocus),
         ink.muted('─'.repeat(width))]
       : [];
     const strip = stripLines.length <= Math.max(0, stripRoom) ? stripLines.length : 0;
-    // Four windows at most; the rest are named on one line above the prompt,
-    // and Tab onto one of them brings it up in place of the least recent.
-    const shown = visibleSessions(windows, this.split.recent ?? [], this.split.focus);
+
+    // When focus is in the roadmap strip (`b` / `/board`), a preview box
+    // directly under it shows the focused card's full title and description.
+    const avail = Math.max(0, height - strip - promptRows);
+    const focusedCard = this.split.boardFocus ? this.boardCardOf(this.split.boardFocus) : null;
+    const previewMax = windows.length && avail >= CARD_MIN_HEIGHT + 5
+      ? Math.max(5, avail - CARD_MIN_HEIGHT)
+      : Math.max(5, avail);
+    let previewLines = [];
+    if (focusedCard && avail >= 5) {
+      const loading = Boolean(this.split.cardLoading?.has(`${focusedCard.slug}:${focusedCard.ref}`));
+      const drawn = boardPreviewLines(width, previewMax, focusedCard, ink, {
+        top: this.split.boardScroll ?? 0,
+        loading,
+      });
+      this.split.boardScroll = drawn.top;
+      this.split.boardMax = drawn.max;
+      this.split.boardRoom = drawn.room;
+      previewLines = drawn.lines;
+    }
+    const preview = previewLines.length && previewLines.length <= avail ? previewLines.length : 0;
+
+    // The sessions are CARDS (session-cards.mjs): as many as fit, the rest
+    // named on one line above the prompt, and Tab onto one of them brings it
+    // up in place of the least recent. The prompt has every row they leave.
+    const room = Math.max(0, height - strip - preview - promptRows);
+    let grid = cardGrid(width, room, windows.length);
+    if (grid.hidden) grid = cardGrid(width, room - 1, windows.length);
+    const shown = visibleSessions(windows, this.split.recent ?? [], this.split.focus, grid.zones.length);
     const hidden = windows.filter((meta) => !shown.includes(meta));
     const tabs = hidden.length ? 1 : 0;
-    const layout = splitLayout(width, height - strip - tabs, shown.length, promptRows);
-    for (const rect of layout.zones) {
-      rect.top += strip;
-    }
-    layout.prompt.top += strip + tabs;
+    const layout = {
+      zones: grid.zones.map((rect) => ({ ...rect, top: rect.top + strip + preview })),
+      prompt: {
+        top: strip + preview + grid.height + tabs,
+        left: 0,
+        width,
+        height: height - strip - preview - grid.height - tabs,
+      },
+      hidden: 0,
+    };
 
+    const now = Date.now();
     const pieces = layout.zones.map((rect, i) => {
       const meta = shown[i];
-      const n = windows.indexOf(meta) + 1;
-      const asking = this.askingOn(this.runs.find((run) => run.id === meta.id));
-      const waiting = this.pendingOn(this.runs.find((run) => run.id === meta.id))
-        ? 'waiting for permission'
-        : asking ? 'waiting for an answer' : null;
-      const lines = (this.lines.get(meta.id) ?? []).map((line) => this.render(line));
-      const body = lines.length ? lines : [ink.muted(meta.state === 'queued'
-        ? `  waiting — ${meta.why ?? 'no reason recorded'}`
-        : meta.ended ? '  nothing was said on this session here' : '  nothing said yet')];
-      return {
-        rect,
-        lines: windowLines(rect, {
-          title: `${n} ${titleFor(meta, waiting)}`,
-          // The agent and its model first, bold and underlined — which CLI and
-          // which model is what somebody comparing two windows looks for.
-          subtitle: (() => {
-            const who = agentModelFor(meta);
-            const lead = who ? `${ink.strong(who)} ` : '';
-            return lead + ink.muted(subtitleFor(meta, rect.width - 4 - (who ? who.length + 1 : 0)));
-          })(),
-          body,
-          footer: actionsFor(meta),
-          focused: meta.id === this.split.focus,
-          dotted: meta.id !== this.split.focus,
-          tone: toneFor(meta),
-        }, ink),
-      };
+      return { rect, lines: sessionCardLines(rect, this.cardOf(meta, windows.indexOf(meta) + 1, rect, now), ink) };
     });
+    if (preview) {
+      pieces.push({
+        rect: { top: strip, left: 0, width, height: preview },
+        lines: previewLines,
+      });
+    }
 
     if (tabs) {
       pieces.push({
@@ -3479,7 +3942,10 @@ export class Attached {
       try {
         const cards = await this.session.request(`/api/projects/${slug}/roadmap?brief=true`);
         for (const card of Array.isArray(cards) ? cards : []) {
-          all.push({ ref: card.ref, title: card.title, slug, status: card.status, live: Boolean(card.activeRun) });
+          all.push({
+            ref: card.ref, title: card.title, slug, status: card.status, live: Boolean(card.activeRun),
+            ...(card.body !== undefined ? { body: card.body } : {}),
+          });
         }
         // The issues are another list on the platform (R85), and were never
         // read here: the strip drew a project's ideas and not one of its bugs.
@@ -3488,6 +3954,7 @@ export class Attached {
           all.push({
             ref: issue.ref, title: issue.title, slug, status: issue.status,
             live: Boolean(issue.activeRun), severity: issue.severity ?? 'MINOR',
+            ...(issue.body !== undefined ? { body: issue.body } : {}),
           });
         }
         read.push(slug);
@@ -3588,9 +4055,12 @@ export class Attached {
     if (shown.length === 1 && !words.some((word) => word.startsWith('@'))) {
       words = [...words, `@${shown[0]}`];
     }
-    const bare = words.filter((word) => word && !word.startsWith('@') && word !== '--anyway' && word !== '--again');
+    const bare = words.filter((word) => word && !word.startsWith('@') && word !== '--anyway' && word !== '--again'
+      && word !== '--show' && word !== '--no-show');
     if (bare.length === 1 && ['dev', 'code'].includes(bare[0].toLowerCase())) {
       const named = words.find((word) => word.startsWith('@'));
+      // R605: the choice of card comes later; the answer about SHOW does not wait for it.
+      this.plannedFlags = words.filter((word) => word === '--show' || word === '--no-show');
       await this.pickPlanned(named ? named.slice(1) : null);
       return;
     }
@@ -3598,10 +4068,20 @@ export class Attached {
     // R369: the answer to "a session already finished here" — `--anyway`'s
     // shape, for a different question.
     const again = words.includes('--again');
+    // R605: this run is shown before its PR, or is not, whatever the card says.
+    // Absent is the card's own switch (R604).
+    const asked = words.includes('--show');
+    const refused = words.includes('--no-show');
+    if (asked && refused) {
+      this.note('--show or --no-show, not both');
+      return;
+    }
+    const show = asked ? true : refused ? false : undefined;
     // `--codex`, `--claude`, `--agy`: this session's agent, over `/agent`'s.
     const flagged = words.find((word) => AGENT_FLAGS.has(word));
     let agent = flagged ? flagged.slice(2) : this.agent;
-    const parsed = parseNew(words.filter((word) => word !== '--anyway' && word !== '--again' && !AGENT_FLAGS.has(word)), {
+    const parsed = parseNew(words.filter((word) => word !== '--anyway' && word !== '--again'
+      && word !== '--show' && word !== '--no-show' && !AGENT_FLAGS.has(word)), {
       // In advanced mode, among the projects it shows.
       projects: this.shownProjects(),
     });
@@ -3622,13 +4102,21 @@ export class Attached {
       this.note(parsed.error);
       return;
     }
+    if (parsed.refs) {
+      await this.startBatch(parsed, { anyway, again, show, agent });
+      return;
+    }
+    if (show !== undefined && parsed.kind !== 'dev') {
+      this.note('--show is for a dev session — a plan or a question shows nothing');
+      return;
+    }
     if (parsed.kind === 'dev' && !parsed.ref) {
       // A dev from words writes its CARD first, then develops it exactly as
       // `/new dev R12` would. It used to be a manual session on a `task-…`
       // branch with no card: no number, nothing on the development board,
       // and a prompt that never said "commit" — so the work ended
       // uncommitted and `/pr` had nothing to propose.
-      await this.developNewCard(parsed.slug, parsed.text, anyway, agent);
+      await this.developNewCard(parsed.slug, parsed.text, anyway, agent, show);
       return;
     }
     // Developing a card whose finished plan has a window here: the agent that
@@ -3648,11 +4136,61 @@ export class Attached {
           ? ['runs/plan', { entryNumber: parsed.ref }, `a plan of ${parsed.ref}`]
           // R150: the session writes the card first, then plans it.
           : ['runs/plan', { prompt: parsed.text }, 'a plan — it writes its card first']
-        : ['runs', { entryNumber: parsed.ref }, `the development of ${parsed.ref}`];
+        : ['runs', { entryNumber: parsed.ref, ...(show === undefined ? {} : { show }) },
+          `the development of ${parsed.ref}${shownWord(show)}`];
     const started = await this.startSession(parsed.slug, path, withAgent(body, agent), withWho(what, agent), anyway, again);
     if (started && plan) {
       this.closeWindowOf(plan);
       this.focusOnArrival = plan.projectSlug;
+    }
+  }
+
+  /**
+   * `/new plan|dev|plan+dev R3 R5 R7` — several cards as ONE batch, on this
+   * machine (R606). The platform holds the order (the runs' chain), so the
+   * terminal can be closed and the cards still go one after another; posting
+   * N single starts would hold nothing.
+   *
+   * A dev batch is a branch each, queued here, or `--in-order` one branch;
+   * a plan batch is in order; `plan+dev` builds each card after its plan
+   * before the next is planned. `--again` and `--show` are one card's answers,
+   * so a batch refuses them rather than applying them to every card.
+   */
+  async startBatch(parsed, { anyway, again, show, agent }) {
+    if (again) {
+      this.note('--again is for one card — a batch skips a card whose session already finished, and names it');
+      return;
+    }
+    if (show !== undefined) {
+      this.note("--show is for one card — on several, each card's own switch decides");
+      return;
+    }
+    const body = {
+      strategy: parsed.inOrder ? 'ONE_BRANCH_IN_ORDER' : 'QUEUED_ON_ONE',
+      cards: parsed.refs.map((ref) => ({ entryNumber: ref })),
+      ...(parsed.kind === 'dev' ? {} : { profile: 'PLAN' }),
+      ...(parsed.kind === 'plan+dev' ? { thenDevelop: true } : {}),
+      ...(parsed.branch ? { branch: parsed.branch } : {}),
+      ...(agent ? { agent } : {}),
+      ...(this.runner?.id ? { targetRunnerId: this.runner.id } : {}),
+      ...(anyway ? { acknowledgeUsage: true } : {}),
+    };
+    try {
+      const outcome = await this.session.request(`/api/projects/${parsed.slug}/runs/batch`, {
+        method: 'POST', body,
+      });
+      const [first, ...skipped] = batchStartedLines(parsed, outcome, parsed.slug, agent);
+      this.say(outcome?.started?.length
+        ? this.ink.success(`  ${first} — each window opens when this machine takes it`)
+        : this.ink.warn(`  ${first}`));
+      for (const line of skipped) {
+        this.say(this.ink.warn(`  ${line}`));
+      }
+      this.note('');
+    } catch (failure) {
+      this.note(/usage|window/i.test(failure.message)
+        ? `${failure.message} — add --anyway to start them regardless`
+        : failure.message);
     }
   }
 
@@ -3711,7 +4249,8 @@ export class Attached {
   async addCard(words) {
     if (!this.requireSignIn('write a card')) return;
     const named = words.find((word) => word.startsWith('@'))?.slice(1) ?? null;
-    const text = wordsText(words.filter((word) => word && !word.startsWith('@')));
+    const show = words.includes('--show');
+    const text = wordsText(words.filter((word) => word && !word.startsWith('@') && word !== '--show'));
     if (!text) {
       this.note('/card what? — /card <the idea in words> (@project)');
       return;
@@ -3740,16 +4279,65 @@ export class Attached {
     try {
       card = await this.session.request(`/api/projects/${slug}/roadmap`, {
         method: 'POST',
-        body: { title: cardTitleFor(text), body: text, status: 'CONSIDERING' },
+        body: { title: cardTitleFor(text), body: text, status: 'CONSIDERING', ...(show ? { showBeforePr: true } : {}) },
       });
     } catch (failure) {
       this.note(`could not write the card: ${failure.message}`);
       return;
     }
     const ref = card?.ref ?? (card?.number ? `R${card.number}` : 'the card');
-    this.say(this.ink.success(`  wrote ${ref} ${card?.title ?? cardTitleFor(text)} in Considering on ${slug}`));
+    this.say(this.ink.success(`  wrote ${ref} ${card?.title ?? cardTitleFor(text)} in Considering on ${slug}${show ? ' · shown before its PR' : ''}`));
     this.note('');
     void this.refreshPlanned();
+  }
+
+  /**
+   * `/import <file.json> (@project)` — the cards of a JSON file, filed as you
+   * (`card-import.mjs`). The project is `@slug`, else advanced mode narrowed to
+   * one, else the one project served here; with several it is asked for by
+   * name, never guessed. `--dry-run` says what would be filed and files nothing.
+   */
+  async importFile(words) {
+    if (!this.requireSignIn('import cards')) return;
+    const named = words.find((word) => word.startsWith('@'))?.slice(1) ?? null;
+    const dryRun = words.includes('--dry-run');
+    const allowDuplicates = words.includes('--allow-duplicates');
+    const statusAt = words.indexOf('--status');
+    const status = statusAt === -1 ? undefined : words[statusAt + 1];
+    const path = words.find((word, at) => word && !word.startsWith('@') && !word.startsWith('--')
+      && at !== statusAt + 1);
+    if (!path) {
+      this.note('/import what? — /import <file.json> (@project) (--dry-run)');
+      return;
+    }
+    const served = this.servedProjects();
+    const shown = this.shownProjects();
+    const slug = named ?? (shown.length === 1 ? shown[0] : null);
+    if (!slug) {
+      this.note(`which project? — /import ${path} @${shown[0] ?? 'project'}`);
+      return;
+    }
+    if (named && !served.includes(named)) {
+      this.note(`this machine does not serve ${named} — ${served.join(', ') || 'no project'}`);
+      return;
+    }
+    let cards;
+    try {
+      cards = cardsFrom(await readFile(absolute(path), 'utf8'));
+    } catch (failure) {
+      this.note(`could not import ${path}: ${failure.message}`);
+      return;
+    }
+    let result;
+    try {
+      result = await importCards(this.session, slug, cards, { dryRun, status, allowDuplicates });
+    } catch (failure) {
+      this.note(`could not import ${path}: ${failure.message}`);
+      return;
+    }
+    for (const line of resultLines(result, slug, this.ink)) this.say(line);
+    this.note('');
+    if (!dryRun) void this.refreshPlanned();
   }
 
   /**
@@ -3758,7 +4346,7 @@ export class Attached {
    * but whose run was refused (a usage window, say) is still on the board,
    * and the person should know which half happened.
    */
-  async developNewCard(slug, text, anyway, agent = this.agent) {
+  async developNewCard(slug, text, anyway, agent = this.agent, show = undefined) {
     let card;
     try {
       card = await this.session.request(`/api/projects/${slug}/roadmap`, {
@@ -3775,8 +4363,9 @@ export class Attached {
       return;
     }
     this.say(this.ink.success(`  wrote ${ref} ${card.title ?? ''} on ${slug}`));
-    await this.startSession(slug, 'runs', withAgent({ entryNumber: ref }, agent),
-      withWho(`the development of ${ref}`, agent), anyway);
+    await this.startSession(slug, 'runs',
+      withAgent({ entryNumber: ref, ...(show === undefined ? {} : { show }) }, agent),
+      withWho(`the development of ${ref}${shownWord(show)}`, agent), anyway);
     void this.refreshPlanned();
   }
 
@@ -3831,6 +4420,9 @@ export class Attached {
     this.say(this.ink.muted(this.split
       ? '  focus its window and type /continue'
       : '  /continue picks up the latest — /advanced-mode gives each one a window'));
+    if (found.some((meta) => staleLockOf(meta.view?.exitSummary, meta.view?.workspace))) {
+      this.say(this.ink.muted('  a git lock a crash left behind stopped it — /clean removes it first'));
+    }
     this.dirty = true;
   }
 
@@ -3870,6 +4462,43 @@ export class Attached {
     } catch (failure) {
       this.note(failure.message);
     }
+  }
+
+  /**
+   * `/clean` — remove the git lock a crash left in the focused (or last ended)
+   * session's checkout, so `/continue` does not fail on it again. The checks
+   * are git-lock.mjs's: the lock must be inside the run's own checkout and old
+   * enough to be nobody's. Done here, not by the daemon, because the control
+   * socket changes nothing (R52); the lock is a file on this machine, and the
+   * run must have been HERE (its runner is this one) for that to be true.
+   * Every session stopped on the same lock is freed by one /clean.
+   */
+  async cleanLock() {
+    const meta = this.commandTarget();
+    const view = meta?.view;
+    if (!meta || !view || !meta.ended) {
+      this.note('/clean needs a session that stopped — focus its window');
+      return;
+    }
+    const lock = staleLockOf(view.exitSummary, view.workspace ?? meta.workspace);
+    if (!lock) {
+      this.note('that session did not stop on a git lock — nothing to clean');
+      return;
+    }
+    if (view.runnerId && this.runner?.id && view.runnerId !== this.runner.id) {
+      this.note(`that checkout is on ${view.runnerName ?? 'another machine'} — clean it there`);
+      return;
+    }
+    const done = await (this.options.removeLock ?? removeStaleLock)(lock);
+    if (!done.removed) {
+      this.note(done.said);
+      return;
+    }
+    for (const other of this.sessions.values()) {
+      if (staleLockOf(other.view?.exitSummary, other.view?.workspace ?? other.workspace) === lock) other.lockCleaned = true;
+    }
+    this.say(this.ink.success(`  ${done.said} — /continue picks it back up`));
+    this.note('');
   }
 
   /**
@@ -4097,10 +4726,452 @@ export class Attached {
     opener(url);
   }
 
+  // --- /review: the branch's diff, its verdict and its merge, here ---------------------------
+
+  /**
+   * `/review` — the diff of a card's branch in this terminal, and the three
+   * acts a reviewer takes on it, each the platform's own endpoint: Done
+   * (`work-items/{id}/verdict` APPROVED), changes requested (the same, with the
+   * note the next session is given), and merge (`work-items/{id}/merge`, which a
+   * machine of yours performs). The diff is local git (`diff-view.mjs`), so
+   * nothing about a branch's contents crosses the API.
+   *
+   * The card is the focused session's, or one named (`/review R42 @slug`). In
+   * advanced mode the diff is the reader over the whole screen and the acts are
+   * keys; otherwise it is printed, and the acts are `/review done`,
+   * `/review changes <note>`, `/review merge`. Merge asks twice either way: it
+   * is the one act here nothing undoes.
+   */
+  async review(words) {
+    if (!this.requireSignIn('review a branch')) return undefined;
+    const [verb, ...rest] = words;
+    switch (verb) {
+      case 'done':
+        return this.reviewDone();
+      case 'changes':
+        return rest.length ? this.reviewChanges(wordsText(rest)) : this.askReviewNote();
+      case 'merge':
+        return this.reviewMerge();
+      case 'agent-merge':
+        return this.reviewAgentMerge();
+      default:
+        return this.openReview(words);
+    }
+  }
+
+  /** The card a review is of: named, else the focused session's. Null after saying why. */
+  async reviewTarget(words) {
+    const named = words.filter((word) => word.startsWith('@')).map((word) => word.slice(1));
+    const bare = words.filter((word) => word && !word.startsWith('@'));
+    if (bare.length) {
+      if (bare.length > 1 || !/^[ri]?\d+$/i.test(bare[0])) {
+        this.note('/review which card? /review R42 (@project), or /review alone for the session\'s');
+        return null;
+      }
+      const ref = refOf(bare[0]);
+      const projects = named.length ? named
+        : this.shownProjects().length ? this.shownProjects() : this.servedProjects();
+      const reads = await Promise.all(projects.map((slug) => this.session
+        .request(`/api/projects/${slug}/roadmap/${ref}`)
+        .then((card) => (card ? { slug, card } : null))
+        .catch(() => null)));
+      const found = reads.filter(Boolean);
+      const building = found.filter((each) => each.card.workItem);
+      const pick = building.length ? building : found;
+      if (pick.length > 1) {
+        this.note(`${ref} is in ${pick.map((each) => each.slug).join(', ')} — name one: /review ${ref} @${pick[0].slug}`);
+        return null;
+      }
+      if (!pick.length) {
+        this.note(`no ${ref} in ${projects.join(', ') || 'any project here'}`);
+        return null;
+      }
+      return { ...pick[0], meta: null };
+    }
+    const meta = this.commandTarget();
+    const ref = meta?.view?.entryRef;
+    const slug = meta?.projectSlug ?? meta?.view?.projectSlug;
+    if (!ref || !slug) {
+      this.note(meta ? 'this session has no card — /review R42 names one' : '/review needs a session — focus one, or name a card: /review R42');
+      return null;
+    }
+    try {
+      return { slug, card: await this.session.request(`/api/projects/${slug}/roadmap/${ref}`), meta };
+    } catch (failure) {
+      this.note(`could not read ${ref}: ${failure.message}`);
+      return null;
+    }
+  }
+
+  /** A checkout of the project on this machine: the session's own, else one the config names. */
+  async checkoutFor(slug, meta) {
+    const candidates = [];
+    if (meta?.view?.workspace) candidates.push(meta.view.workspace);
+    if (this.runner?.configPath) {
+      const file = await readConfigFile(this.runner.configPath).catch(() => null);
+      candidates.push(...pathsOf(file?.projects?.[slug]).map((path) => absolute(path)));
+    }
+    return candidates.find((path) => existsSync(join(path, '.git'))) ?? null;
+  }
+
+  async openReview(words) {
+    const target = await this.reviewTarget(words);
+    if (!target) return undefined;
+    const { slug, card, meta } = target;
+    const ref = card.ref ?? '';
+    const item = card.workItem;
+    if (!item?.id || !item.branch) {
+      return this.note(`${ref} has no branch in development${card.status ? ` — it is ${card.status}` : ''}`);
+    }
+    const cwd = await this.checkoutFor(slug, meta);
+    if (!cwd) {
+      return this.note(`no checkout of ${slug} on this machine to read the diff in — c → Add a workspace`);
+    }
+    const project = await this.session.request(`/api/projects/${slug}`).catch(() => null);
+    const base = item.baseBranch ?? project?.defaultBranch ?? 'main';
+    this.note(`reading ${item.branch} against ${base}…`);
+    let diff;
+    try {
+      diff = await branchDiff(cwd, { branch: item.branch, base });
+    } catch (failure) {
+      return this.note(`could not read the diff: ${failure.message}`);
+    }
+    const files = diff.files;
+    this.reviewing = {
+      slug,
+      ref,
+      title: card.title ?? '',
+      item,
+      branch: item.branch,
+      base,
+      files,
+      cut: diff.cut,
+      stale: diff.stale,
+      folded: new Set(files.filter(foldedByDefault).map((file) => file.path)),
+      // A merge may be pressed only by somebody who holds Merge; absent, the API decides.
+      mayMerge: Array.isArray(project?.yourPrivileges) ? project.yourPrivileges.includes('MERGE') : true,
+      layout: null,
+      confirmingMerge: false,
+    };
+    if (!this.split) {
+      const width = Math.max(20, (this.screen?.width ?? 80) - 2);
+      this.say('');
+      this.say(this.ink.bold(` review ${ref} ${printable(this.reviewing.title)}`));
+      for (const row of layoutDiff(this.reviewing, width, this.ink).rows) this.say(` ${row}`);
+      this.say('');
+      this.say(`  ${this.reviewActions()}`);
+      return this.note('');
+    }
+    return this.reopenReview();
+  }
+
+  /** The reader on the review, where it was; also where a cancelled note goes back to. */
+  reopenReview() {
+    if (!this.reviewing) return this.note('');
+    if (!this.split) return this.note('');
+    this.reader = { kind: 'review', top: this.reviewing.top ?? 0, room: 1, max: 0 };
+    this.dirty = true;
+    return this.note('');
+  }
+
+  /** What may be done next, in words — the scrollback's footer. */
+  reviewActions() {
+    const ink = this.ink;
+    const item = this.reviewing?.item;
+    const acts = [`${ink.success('/review done')} ${ink.muted('approves')}`,
+      `${ink.warn('/review changes <note>')} ${ink.muted('sends it back')}`];
+    if (item?.status === 'DONE' && this.reviewing.mayMerge) acts.push(`${ink.accent('/review merge')} ${ink.muted('lands it')}`);
+    return acts.join(ink.muted(' · '));
+  }
+
+  reviewScreen(width, height) {
+    const review = this.reviewing;
+    const ink = this.ink;
+    const inner = Math.max(1, width - 2);
+    if (!review.layout || review.layout.width !== inner) {
+      review.layout = { width: inner, ...layoutDiff(review, inner, ink) };
+    }
+    const item = review.item;
+    const keys = ['↑↓ PgUp/PgDn g/G', 'n/p file', 'f fold', 'd done', 'c changes'];
+    if (item.status === 'DONE' && review.mayMerge) keys.push(review.confirmingMerge ? 'm AGAIN merges' : 'm merge');
+    keys.push('esc close');
+    const drawn = readerFrame(width, height, {
+      title: `review ${review.ref} ${printable(review.title)} · ${item.statusDisplay ?? item.status ?? ''}`,
+      lines: review.layout.rows,
+      requestAt: 0,
+      top: this.reader.top ?? 0,
+      footer: keyList(keys, '', width - 2, ink),
+    }, ink);
+    Object.assign(this.reader, { top: drawn.top, max: drawn.max, room: drawn.room });
+    review.top = drawn.top;
+    return drawn.lines;
+  }
+
+  onReviewKey(key) {
+    const reader = this.reader;
+    const review = this.reviewing;
+    const move = (to) => {
+      reader.top = Math.min(Math.max(0, to), reader.max);
+      this.dirty = true;
+      return undefined;
+    };
+    const at = reader.top ?? 0;
+    const fileRows = review.layout?.fileRows ?? [];
+    if (key !== 'm' && review.confirmingMerge) {
+      review.confirmingMerge = false;
+      this.note('not merged');
+    }
+    switch (key) {
+      case `${ESC}[A`: case `${ESC}OA`: case 'k':
+        return move(at - 1);
+      case `${ESC}[B`: case `${ESC}OB`: case 'j':
+        return move(at + 1);
+      case `${ESC}[5~`: case 'b':
+        return move(at - reader.room);
+      case `${ESC}[6~`: case ' ':
+        return move(at + reader.room);
+      case `${ESC}[H`: case `${ESC}[1~`: case 'g':
+        return move(0);
+      case `${ESC}[F`: case `${ESC}[4~`: case 'G':
+        return move(reader.max);
+      case 'n': {
+        const next = fileRows.find((row) => row > at);
+        return next === undefined ? this.note('the last file') : move(next);
+      }
+      case 'p': {
+        const previous = [...fileRows].reverse().find((row) => row < at);
+        return previous === undefined ? move(0) : move(previous);
+      }
+      case 'f': {
+        const index = Math.max(0, fileAt(fileRows, at));
+        const file = review.files[index];
+        if (!file) return undefined;
+        if (review.folded.has(file.path)) review.folded.delete(file.path);
+        else review.folded.add(file.path);
+        review.layout = null;
+        // Stay on the file: its header row is where it was, whatever folded under it.
+        reader.top = fileRows[index] ?? at;
+        this.dirty = true;
+        return undefined;
+      }
+      case 'd':
+        return void this.reviewDone();
+      case 'c':
+        return this.askReviewNote();
+      case 'm':
+        return void this.reviewMerge();
+      case '/':
+        this.reader = null;
+        this.dirty = true;
+        return this.type('command', 'cawdev ▸', '/');
+      case ESC: case 'q':
+        this.reader = null;
+        this.dirty = true;
+        return this.note('');
+      default:
+        return undefined;
+    }
+  }
+
+  /** The note a changes-requested verdict carries, asked in the prompt. */
+  askReviewNote() {
+    if (!this.reviewing) return this.note('/review a branch first');
+    this.reader = null;
+    this.dirty = true;
+    return this.type('review-note', `changes for ${this.reviewing.ref} — what should the next session do? (empty goes back) ▸`, '');
+  }
+
+  /** The work item as the platform has it now, read again after an act. */
+  async rereadReview() {
+    const review = this.reviewing;
+    const card = await this.session.request(`/api/projects/${review.slug}/roadmap/${review.ref}`).catch(() => null);
+    if (card?.workItem) review.item = card.workItem;
+    this.dirty = true;
+    return card;
+  }
+
+  async reviewVerdict(verdict, note) {
+    const review = this.reviewing;
+    if (!review) return this.note('/review a branch first');
+    try {
+      await this.session.request(`/api/projects/${review.slug}/work-items/${review.item.id}/verdict`, {
+        method: 'POST',
+        body: { verdict, ...(note ? { note } : {}) },
+      });
+    } catch (failure) {
+      return this.note(`could not decide ${review.ref}: ${failure.message}`);
+    }
+    await this.rereadReview();
+    return true;
+  }
+
+  async reviewDone() {
+    if (await this.reviewVerdict('APPROVED') !== true) return undefined;
+    const review = this.reviewing;
+    this.say(this.ink.success(`  ${review.ref} ${review.branch}: Done`));
+    return this.note(review.mayMerge ? `Done — m merges it${this.split ? '' : ' (/review merge)'}` : 'Done');
+  }
+
+  async reviewChanges(note) {
+    if (await this.reviewVerdict('CHANGES_REQUESTED', note) !== true) return undefined;
+    const review = this.reviewing;
+    this.say(this.ink.warn(`  ${review.ref} ${review.branch}: changes requested`));
+    this.say(this.ink.muted(`    ${printable(note)}`));
+    // The verdict is given: the diff is no longer what anybody acts on.
+    this.reader = null;
+    this.dirty = true;
+    return this.note(`sent back — the next session on ${review.ref} is given the note`);
+  }
+
+  /** Twice: the first press says what will land where, the second lands it. */
+  async reviewMerge() {
+    const review = this.reviewing;
+    if (!review) return this.note('/review a branch first');
+    if (review.item.status !== 'DONE') {
+      return this.note(`${review.ref} is ${review.item.statusDisplay ?? review.item.status} — say Done first (d)`);
+    }
+    if (!review.mayMerge) return this.note(`merging needs Merge on ${review.slug}, which you do not hold`);
+    if (!review.confirmingMerge) {
+      review.confirmingMerge = true;
+      this.dirty = true;
+      return this.note(`merge ${review.branch} into ${review.base}? ${this.split ? 'm again' : '/review merge again'} lands it — anything else keeps it`);
+    }
+    review.confirmingMerge = false;
+    try {
+      await this.session.request(`/api/projects/${review.slug}/work-items/${review.item.id}/merge`, { method: 'POST' });
+    } catch (failure) {
+      return this.note(`could not merge ${review.ref}: ${failure.message}`);
+    }
+    this.reader = null;
+    this.markMerging(review, { state: 'merging' });
+    this.say(this.ink.accent(`  ${review.ref}: merge of ${review.branch} queued on a machine of yours`));
+    void this.followMerge(review);
+    return this.note('merging — said here when it lands');
+  }
+
+  /**
+   * The sessions on the card being merged: their cards say so, and refuse
+   * every act on the branch until it lands (`refuseWhileMerging`). `state` is
+   * `merging`, or `failed` with `why`, which gives the acts back.
+   */
+  markMerging(review, { state, why = null }) {
+    for (const meta of this.mergingCards(review)) {
+      meta.merging = { state, why, ref: review.ref, branch: review.branch, base: review.base };
+    }
+    this.dirty = true;
+  }
+
+  /**
+   * A merge that hit a conflict goes back to the card's development: the
+   * branch is sent back (Not done) with the order as its note, which the next
+   * session on the card is handed (`RunReviews.latestRejection`, `task_current`),
+   * and that session is started here, again, with the agent that built it.
+   * The card is IN DEVELOPMENT again, the old session's card gives way to the
+   * new one's, and the merge is asked for once it is Done again. Two endpoints
+   * this terminal already uses; nothing new on the platform.
+   */
+  async resolveConflict(review, why) {
+    const ink = this.ink;
+    const sessions = this.mergingCards(review);
+    this.markMerging(review, { state: 'resolving', why });
+    this.say(ink.warn(`  ${review.ref}: ${review.branch} conflicts with ${review.base} — sent back to its development to resolve it`));
+    try {
+      await this.session.request(`/api/projects/${review.slug}/work-items/${review.item.id}/verdict`, {
+        method: 'POST',
+        body: { verdict: 'CHANGES_REQUESTED', note: conflictOrder(review, why) },
+      });
+    } catch (failure) {
+      this.markMerging(review, { state: 'failed', why: `${why} — and it could not be sent back: ${failure.message}` });
+      return this.note(`${review.ref} is not merged — /review to look again`);
+    }
+    const agent = sessions.map((meta) => meta.agent ?? meta.view?.agent).find(Boolean) ?? null;
+    this.focusOnArrival = review.slug;
+    const started = await this.startSession(review.slug, 'runs', withAgent({ entryNumber: review.ref }, agent),
+      withWho(`the development of ${review.ref}, to resolve the conflict with ${review.base}`, agent), false, true);
+    if (!started) {
+      this.focusOnArrival = null;
+      this.markMerging(review, { state: 'failed', why: `${why} — sent back, but its development did not start: ${this.status}` });
+      return this.note(`/new dev ${review.ref} --again starts it`);
+    }
+    // The development's own card takes over when this machine claims it.
+    for (const meta of sessions) {
+      meta.merging = null;
+      if (meta.ended) this.closeWindowOf(meta);
+    }
+    this.dirty = true;
+    return this.note(`${review.ref} is back in development — /review it again once it is Done`);
+  }
+
+  /** The sessions here whose card is `review`'s. */
+  mergingCards(review) {
+    const ref = String(review.ref).toLowerCase();
+    return [...this.sessions.values()].filter((meta) => meta.projectSlug === review.slug
+      && String(meta.view?.entryRef ?? '').toLowerCase() === ref);
+  }
+
+  /** True, having said why, when the session acted on is merging its card. */
+  refuseWhileMerging() {
+    const merging = this.commandTarget()?.merging;
+    if (merging?.state !== 'merging' && merging?.state !== 'resolving') return false;
+    this.note(`${merging.ref} is merging into ${merging.base} — its card closes by itself once it lands`);
+    return true;
+  }
+
+  async reviewAgentMerge() {
+    const review = this.reviewing;
+    if (!review) return this.note('/review a branch first');
+    try {
+      await this.session.request(`/api/projects/${review.slug}/work-items/${review.item.id}/agent-merge`, { method: 'POST' });
+    } catch (failure) {
+      return this.note(`could not start the agent merge: ${failure.message}`);
+    }
+    this.say(this.ink.accent(`  ${review.ref}: an agent merges ${review.base} into ${review.branch} and resolves the conflict`));
+    return this.note('agent merge started — its session opens like any other');
+  }
+
+  /**
+   * The merge, followed until the machine says: the card MERGED, or the merge
+   * FAILED (a conflict offers the agent). Polls the card, which is where the
+   * outcome is written; gives up saying so after `REVIEW_FOLLOW_TRIES`.
+   */
+  async followMerge(review, tries = REVIEW_FOLLOW_TRIES) {
+    const card = await this.session.request(`/api/projects/${review.slug}/roadmap/${review.ref}`).catch(() => null);
+    const merge = card?.workItem?.merge;
+    if (card?.status === 'MERGED' || card?.status === 'SHIPPED' || merge?.state === 'DONE') {
+      this.say(this.ink.success(`  ${review.ref} landed: ${review.branch} is in ${review.base}${merge?.result ? ` (${printable(merge.result)})` : ''}`));
+      // Landed: the card's work is over, and so are its cards here.
+      for (const meta of this.mergingCards(review)) {
+        meta.merging = null;
+        if (meta.ended) this.closeWindowOf(meta);
+      }
+      this.dirty = true;
+      return this.note(`${review.ref} merged`);
+    }
+    if (merge?.state === 'FAILED') {
+      // `failure` is the KIND (R155: CONFLICT, NO_PULL_REQUEST…); `result` the machine's words.
+      const why = printable(merge.result ?? merge.failure ?? 'no reason given');
+      // An older runner names no kind: its words are all there is to go on.
+      if (merge.failure === 'CONFLICT' || (!merge.failure && /conflict/i.test(merge.result ?? ''))) {
+        return this.resolveConflict(review, why);
+      }
+      this.say(this.ink.danger(`  ${review.ref}: the merge failed — ${why}`));
+      this.markMerging(review, { state: 'failed', why });
+      return this.note(`${review.ref} is not merged — /review to look again`);
+    }
+    if (tries <= 0) {
+      return this.note(`${review.ref}: still merging — the board says when it lands`);
+    }
+    const again = setTimeout(() => void this.followMerge(review, tries - 1), this.options.reviewFollowMs ?? 5_000);
+    again.unref?.();
+    return undefined;
+  }
+
   /** What a session is stopped on — a question or a permission request — or null. */
   waitingOn(meta) {
     const run = meta ? this.runs.find((each) => each.id === meta.id) : null;
     if (!run) return null;
+    const shown = this.showOn(run);
+    if (shown) return { kind: 'show', pending: shown };
     const pending = this.pendingOn(run);
     if (pending) return { kind: 'permission', pending };
     const asking = this.askingOn(run);
@@ -4115,6 +5186,47 @@ export class Attached {
    * and does what it does (`a` answers, `y`/`n` decide). In the scrollback
    * the request is printed whole, where the terminal scrolls it.
    */
+  /**
+   * The window `/view 2` or `/view R42` names: a number is a card's, a ref
+   * is the session on that card (the focused one first, then the latest). Null
+   * for anything else, which is a card to print.
+   */
+  windowNamed(words) {
+    if (words.length !== 1) return null;
+    const windows = this.windows();
+    const [word] = words;
+    if (/^\d+$/.test(word)) return windows[Number(word) - 1] ?? null;
+    const ref = word.toLowerCase();
+    const on = windows.filter((meta) => String(meta.view?.entryRef ?? '').toLowerCase() === ref);
+    return on.find((meta) => meta.id === this.split.focus) ?? on.at(-1) ?? null;
+  }
+
+  /**
+   * `/view` in advanced mode: the session takes the screen — its log, live,
+   * following the end until it is scrolled up, and what it waits on under it
+   * when it waits on you. Esc gives the cards back; tab goes to the next
+   * session without leaving.
+   */
+  viewSession(meta) {
+    this.focusWindow(meta.id);
+    const waiting = Boolean(this.waitingOn(meta));
+    this.reader = { runId: meta.id, top: null, room: 1, max: 0, session: true, follow: !waiting };
+    this.dirty = true;
+    return this.note('');
+  }
+
+  /** `/matrix on|off` — the cards' rain, remembered beside `/agent` (prefs.mjs). */
+  async chooseMatrix(word) {
+    const wanted = String(word ?? '').toLowerCase();
+    if (!['on', 'off'].includes(wanted)) {
+      return this.note(`the rain is ${this.matrix === false ? 'off' : 'on'} — /matrix on|off`);
+    }
+    this.matrix = wanted === 'on';
+    this.dirty = true;
+    await savePrefs(this.session.url, { matrix: this.matrix ? null : false }).catch(() => undefined);
+    return this.note(this.matrix ? 'the cards rain again' : 'the cards are still');
+  }
+
   openReader() {
     const meta = this.commandTarget();
     if (!this.split) {
@@ -4123,9 +5235,7 @@ export class Attached {
       this.say('');
       return this.note('');
     }
-    this.reader = { runId: meta.id, top: null, room: 1, max: 0 };
-    this.dirty = true;
-    return this.note('');
+    return this.viewSession(meta);
   }
 
   /** The request a session waits on, every word of it. */
@@ -4150,6 +5260,14 @@ export class Attached {
       ];
     }
     const approval = waiting.pending.approval ?? waiting.pending;
+    if (waiting.kind === 'show') {
+      return [
+        ...permissionBanner(waiting.pending, width, ink, this.runner ?? {}).slice(0, 2),
+        ...String(approval.summary ?? '').split('\n').flatMap((part) => wordWrap(printable(part), room)).map((line) => `  ${line}`),
+        '',
+        ...permissionBanner(waiting.pending, width, ink, this.runner ?? {}).slice(2),
+      ];
+    }
     return [
       `${ink.bold(ink.warn(' permission '))} ${ink.muted(`${approval.toolName ?? ''} · waiting since ${approval.askedAt?.slice(11, 19) ?? ''}`)}`,
       ...String(approval.summary ?? '').split('\n').flatMap((part) => wordWrap(part, room)).map((line) => `  ${line}`),
@@ -4163,22 +5281,31 @@ export class Attached {
 
   /** The reader, drawn over the whole screen — see `readerFrame` in split.mjs. */
   readerScreen(width, height) {
+    if (this.reader.kind === 'review') return this.reviewScreen(width, height);
     const ink = this.ink;
     const meta = this.windows().find((each) => each.id === this.reader.runId)
       ?? this.sessions.get(this.reader.runId) ?? { id: this.reader.runId };
     const output = (this.lines.get(this.reader.runId) ?? []).map((line) => this.render(line));
     const waiting = this.waitingOn(meta);
-    const request = this.requestLines(waiting, width - 2);
+    // What it waits on goes under its log; a session waiting on nobody is its
+    // log alone, followed at the end as it grows.
+    const request = waiting || !this.reader.session ? this.requestLines(waiting, width - 2) : [];
     const n = this.windowNumberOf(meta.id);
-    const keys = waiting?.kind === 'permission'
-      ? 'y once · s session · n refuse'
-      : waiting?.asking?.yours ? 'a answer' : '';
+    const keys = waiting?.kind === 'show'
+      ? 'a look and decide'
+      : waiting?.kind === 'permission'
+        ? 'y once · s session · n refuse'
+        : waiting?.asking?.yours ? 'a answer' : '';
     const drawn = readerFrame(width, height, {
-      title: `${n ? `${n} ` : ''}${titleFor(meta, waiting ? `waiting for ${waiting.kind === 'question' ? 'an answer' : 'permission'}` : null)}`,
-      lines: [...output, ink.muted('─'.repeat(Math.min(40, width - 2))), ...request],
+      title: `${n ? `${n} ` : ''}${titleFor(meta, waiting ? waitingWord(waiting.kind) : null)}`,
+      lines: [
+        ...(output.length ? output : [ink.muted('  nothing said on this session here yet')]),
+        ...(request.length ? [ink.muted('─'.repeat(Math.min(40, width - 2))), ...request] : []),
+      ],
       requestAt: output.length,
-      top: this.reader.top,
-      footer: keyList(['↑↓ scroll', 'PgUp/PgDn page', 'g/G top/end', 'esc close',
+      top: this.reader.follow ? Infinity : this.reader.top,
+      footer: keyList(['↑↓ scroll', 'PgUp/PgDn page', 'g/G top/end',
+        ...(this.reader.session ? ['tab next session'] : []), 'esc close',
         ...(keys ? [keys] : []), '/open on cawdev'], '', width - 2, ink),
     }, ink);
     Object.assign(this.reader, { top: drawn.top, max: drawn.max, room: drawn.room });
@@ -4187,9 +5314,12 @@ export class Attached {
 
   /** Keys while the reader is open. */
   onReaderKey(key) {
+    if (this.reader.kind === 'review') return this.onReviewKey(key);
     const reader = this.reader;
     const move = (to) => {
       reader.top = Math.min(Math.max(0, to), reader.max);
+      // At the end a session's log is followed again; above it, it holds still.
+      reader.follow = Boolean(reader.session) && reader.top >= reader.max;
       this.dirty = true;
       return undefined;
     };
@@ -4212,12 +5342,20 @@ export class Attached {
         this.dirty = true;
         return this.note('');
       default:
-        // Anything else is what it always is — `a` answers, `y`/`n` decide,
-        // `/` a command — with the reader closed first.
-        this.reader = null;
-        this.dirty = true;
-        return this.onKey(key);
+        break;
     }
+    if (reader.session && (key === '\t' || key === `${ESC}[Z`)) {
+      // The next session's log, without going back to the cards.
+      const windows = this.windows();
+      const here = windows.findIndex((meta) => meta.id === reader.runId);
+      const next = windows[(here + (key === '\t' ? 1 : -1) + windows.length) % windows.length];
+      return next ? this.viewSession(next) : undefined;
+    }
+    // Anything else is what it always is — `a` answers, `y`/`n` decide,
+    // `/` a command — with the reader closed first.
+    this.reader = null;
+    this.dirty = true;
+    return this.onKey(key);
   }
 
   /**
@@ -4489,6 +5627,7 @@ export class Attached {
     if (!pending) {
       return this.note('nothing is waiting for permission on this one');
     }
+    if (showGate(pending.approval)) return this.note(A_SHOW_GATE);
     const decision = permissionDecision(pending.approval, key, this.runner ?? {});
     if (!decision) {
       // Two ways to get here and they need different sentences. `Y` or `M` on a
@@ -4546,6 +5685,438 @@ export class Attached {
       this.note(failure.message);
     }
     return undefined;
+  }
+
+  // --- looking and deciding at a SHOW gate — R605 -----------------------------
+
+  /** The daemon's record of a window's session, or null. */
+  runOf(meta) {
+    return meta ? this.runs.find((each) => each.id === meta.id) ?? null : null;
+  }
+
+  /** This round's attachments live under the run; every URL here is built from it. */
+  attachmentsPath(run) {
+    return `/api/projects/${run.projectSlug}/runs/${run.id}/attachments`;
+  }
+
+  /**
+   * The round a gate names, confirmed against what the platform SEALED.
+   *
+   * A gate's `toolInput` is the session's own claim — the run token can raise
+   * a `stage:SHOW` approval naming anything — so a screenshot is shown only
+   * when the sealed list for that round holds its id, and a gate with an id
+   * that does not match offers no Accept.
+   */
+  async loadRound(run, pending) {
+    const gate = showGate(pending.approval);
+    const base = `/api/projects/${run.projectSlug}/runs/${run.id}`;
+    const listed = await this.session.request(`${base}/attachments`);
+    const all = (Array.isArray(listed) ? listed : []).map((each) => ({ ...each, runId: run.id }));
+    const byId = new Map(all.filter((each) => each.round === gate.round).map((each) => [each.id, each]));
+    const shots = gate.ids.map((id) => byId.get(id)).filter(Boolean);
+    // Confirmed only when the gate names exactly what the platform sealed for
+    // that round: no id that was never sealed, none twice, none left out, and
+    // something to look at. A claim naming some of the shots is a claim.
+    const confirmed = Number.isInteger(gate.round) && gate.round > 0
+      && gate.ids.length > 0 && new Set(gate.ids).size === gate.ids.length
+      && shots.length === gate.ids.length && byId.size === gate.ids.length;
+
+    const seen = await this.session.request(`${base}/approvals`).catch(() => []);
+    const rounds = (Array.isArray(seen) ? seen : [])
+      .filter((each) => each.state === 'DENIED' && showGate(each))
+      .map((each) => ({
+        round: showGate(each).round,
+        comments: each.reason ?? '',
+        by: each.decidedByEmail ? printable(each.decidedByEmail) : null,
+        shots: all.filter((shot) => shot.round === showGate(each).round),
+      }))
+      .filter((each) => each.round < gate.round)
+      .sort((a, b) => b.round - a.round);
+
+    return {
+      runId: run.id, approvalId: pending.approval.id, slug: run.projectSlug, round: gate.round,
+      shots, confirmed, rounds, select: null,
+    };
+  }
+
+  /** The loaded round for this gate — read once, kept while it is the same gate. */
+  async roundFor(run, pending) {
+    if (this.showing?.approvalId !== pending.approval.id) {
+      this.showing = await this.loadRound(run, pending);
+    }
+    return this.showing;
+  }
+
+  /** `a`, and `/view`: the picker that looks and decides. */
+  async lookAndDecide(run) {
+    const pending = this.showOn(run);
+    if (!pending) return this.note('nothing is waiting at SHOW on this one');
+    // So R137's `decidedElsewhere` can close this picker when somebody decides
+    // the gate in the console first.
+    this.deciding = { runId: run.id, approvalId: pending.approval.id };
+    try {
+      await this.roundFor(run, pending);
+    } catch (failure) {
+      if (this.deciding?.approvalId === pending.approval.id) this.deciding = null;
+      return this.note(printable(failure.message));
+    }
+    // The gate may have been decided, or the person may have started typing,
+    // while the round loaded: a picker for a settled gate is a lie.
+    if (this.showOn(run)?.approval.id !== pending.approval.id || this.mode !== 'keys') {
+      return undefined;
+    }
+    return this.openShowPicker();
+  }
+
+  openShowPicker() {
+    const round = this.showing;
+    const ink = this.ink;
+    const count = round.shots.length;
+    const rows = [
+      ...round.shots.map((shot, at) => ({
+        id: `shot:${at}`,
+        label: `${at + 1}  ${printable(shot.name)}${shot.caption ? ` — ${printable(shot.caption)}` : ''}`,
+        ...(isImage(shot) ? {} : { hint: 'html — opens on cawdev' }),
+      })),
+      ...(count ? [{ id: 'all', label: 'Open all', hint: 'images in the viewer, html on cawdev' }] : []),
+      ...(round.confirmed ? [{ id: 'accept', label: 'Accept — open the pull request' }] : []),
+      ...round.rounds.map((each) => ({
+        id: `round:${each.round}`,
+        label: `Round ${each.round} — ${each.shots.length} screenshot${each.shots.length === 1 ? '' : 's'}, comments sent`,
+      })),
+      { id: WRITE_MY_OWN, label: 'Send comments…', hint: '#2 … is a note on screenshot 2; an empty line sends' },
+    ];
+    const select = new Select({
+      kind: 'show',
+      title: `${this.tagOf(this.runs.find((each) => each.id === round.runId))} · round ${round.round} · ${count} screenshot${count === 1 ? '' : 's'}`
+        + (round.confirmed ? '' : ' — this gate names screenshots that were never sealed — /open looks on cawdev'),
+      hint: '/open looks on cawdev',
+      rows,
+    });
+    round.select = select;
+    if (!round.confirmed) {
+      this.say(ink.warn('  this gate names screenshots that were never sealed — /open looks on cawdev'));
+    }
+    return this.openPicker(select);
+  }
+
+  /** One row of the show picker. */
+  choseShow(select, row, typed) {
+    const round = this.showing;
+    if (!round) return this.note('');
+    const back = () => (select.kind === 'show-round' ? select : round.select);
+    const reopenWith = async (work) => {
+      const said = await work;
+      // Not over a gate decided meanwhile, nor over something being typed.
+      if (this.showing?.approvalId !== round.approvalId || this.mode !== 'keys') return;
+      this.reopen(back());
+      this.note(said);
+    };
+    if (select.kind === 'show-round') {
+      const earlier = select.earlier;
+      if (row.id === 'back') return this.reopen(round.select);
+      if (row.id === 'all') return void reopenWith(this.openShots(earlier.shots, round));
+      if (row.id.startsWith('shot:')) {
+        return void reopenWith(this.openShots([earlier.shots[Number(row.id.slice(5))]], round));
+      }
+      return this.note('');
+    }
+    if (row.id.startsWith('shot:')) {
+      return void reopenWith(this.openShots([round.shots[Number(row.id.slice(5))]], round));
+    }
+    if (row.id === 'all') return void reopenWith(this.openShots(round.shots, round));
+    if (row.id === 'accept') return void this.acceptShow(this.runs.find((each) => each.id === round.runId));
+    if (row.id.startsWith('round:')) {
+      return this.showRound(Number(row.id.slice(6)), round, true);
+    }
+    if (row.id === WRITE_MY_OWN) {
+      this.commenting = { approvalId: round.approvalId, lines: [] };
+      if (typed) {
+        return void this.sendComments(this.runs.find((each) => each.id === round.runId), typed);
+      }
+      return this.type('comments', 'comments ▸', '', round.select);
+    }
+    return this.note('');
+  }
+
+  /** An earlier round: what was sent on it printed ONCE, then its screenshots. */
+  showRound(number, round, picker) {
+    const earlier = round.rounds.find((each) => each.round === number);
+    if (!earlier) return this.note(`there is no round ${number} to show — ${round.rounds.map((each) => each.round).join(', ') || 'none earlier'}`);
+    const ink = this.ink;
+    this.say('');
+    this.say(`${ink.bold(ink.warn(` round ${number} `))} ${ink.muted(`${earlier.shots.length} screenshot${earlier.shots.length === 1 ? '' : 's'}${earlier.by ? ` · comments by ${earlier.by}` : ''}`)}`);
+    for (const line of roundListing(earlier.shots, ink)) this.say(line);
+    // The reason alone: it already holds each screenshot's note ("On `x` — caption:
+    // note"), so printing the notes as well would say each one twice.
+    for (const line of printable(earlier.comments, { lines: true }).split('\n')) this.say(`  ${ink.text(line)}`);
+    this.say('');
+    if (!picker) return this.note('');
+    const nested = new Select({
+      kind: 'show-round',
+      title: `round ${number}`,
+      rows: [
+        ...earlier.shots.map((shot, at) => ({
+          id: `shot:${at}`,
+          label: `${at + 1}  ${printable(shot.name)}${shot.caption ? ` — ${printable(shot.caption)}` : ''}`,
+        })),
+        ...(earlier.shots.length ? [{ id: 'all', label: 'Open all' }] : []),
+        { id: 'back', label: 'Back' },
+      ],
+    });
+    nested.earlier = earlier;
+    return this.openPicker(nested);
+  }
+
+  /**
+   * Hand screenshots to the OS viewer. Images come from the local cache —
+   * downloaded the first time and never again while the bytes match their
+   * checksum; HTML is NEVER written to disk or opened as a file: it opens at
+   * the platform's sandboxed URL, which is the only origin it may run on.
+   *
+   * @returns the sentence for the status line.
+   */
+  async openShots(shots, round) {
+    const run = this.runs.find((each) => each.id === round.runId) ?? { id: round.runId, projectSlug: round.slug };
+    const base = this.attachmentsPath(run);
+    const dir = shotsDir();
+    const paths = [];
+    let downloaded = 0;
+    try {
+      for (const shot of shots.filter(isImage)) {
+        const copy = await localCopy(shot, {
+          dir, fetchBytes: () => this.session.requestBytes(`${base}/${encodeURIComponent(shot.id)}`),
+        });
+        paths.push(copy.path);
+        if (copy.downloaded) downloaded++;
+      }
+    } catch (failure) {
+      return printable(failure.message);
+    }
+    if (paths.length) this.launch(paths);
+    const pages = shots.filter((shot) => !isImage(shot));
+    for (const page of pages) this.openLink(`${this.session.url}${base}/${encodeURIComponent(page.id)}`);
+
+    const home = homedir();
+    const where = (dir.startsWith(home) ? `~${dir.slice(home.length)}` : dir);
+    const said = [];
+    if (paths.length) {
+      said.push(`opened ${paths.length} in the viewer (${downloaded
+        ? `downloaded ${downloaded} into ${where}/${round.runId}/${round.round}` : `from ${where}`})`);
+    }
+    if (pages.length) {
+      said.push(`${pages.length === 1 ? 'the html one opens' : 'the html ones open'} on cawdev — sign in there in your browser if it asks`);
+    }
+    return said.join(' · ');
+  }
+
+  /** The viewer, with files. Injectable, like `openUrl`. */
+  launch(paths) {
+    if (this.options.openFiles) {
+      this.options.openFiles(paths);
+      return;
+    }
+    for (const [command, args] of openerFor(process.platform)(paths)) {
+      spawn(command, args, { stdio: 'ignore', detached: true }).on('error', () => undefined).unref();
+    }
+  }
+
+  /** A line (or several, pasted) written at the comments prompt. An empty one sends. */
+  commentLine(text, back) {
+    const ink = this.ink;
+    if (this.commenting?.approvalId !== this.showing?.approvalId) {
+      this.commenting = { approvalId: this.showing?.approvalId ?? null, lines: [] };
+    }
+    const lines = String(text).split('\n').map((line) => line.trim()).filter(Boolean);
+    if (!lines.length) {
+      if (this.commenting.lines.length) {
+        const run = this.runs.find((each) => each.id === this.showing?.runId);
+        return void this.sendComments(run, this.commenting.lines.join('\n'), back);
+      }
+      return back ? this.reopen(back) : this.note('');
+    }
+    for (const line of lines) {
+      this.commenting.lines.push(line);
+      this.say(ink.muted(`  ▸ ${printable(line)}`));
+    }
+    const n = this.commenting.lines.length;
+    return this.type('comments', `comments (${n} line${n === 1 ? '' : 's'} · empty line sends) ▸`, '', back);
+  }
+
+  /** Mark a gate decided, here: the poll must not raise it again (R137). */
+  settleGate(run, approvalId) {
+    this.settled.add(approvalId);
+    this.approvals.delete(run.id);
+    if (this.deciding?.approvalId === approvalId) this.deciding = null;
+    this.showing = null;
+    this.commenting = null;
+    // Only what this gate opened: a prompt or another run's picker is not ours.
+    if (this.select?.kind === 'show' || this.select?.kind === 'show-round'
+        || this.input?.kind === 'comments') {
+      this.mode = 'keys';
+      this.select = null;
+      this.input = null;
+    }
+    this.dirty = true;
+  }
+
+  /** The gate to decide, still the same gate the round was read for. */
+  stillAt(run) {
+    const pending = this.showOn(run);
+    if (!pending || (this.showing && this.showing.approvalId !== pending.approval.id)) {
+      this.note('no longer waiting at SHOW — decided elsewhere, or gone');
+      return null;
+    }
+    return pending;
+  }
+
+  async sendComments(run, text, back = null) {
+    if (!run || !this.requireSignIn('send comments')) return undefined;
+    const pending = this.stillAt(run);
+    if (!pending) return undefined;
+    let round;
+    try {
+      round = await this.roundFor(run, pending);
+    } catch (failure) {
+      return this.note(printable(failure.message));
+    }
+    const parsed = parseComments(text, round.shots);
+    if (parsed.error) {
+      // Nothing is sent. Back on the line, with what was written still held.
+      if (back || this.commenting) {
+        this.type('comments', 'comments ▸', '', back ?? round.select);
+      }
+      return this.note(parsed.error);
+    }
+    try {
+      await this.session.request(
+        `/api/projects/${run.projectSlug}/runs/${run.id}/approvals/${pending.approval.id}/decision`,
+        { method: 'POST', body: { allow: false, scope: 'ONCE', reason: parsed.reason, notes: parsed.notes } },
+      );
+    } catch (failure) {
+      // A 409 for a round that was replaced says so in its own sentence.
+      return this.note(printable(failure.message));
+    }
+    this.settleGate(run, pending.approval.id);
+    // The run is read again rather than assumed: with no stages to walk again
+    // the daemon ends it FAILED, and "goes back to coding" would be untrue.
+    const view = await this.session.request(`/api/projects/${run.projectSlug}/runs/${run.id}`)
+      .catch(() => null);
+    const alive = view && (view.live ?? !['FAILED', 'FINISHED', 'CANCELLED'].includes(view.state));
+    const ref = view?.entryRef ?? this.sessions.get(run.id)?.view?.entryRef ?? null;
+    return this.note(alive
+      ? `sent — ${ref ?? 'the run'} goes back to coding (round ${round.round + 1})`
+      : 'sent');
+  }
+
+  async acceptShow(run) {
+    if (!run || !this.requireSignIn('accept the screenshots')) return undefined;
+    const pending = this.stillAt(run);
+    if (!pending) return undefined;
+    let round;
+    try {
+      round = await this.roundFor(run, pending);
+    } catch (failure) {
+      return this.note(printable(failure.message));
+    }
+    if (!round.confirmed) {
+      return this.note('this gate names screenshots that were never sealed — /open looks on cawdev');
+    }
+    const dropped = this.commenting?.lines.length
+      ? 'the comments you wrote are dropped — accepting · ' : '';
+    try {
+      await this.session.request(
+        `/api/projects/${run.projectSlug}/runs/${run.id}/approvals/${pending.approval.id}/decision`,
+        { method: 'POST', body: { allow: true, scope: 'ONCE' } },
+      );
+    } catch (failure) {
+      return this.note(printable(failure.message));
+    }
+    this.settleGate(run, pending.approval.id);
+    return this.note(`${dropped}accepted — the pull request opens when the run finishes`);
+  }
+
+  /**
+   * `/shots`, `/accept`, `/comments` — and `/view` at a SHOW gate. Each acts on
+   * the focused session, and each says why and does nothing when it is not
+   * stopped at SHOW.
+   */
+  async showCommand(word, rest) {
+    const meta = this.commandTarget();
+    const label = meta ? this.tagOf(this.runOf(meta) ?? meta) || meta.label || 'this session' : null;
+    if (!meta) return this.note(`/${word} needs a session — focus one`);
+    const run = this.runOf(meta);
+    const pending = this.showOn(run);
+    if (!pending) return this.note(`${label} is not waiting at SHOW — nothing to look at`);
+    if (word === 'view') {
+      if (!this.requireSignIn('look and decide')) return undefined;
+      return this.lookAndDecide(run);
+    }
+    if (word === 'accept') return this.acceptShow(run);
+    if (word === 'comments') {
+      // `#2` anywhere starts a note on screenshot 2, which runs to the next
+      // `#n` or the end; what comes before the first is the round's note.
+      const text = wordsText(rest).replace(/[ \t]+(#\d+)(?=[\s:—-]|$)/g, '\n$1');
+      return this.sendComments(run, text);
+    }
+    if (!this.requireSignIn('look at the screenshots')) return undefined;
+    let round;
+    try {
+      round = await this.roundFor(run, pending);
+    } catch (failure) {
+      return this.note(printable(failure.message));
+    }
+    const usage = '/shots · /shots 2 · /shots all · /shots round 1 (all | 2)';
+    let from = round;
+    let shots = round.shots;
+    let words = rest;
+    if (words[0] === 'round') {
+      const wanted = Number(words[1]);
+      const earlier = round.rounds.find((each) => each.round === wanted);
+      if (!earlier) return this.note(Number.isInteger(wanted) ? `there is no round ${wanted} to show — ${usage}` : usage);
+      if (words.length === 2) return this.showRound(wanted, round, false);
+      shots = earlier.shots;
+      words = words.slice(2);
+      from = round;
+    }
+    if (!words.length) {
+      const ink = this.ink;
+      this.say('');
+      this.say(`${ink.bold(ink.warn(' shots '))} ${ink.muted(`round ${round.round} · ${shots.length} screenshot${shots.length === 1 ? '' : 's'}`)}`);
+      for (const line of roundListing(shots, ink)) this.say(line);
+      this.say('');
+      if (!this.split && !this.plain) await this.printThumbnails(shots, run);
+      return this.note(round.confirmed ? '' : 'this gate names screenshots that were never sealed — /open looks on cawdev');
+    }
+    if (words.length === 1 && words[0] === 'all') {
+      return this.note(await this.openShots(shots, from));
+    }
+    if (words.length === 1 && /^\d+$/.test(words[0])) {
+      const at = Number(words[0]);
+      if (at < 1 || at > shots.length) return this.note(`there is no screenshot ${at} — ${shots.length} in this round`);
+      return this.note(await this.openShots([shots[at - 1]], from));
+    }
+    return this.note(usage);
+  }
+
+  /** Inline thumbnails — iTerm2, WezTerm, kitty — into the scrollback, never the live region. */
+  async printThumbnails(shots, run) {
+    const protocol = thumbnailProtocol(process.env);
+    if (!protocol) return;
+    const base = this.attachmentsPath(run);
+    for (const shot of shots.filter(isImage)) {
+      try {
+        const copy = await localCopy(shot, {
+          dir: shotsDir(), fetchBytes: () => this.session.requestBytes(`${base}/${encodeURIComponent(shot.id)}`),
+        });
+        // Pushed as a committed line, not through `say`: `wrap` counts the
+        // base64 as visible text and would cut the escape in half.
+        this.pending.push(thumbnailEscape(await readFile(copy.path), protocol));
+        this.dirty = true;
+      } catch (failure) {
+        this.say(this.ink.muted(`  ${printable(shot.name)}: ${printable(failure.message)}`));
+      }
+    }
   }
 
   async cancel() {
@@ -4922,6 +6493,15 @@ export class Attached {
       // it under the first.
       return [];
     }
+    if (this.split?.boardFocus) {
+      return [
+        `${ink.text('←→')} ${ink.muted('column')}`,
+        `${ink.text('↑↓')} ${ink.muted('card')}`,
+        `${ink.text('p')} ${ink.muted(`plan ${this.split.boardFocus.ref}`)}`,
+        `${ink.text('d')} ${ink.muted(`develop ${this.split.boardFocus.ref}`)}`,
+        `${ink.text('esc/b')} ${ink.muted('back to sessions')}`,
+      ];
+    }
     const parts = [
       `${ink.text('enter')} ${ink.muted('prompt')}`,
       `${ink.text('/')} ${ink.muted('commands')}`,
@@ -4938,7 +6518,9 @@ export class Attached {
         + `${ink.muted('permission')}`);
     }
     if (this.split) {
-      parts.push(`${ink.text('tab')} ${ink.muted('next window')}`);
+      parts.push(`${ink.text('b')} ${ink.muted('board')}`);
+      parts.push(`${ink.text('tab')} ${ink.muted('next card')}`);
+      parts.push(`${ink.text('v')} ${ink.muted('its log')}`);
       parts.push(`${ink.text('d')} ${ink.muted(this.finishedPlan(this.commandTarget())
         ? `develop ${this.commandTarget().view.entryRef}` : 'develop a planned card')}`);
     }

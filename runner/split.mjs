@@ -16,7 +16,8 @@
 // which is how scrollback.mjs's own layout bugs were found. The class at the
 // bottom only enters, leaves, and writes the rows that changed.
 
-import { clip, padVisible, visibleWidth, wrap } from '../lib/ansi.mjs';
+import { clip, keyList, padVisible, visibleWidth, wrap } from '../lib/ansi.mjs';
+import { staleLockOf } from './git-lock.mjs';
 
 const ESC = '\x1b';
 const ALT_ON = `${ESC}[?1049h`;
@@ -407,6 +408,14 @@ export function subtitleFor(meta, width) {
 }
 
 /**
+ * What a window says while its run is stopped at SHOW — R605. Pure, so the
+ * singular is pinned once.
+ */
+export function showWaitingLine(gate, count) {
+  return `waiting for you — ${count} screenshot${count === 1 ? '' : 's'}, round ${gate.round} · a to look and decide`;
+}
+
+/**
  * A window frame's colour, from where its session stands: `live` (red) while
  * it runs or waits, `done` (green) once it FINISHED — a plan planned, a dev
  * developed — and `stopped` (amber) for any other ending. Null until an ended
@@ -429,6 +438,9 @@ export function toneFor(meta) {
  * What can be done about a session now — the window's last line. Empty while
  * it runs: the prompt, the answer and the permission keys are the prompt's.
  *
+ * A session that stopped on a git lock a crash left behind offers `/clean`
+ * beside `/continue` (git-lock.mjs).
+ *
  * A finished PLAN on a card offers its development — `d`, in its place. A finished session that
  * wrote a branch offers the pull request until one is known, then shows it.
  * Every ended window can be closed.
@@ -440,6 +452,10 @@ export function actionsFor(meta) {
   const view = meta.view;
   const parts = [];
   if (view?.canCarryOn && !meta.carryAsked) {
+    // A lock a crash left behind fails /continue the same way again.
+    if (!meta.lockCleaned && staleLockOf(view.exitSummary, view.workspace ?? meta.workspace)) {
+      parts.push('/clean removes the stale git lock');
+    }
     parts.push('/continue picks it back up here');
   } else if (meta.carryAsked) {
     parts.push('continue asked for — back when this machine takes it');
@@ -459,10 +475,16 @@ export function actionsFor(meta) {
   } else if (view?.branch && (view.profile ?? 'CODE') === 'CODE' && view.state === 'FINISHED') {
     parts.push('/pr opens the pull request');
   }
+  // A finished development on a card has a branch to read and decide on here.
+  if (view?.entryRef && view.branch && (view.profile ?? 'CODE') === 'CODE' && view.state === 'FINISHED'
+    && !builtNothing(meta)) {
+    parts.push('/review');
+  }
+  // The command alone: a card's last line is short, and /help says what it does.
   if (meta.dropped) {
     parts.push('checkout deleted');
   } else if (isAutoCheckout(view?.workspace) && view?.state !== 'RUNNING' && !view?.live) {
-    parts.push('/drop deletes its checkout');
+    parts.push('/drop');
   }
   parts.push('/close');
   return parts.join(' · ');
@@ -493,22 +515,6 @@ export function isAutoCheckout(path) {
 }
 
 /**
- * `/new plan R3`, `/new dev R3`, `/new ask what does the importer do?` — and a
- * plan or a dev from a sentence, with no card: `/new plan add a CSV export`,
- * `/new dev fix the sort on the client list`. `@slug` anywhere names the
- * project; without it the caller asks which.
- *
- * One card reference and nothing else is that card; anything else is the task
- * in words. A plan from words writes its card first and plans what it wrote
- * (R150); a dev from words is a manual session, on a branch of its own.
- *
- * @param words what followed `/new`, split on spaces
- * @param projects the slugs this machine serves
- * @returns `{ kind, slug, ref }` for a card, `{ kind, slug, text }` for words,
- *   `{ needsProject, projects }` when no `@project` was written — the project
- *   is ALWAYS asked, never guessed — or `{ error }` in words.
- */
-/**
  * A command line as words — on spaces and tabs, with every line break kept as
  * a word of its own (`'\n'`). Splitting on all whitespace turned a pasted list
  * of requirements into one long line; kept here, `wordsText` puts it back.
@@ -522,15 +528,46 @@ export function wordsText(words) {
   return words.join(' ').replace(/ *\n */g, '\n').trim();
 }
 
+/**
+ * `/new plan R3`, `/new dev R3`, `/new ask what does the importer do?` — and a
+ * plan or a dev from a sentence, with no card: `/new plan add a CSV export`,
+ * `/new dev fix the sort on the client list`. `@slug` anywhere names the
+ * project; without it the caller asks which.
+ *
+ * One card reference and nothing else is that card; anything else is the task
+ * in words. A plan from words writes its card first and plans what it wrote
+ * (R150); a dev from words is a manual session, on a branch of its own.
+ *
+ * R606: several references and nothing else are several cards, in the order
+ * written (`R3 R5 R7` or `R3,R5,R7`), started as one batch on this machine.
+ * `plan+dev` plans each card and builds it before the next is planned, so it
+ * takes cards only — one is a batch of one. `--in-order` puts dev cards on one
+ * branch, each run from the last one's commits, and `--branch <name>` names it.
+ *
+ * @param words what followed `/new`, split on spaces
+ * @param projects the slugs this machine serves
+ * @returns `{ kind, slug, ref }` for a card, `{ kind, slug, refs }` for
+ *   several (with `inOrder` and `branch` when asked for), `{ kind, slug, text }`
+ *   for words, `{ needsProject, projects }` when no `@project` was written —
+ *   the project is ALWAYS asked, never guessed — or `{ error }` in words.
+ */
 export function parseNew(words, { projects = [] } = {}) {
   const named = words.find((word) => word.startsWith('@'));
-  const rest = words.filter((word) => word !== named && word !== '');
+  const at = words.indexOf('--branch');
+  const branch = at >= 0 ? words[at + 1] : undefined;
+  const inOrder = words.includes('--in-order');
+  const rest = words.filter((word, index) => word !== named && word !== '' && word !== '--in-order'
+    && (at < 0 || (index !== at && index !== at + 1)));
   const [kindWord, ...args] = rest;
-  const kind = { plan: 'plan', dev: 'dev', code: 'dev', ask: 'ask' }[String(kindWord ?? '').toLowerCase()];
-  const usage = 'use /new plan R3, /new dev R3, /new plan|dev <the task in words> or /new ask <question>'
-    + ' (and @project to pick one)';
+  const kind = { plan: 'plan', dev: 'dev', code: 'dev', ask: 'ask', 'plan+dev': 'plan+dev', 'plan+code': 'plan+dev' }[
+    String(kindWord ?? '').toLowerCase()];
+  const usage = 'use /new plan R3, /new dev R3, /new plan|dev <the task in words>, /new ask <question>'
+    + ' or several cards: /new plan|dev|plan+dev R3 R5 R7 (and @project to pick one)';
   if (!kind) {
     return { error: kindWord ? `no such session kind: ${kindWord} — ${usage}` : usage };
+  }
+  if (at >= 0 && (!branch || branch.startsWith('-') || branch.startsWith('@'))) {
+    return { error: '--branch what? /new dev R3 R5 --in-order --branch <name>' };
   }
   const slug = named ? named.slice(1) : null;
   if (slug && projects.length && !projects.includes(slug)) {
@@ -539,14 +576,38 @@ export function parseNew(words, { projects = [] } = {}) {
   const text = wordsText(args);
   if (!text) {
     return { error: kind === 'ask' ? 'ask what? /new ask <question>'
-      : `${kind} what? /new ${kind} R3, or /new ${kind} <the task in words>` };
+      : `${kind} what? /new ${kind} R3${kind === 'plan+dev' ? ' R5' : `, or /new ${kind} <the task in words>`}` };
+  }
+  // A card is written R3 and an issue i3 — EntryRef's spelling; a bare number
+  // is a roadmap card, as it is everywhere else. Commas only part references:
+  // a sentence with a comma in it stays the sentence it was.
+  const pieces = args.flatMap((word) => word.split(','));
+  const refs = kind !== 'ask' && pieces.filter(Boolean).length
+    && pieces.every((word) => word === '' || /^[RrIi]?\d+$/.test(word))
+    ? pieces.filter(Boolean).map((word) => {
+      const digits = word.replace(/^[RrIi]/, '');
+      return /^[Ii]/.test(word) ? `i${digits}` : `R${digits}`;
+    })
+    : null;
+  const twice = refs?.find((ref, index) => refs.indexOf(ref) !== index);
+  if (twice) {
+    return { error: `${twice} is on the line twice — a card is planned or built once per batch` };
+  }
+  if (kind === 'plan+dev' && !refs) {
+    return { error: 'plan+dev takes cards: /new plan+dev R3 R5 R7 — /card writes one first' };
+  }
+  const several = refs && (refs.length > 1 || kind === 'plan+dev');
+  if ((inOrder || at >= 0) && !(several && kind === 'dev')) {
+    return { error: '--in-order and --branch are for several dev cards: /new dev R3 R5 --in-order' };
+  }
+  if (at >= 0 && !inOrder) {
+    return { error: '--branch names the one branch of --in-order; without it each card has its own' };
   }
   let what;
-  if (kind !== 'ask' && args.length === 1 && /^[RrIi]?\d+$/.test(args[0])) {
-    // A card is written R3 and an issue i3 — EntryRef's spelling; a bare
-    // number is a roadmap card, as it is everywhere else.
-    const digits = args[0].replace(/^[RrIi]/, '');
-    what = { kind, ref: /^[Ii]/.test(args[0]) ? `i${digits}` : `R${digits}` };
+  if (several) {
+    what = { kind, refs, ...(inOrder ? { inOrder } : {}), ...(branch ? { branch } : {}) };
+  } else if (refs) {
+    what = { kind, ref: refs[0] };
   } else {
     what = { kind, text };
   }
@@ -559,6 +620,37 @@ export function parseNew(words, { projects = [] } = {}) {
       : { error: 'this machine serves no project yet — c adds one' };
   }
   return { ...what, slug };
+}
+
+/**
+ * What a batch started from `/new` did, in lines — R606. Both halves, as the
+ * console's dialog says them: what went, in the order it will run, and each
+ * card the platform skipped with its reason. A batch that started nothing
+ * says so first, so the skipped lines read as the reason.
+ *
+ * @param asked what `parseNew` returned (`kind`, `inOrder`)
+ * @param outcome the API's `StartedBatch` (`started` runs, `refused` cards)
+ */
+export function batchStartedLines(asked, outcome, slug, agent = null) {
+  const started = outcome?.started ?? [];
+  const refs = started.map((run) => run.entryRef ?? `#${run.entryNumber}`);
+  const where = agent ? `on ${slug} with ${agent}` : `on ${slug}`;
+  const lines = [];
+  if (!started.length) {
+    lines.push(`nothing started on ${slug}`);
+  } else if (asked.kind === 'plan+dev') {
+    lines.push(`planning then building ${refs.join(' → ')} ${where}, one card at a time`);
+  } else if (asked.kind === 'plan') {
+    lines.push(`planning ${refs.join(' → ')} ${where}, in order`);
+  } else if (asked.inOrder) {
+    lines.push(`building ${refs.join(' → ')} ${where}, in order on ${started[0].branch}`);
+  } else {
+    lines.push(`building ${refs.join(', ')} ${where}, a branch each, queued on this machine`);
+  }
+  for (const card of outcome?.refused ?? []) {
+    lines.push(`skipped ${card.ref ?? `#${card.entryNumber}`}: ${card.reason}`);
+  }
+  return lines;
 }
 
 /**
@@ -701,36 +793,14 @@ export const MIN_COLUMN = 18;
 const STRIP_HEAD = 2;
 
 /**
- * The roadmap across the top of advanced mode: every project this machine
- * serves, each as a small board — its columns side by side, one line per
- * card, a `●` on a card with a session running now.
- *
- * THE ROOM RUNS OUT TWO WAYS, and each is said rather than cut:
- * - **Too many cards for the rows** — a column ends in `+N more` on its last
- *   row, never a card cut in half, and the header keeps the true count.
- * - **Too many columns for the width** — empty columns go first (the header
- *   line of their project still names nothing lost), then whole columns in
- *   `GIVES_WAY` order, each named in the project's header as `merged 3
- *   hidden`; then whole projects, counted as `+N projects`. A project always
- *   keeps one column.
- *
- * Between `STRIP_HEAD + 1` and `maxRows` lines — as many as the fullest
- * column needs, no more — of exactly `width` columns. One line when there is
- * no project at all.
- *
- * ISSUES SHARE THE COLUMNS (`columnOf`) and go first in each, most severe
- * first: a column cut to `+N more` should not hide a critical defect under
- * ideas. Their ref (`i12`) is in the colour of their severity.
- *
- * @param cards `[{ ref, title, slug, status, live?, severity? }]` — a card
- *   with a `severity` is an issue
- * @param projects the slugs to show, in order; defaults to those the cards
- *   come from
+ * The boards and columns the strip fits into `width`, in left-to-right order.
+ * Shared by {@link roadmapStrip} and {@link stripColumns} so keyboard focus
+ * walks the exact columns drawn on screen.
  */
-export function roadmapStrip(width, maxRows, cards, ink, projects = null) {
+function stripBoards(width, cards, projects = null) {
   const slugs = projects?.length ? [...projects] : [...new Set(cards.map((card) => card.slug))];
   if (!slugs.length) {
-    return [padVisible(ink.muted(' no project here yet — the roadmap shows here'), width)];
+    return { slugs: [], shown: [], hiddenProjects: 0 };
   }
   const boards = slugs.map((slug) => {
     const mine = cards.filter((card) => card.slug === slug);
@@ -783,6 +853,84 @@ export function roadmapStrip(width, maxRows, cards, ink, projects = null) {
     }
     board.width = board.columns.reduce((sum, column) => sum + column.width, 0) + board.columns.length - 1;
   }
+  return { slugs, shown, hiddenProjects };
+}
+
+/**
+ * The non-empty columns drawn on the roadmap strip at `width`, left to right:
+ * `[{ slug, status, label, cards }]`. Empty columns (`—`) are skipped so
+ * left/right navigation always lands on a card.
+ */
+export function stripColumns(width, cards, projects = null) {
+  const { shown } = stripBoards(width, cards, projects);
+  return shown.flatMap((board) => board.columns
+    .filter((column) => column.cards.length > 0)
+    .map((column) => ({ slug: board.slug, status: column.status, label: column.label, cards: column.cards })));
+}
+
+/**
+ * Step the board focus by `(dCol, dRow)` across `columns` (`stripColumns`).
+ * Moving horizontally keeps the row index clamped to the destination column's
+ * cards; moving vertically wraps within the current column.
+ */
+export function moveInStrip(columns, focus, dCol = 0, dRow = 0) {
+  if (!columns.length) return null;
+  let colAt = focus ? columns.findIndex((col) => col.slug === focus.slug
+    && col.cards.some((card) => card.ref === focus.ref)) : -1;
+  let rowAt = colAt >= 0 ? columns[colAt].cards.findIndex((card) => card.ref === focus.ref) : 0;
+  if (colAt < 0) {
+    colAt = 0;
+    rowAt = 0;
+    if (dCol === 0 && dRow === 0) {
+      return { slug: columns[0].slug, ref: columns[0].cards[0].ref };
+    }
+  }
+  if (dCol !== 0) {
+    colAt = (colAt + dCol + columns.length) % columns.length;
+    rowAt = Math.min(rowAt, columns[colAt].cards.length - 1);
+  } else if (dRow !== 0) {
+    const count = columns[colAt].cards.length;
+    rowAt = (rowAt + dRow + count) % count;
+  }
+  return { slug: columns[colAt].slug, ref: columns[colAt].cards[rowAt].ref };
+}
+
+/**
+ * The roadmap across the top of advanced mode: every project this machine
+ * serves, each as a small board — its columns side by side, one line per
+ * card, a `●` on a card with a session running now, and `❯` on the card
+ * focused when browsing the strip (`focus`).
+ *
+ * THE ROOM RUNS OUT TWO WAYS, and each is said rather than cut:
+ * - **Too many cards for the rows** — a column ends in `+N more` on its last
+ *   row, never a card cut in half, and the header keeps the true count. When
+ *   browsing a column past the fold, its window walks with `focus` so every
+ *   card in the column can be reached.
+ * - **Too many columns for the width** — empty columns go first (the header
+ *   line of their project still names nothing lost), then whole columns in
+ *   `GIVES_WAY` order, each named in the project's header as `merged 3
+ *   hidden`; then whole projects, counted as `+N projects`. A project always
+ *   keeps one column.
+ *
+ * Between `STRIP_HEAD + 1` and `maxRows` lines — as many as the fullest
+ * column needs, no more — of exactly `width` columns. One line when there is
+ * no project at all.
+ *
+ * ISSUES SHARE THE COLUMNS (`columnOf`) and go first in each, most severe
+ * first: a column cut to `+N more` should not hide a critical defect under
+ * ideas. Their ref (`i12`) is in the colour of their severity.
+ *
+ * @param cards `[{ ref, title, slug, status, live?, severity? }]` — a card
+ *   with a `severity` is an issue
+ * @param projects the slugs to show, in order; defaults to those the cards
+ *   come from
+ * @param focus `{ slug, ref }` when browsing the strip, else null
+ */
+export function roadmapStrip(width, maxRows, cards, ink, projects = null, focus = null) {
+  const { slugs, shown, hiddenProjects } = stripBoards(width, cards, projects);
+  if (!slugs.length) {
+    return [padVisible(ink.muted(' no project here yet — the roadmap shows here'), width)];
+  }
 
   // Rows: as many as the fullest column needs, within what the screen gave.
   const fullest = Math.max(1, ...shown.flatMap((board) => board.columns.map((column) => column.cards.length)));
@@ -805,20 +953,35 @@ export function roadmapStrip(width, maxRows, cards, ink, projects = null) {
     const tail = [...lost, ...more, ...counts].join(' · ');
     return `${ink.bold(board.slug)}${tail ? ink.muted(` · ${tail}`) : ''}`;
   }));
-  lines.push(lineOf((board) => board.columns.map((column) =>
-    padVisible(clip(`${hueOf(column.status, ink)(column.label)} ${ink.muted(String(column.cards.length))}`,
-      column.width), column.width)).join(' ')));
+  lines.push(lineOf((board) => board.columns.map((column) => {
+    const active = Boolean(focus && board.slug === focus.slug
+      && column.cards.some((card) => card.ref === focus.ref));
+    const paintLabel = hueOf(column.status, ink);
+    const head = active ? ink.strong(paintLabel(column.label)) : paintLabel(column.label);
+    return padVisible(clip(`${head} ${ink.muted(String(column.cards.length))}`,
+      column.width), column.width);
+  }).join(' ')));
   for (let row = 0; row < cardRows; row++) {
     lines.push(lineOf((board) => board.columns.map((column) => {
+      const focusedAt = focus && board.slug === focus.slug
+        ? column.cards.findIndex((card) => card.ref === focus.ref)
+        : -1;
       const overflow = column.cards.length > cardRows;
+      const atEnd = overflow && focusedAt === column.cards.length - 1 && cardRows > 1;
+      const start = !overflow ? 0
+        : cardRows === 1 ? Math.max(0, focusedAt)
+          : atEnd ? column.cards.length - cardRows
+            : focusedAt >= 0 ? Math.max(0, focusedAt - (cardRows - 2)) : 0;
       const last = row === cardRows - 1;
       let cell = '';
-      if (overflow && last) {
-        cell = ink.muted(`+${column.cards.length - (cardRows - 1)} more`);
-      } else if (column.cards[row]) {
-        const card = column.cards[row];
-        const mark = card.live ? ink.accent('●') : ' ';
-        cell = `${mark}${refInk(card, ink)(card.ref)} ${card.title ?? ''}`;
+      if (overflow && last && !atEnd && !(cardRows === 1 && focusedAt >= 0)) {
+        cell = ink.muted(`+${column.cards.length - (start + cardRows - 1)} more`);
+      } else if (column.cards[start + row]) {
+        const card = column.cards[start + row];
+        const chosen = focusedAt >= 0 && card.ref === focus.ref;
+        const mark = chosen ? ink.bold(ink.accent('❯')) : card.live ? ink.accent('●') : ' ';
+        const title = chosen ? ink.bold(ink.text(card.title ?? '')) : (card.title ?? '');
+        cell = `${mark}${refInk(card, ink)(card.ref)} ${title}`;
       } else if (row === 0 && !column.cards.length) {
         cell = ink.muted(' —');
       }
@@ -826,6 +989,51 @@ export function roadmapStrip(width, maxRows, cards, ink, projects = null) {
     }).join(' ')));
   }
   return lines.map((line) => padVisible(clip(line, width), width));
+}
+
+/**
+ * The preview panel directly below the roadmap strip while a card in the strip
+ * has focus (`b` / `/board`): its full untruncated title and its description,
+ * wrapped to `width`.
+ *
+ * @param card `{ ref, title, slug, status, statusDisplay?, severity?, section?, body? }`
+ * @returns `{ lines, top, max, room }`
+ */
+export function boardPreviewLines(width, maxRows, card, ink, { top = 0, loading = false } = {}) {
+  const inner = Math.max(1, width - 2);
+  const colLabel = BOARD_COLUMNS.find(([s]) => s === columnOf(card.status))?.[1]
+    ?? card.statusDisplay ?? card.status ?? '';
+  const sev = card.severity ? String(card.severity).toLowerCase() : null;
+  const headParts = [card.ref, colLabel, sev, card.section, card.slug].filter(Boolean);
+  const fullName = `${card.ref ?? ''} ${card.title ?? ''}`.trim();
+  const titleRows = wordWrap(fullName, inner).map((line) => ` ${ink.bold(ink.text(line))}`);
+  const rawBody = card.body !== undefined && card.body !== null ? String(card.body).trim() : null;
+  const descRows = rawBody
+    ? wordWrap(rawBody, inner).map((line) => (line ? ` ${line}` : ''))
+    : [ink.muted(loading ? ' reading description…' : ' no description')];
+  const allRows = [...titleRows, ...descRows];
+  const maxBody = Math.max(2, maxRows - 3);
+  const room = Math.max(2, Math.min(maxBody, allRows.length));
+  const max = Math.max(0, allRows.length - room);
+  const at = Math.min(Math.max(0, top), max);
+  const shown = allRows.slice(at, at + room);
+  const where = max > 0 ? ` · ${at + 1}–${at + shown.length} of ${allRows.length}` : '';
+  const footer = keyList(
+    ['←→↑↓ move', ...(max > 0 ? ['space/PgDn scroll'] : []), 'p plan', 'd develop', 'v full card', 'esc sessions'],
+    '',
+    inner,
+    ink,
+  );
+  return {
+    lines: windowLines(
+      { width, height: room + 3 },
+      { title: `${headParts.join(' · ')}${where}`, body: shown, footer, focused: true },
+      ink,
+    ),
+    top: at,
+    max,
+    room,
+  };
 }
 
 /** A column's cards: its issues first, most severe first, then its roadmap cards, each in the order given. */

@@ -73,6 +73,18 @@ export async function fakePlatform({
   shield = null,
   gateDecision = null,
   /**
+   * R604: what a person answered at each SHOW gate, in order — `{ state,
+   * reason }`. The last one repeats. Beats `gateDecision` when given.
+   */
+  gateDecisions = null,
+  /** R604: the claim's `rework` and `showComments`. */
+  rework = [],
+  showComments = null,
+  /** R604: the sentence the platform refuses a screenshot with, or null to accept. */
+  refuseAttachments = null,
+  /** R604: a gate that cannot be raised answers 500. */
+  gateBroken = false,
+  /**
    * R40's finish rules, as the claim carries them — R155 needs them.
    *
    * Null is a platform older than R40, which the daemon handles by doing
@@ -120,6 +132,8 @@ export async function fakePlatform({
   sonarBranches = null,
   /** R587: the project's declared version files, as the claim says them. */
   versionFiles = [],
+  /** R318: the findings the claim asks the daemon to prove fixed. */
+  findingsToProve = [],
   /**
    * R346: what `GET …/work-item-branches` answers. Null falls through to the
    * catch-all's `{}` — the shape of a platform older than R346, which the
@@ -180,6 +194,9 @@ export async function fakePlatform({
   const stageCalls = [];
   /** R112: the approvals it raised at a gate. */
   const gates = [];
+  /** R604: the files PUT, in order, and the manifests POSTed to seal a round. */
+  const uploads = [];
+  const sealed = [];
   /** R108: the briefings it saved. */
   const briefings = [];
   /** R110: what it said the shield stopped. */
@@ -281,6 +298,7 @@ export async function fakePlatform({
           sonarUrl,
           sonarBranches,
           versionFiles,
+          findingsToProve,
           allowDirty,
           resume,
           mcpServers,
@@ -292,6 +310,8 @@ export async function fakePlatform({
           brief,
           rules,
           releaseWrites,
+          rework,
+          showComments,
         }));
       }
       // R155. What the machine found when it merged, and what it left behind.
@@ -337,7 +357,37 @@ export async function fakePlatform({
         stageCalls.push({ stage, what, body: JSON.parse(body || '{}') });
         return response.end(JSON.stringify({ stage, state: 'DONE' }));
       }
+      // R604. The daemon's door for a SHOW stage's screenshots. The real one
+      // checks the machine token; so does this, for R114's reason.
+      if (url.includes('/attachments')) {
+        if (!(request.headers.authorization ?? '').includes('cawd_')
+            || (request.headers.authorization ?? '').includes('cawdr_')) {
+          response.statusCode = 403;
+          return response.end(JSON.stringify({ message: 'This token is missing runner:operate.' }));
+        }
+        if (refuseAttachments) {
+          response.statusCode = 400;
+          return response.end(JSON.stringify({ message: refuseAttachments }));
+        }
+        if (request.method === 'PUT') {
+          const name = decodeURIComponent(url.split('/attachments/')[1]);
+          uploads.push({ name, size: Buffer.byteLength(body), contentType: request.headers['content-type'] });
+          return response.end(JSON.stringify({ name }));
+        }
+        const manifest = JSON.parse(body || '{}');
+        sealed.push(manifest);
+        return response.end(JSON.stringify({
+          round: sealed.length,
+          attachments: manifest.files.map((each, i) => ({
+            id: `shot-${sealed.length}-${i + 1}`, name: each.name, caption: each.caption,
+          })),
+        }));
+      }
       if (url.includes('/approvals') && request.method === 'POST') {
+        if (gateBroken) {
+          response.statusCode = 500;
+          return response.end(JSON.stringify({ message: 'the platform fell over' }));
+        }
         // R114 found this by running it: approvals are on `agent:ask`, which a
         // MACHINE token does not carry. The daemon raised a stage gate with
         // `config.token` and got a 403 from the real platform, while this stub
@@ -358,6 +408,10 @@ export async function fakePlatform({
       if (url.includes('/decision')) {
         // PENDING is how a test watches the daemon WAIT, which is the
         // interesting half — a stub that always answered could not show it.
+        if (gateDecisions) {
+          const n = Number(/approval-(\d+)/.exec(url)?.[1] ?? 1);
+          return response.end(JSON.stringify(gateDecisions[Math.min(n, gateDecisions.length) - 1]));
+        }
         return response.end(JSON.stringify({ state: gateDecision ?? 'PENDING' }));
       }
       if (url.endsWith('/briefing') && request.method === 'POST') {
@@ -486,6 +540,8 @@ export async function fakePlatform({
     url,
     stageCalls,
     gates,
+    uploads,
+    sealed,
     briefings,
     blocks,
     /**

@@ -364,3 +364,21 @@ test('a many-line summary (a stage gate\'s plan) is one row and a count', () => 
   assert.ok(lines.every((line) => !line.includes('\n')));
   assert.ok(!lines.some((line) => /step one/.test(line)));
 });
+
+test('R605: a SHOW gate is a show banner — a look and decide, not the permission keys', () => {
+  const said = permissionBanner({
+    approval: {
+      id: '1', toolName: 'stage:SHOW', askedAt: '2026-09-04T10:11:12Z',
+      summary: '3 screenshots to look at\n\n- **a.png** — one\n- **b.png** — two',
+      toolInput: JSON.stringify({ stage: 'SHOW', round: 1, attachments: ['a', 'b', 'c'] }),
+    },
+  }, 100, painter(3)).map(stripAnsi);
+  const all = said.join('\n');
+
+  assert.match(said[0], /^ show  waiting for you — 3 screenshots, round 1$/);
+  assert.match(all, /a look and decide/);
+  assert.match(all, /\/accept/);
+  assert.match(all, /\/comments/);
+  assert.doesNotMatch(all, /y once|s session|n refuse/);
+  assert.doesNotMatch(all, /one/, 'the captions are not drawn here');
+});

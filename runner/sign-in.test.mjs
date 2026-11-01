@@ -258,3 +258,40 @@ test('an unreadable or half-written store is "not signed in", not a crash', asyn
     await clearSession('http://localhost:8091');
   });
 });
+
+test('requestBytes returns the bytes, sends the cookie, and a 401 ends a signed-in session as request does', async (t) => {
+  const seenCookies = [];
+  const server = createServer((request, response) => {
+    seenCookies.push(request.headers.cookie ?? '');
+    if (request.url === '/png') {
+      response.writeHead(200, { 'content-type': 'image/png' });
+      response.end(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 255]));
+    } else if (request.url === '/moved') {
+      response.writeHead(302, { location: 'http://elsewhere.invalid/x' });
+      response.end();
+    } else {
+      response.writeHead(401, { 'content-type': 'application/json' });
+      response.end('{"message":"sign in"}');
+    }
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => server.close());
+
+  const session = new Session(`http://127.0.0.1:${server.address().port}`);
+  session.cookies.set('SESSION', 'abc');
+  session.email = 'dali@cawdev.test';
+  let told = 0;
+  session.onExpired = () => told++;
+
+  const bytes = await session.requestBytes('/png');
+  assert.ok(Buffer.isBuffer(bytes));
+  assert.deepEqual([...bytes], [0x89, 0x50, 0x4e, 0x47, 0, 255]);
+  assert.match(seenCookies[0], /SESSION=abc/);
+
+  await assert.rejects(session.requestBytes('/moved'), 'a redirect is not followed');
+
+  await assert.rejects(session.requestBytes('/nope'), (failure) => failure.status === 401);
+  assert.equal(session.signedIn, false);
+  assert.equal(told, 1);
+});

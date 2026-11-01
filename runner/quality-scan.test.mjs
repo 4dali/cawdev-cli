@@ -111,11 +111,17 @@ writeFileSync(join(value('sonar.working.directory'), 'report-task.txt'), [
 }
 
 /** The three answers the daemon asks a SonarQube server for, and what each was asked with. */
-async function aSonarQube() {
+async function aSonarQube(answer = () => null) {
   const asked = [];
   const server = createServer((request, response) => {
     asked.push({ url: request.url, authorization: request.headers.authorization ?? null });
     response.setHeader('content-type', 'application/json');
+    // R318: a test's own answer to the finding checks comes first.
+    const own = answer(new URL(request.url, 'http://x'));
+    if (own) {
+      response.statusCode = own.status ?? 200;
+      return response.end(JSON.stringify(own.body ?? {}));
+    }
     if (request.url.startsWith('/api/ce/task')) {
       return response.end(JSON.stringify({ task: { status: 'SUCCESS', analysisId: 'analysis-1' } }));
     }
@@ -167,7 +173,7 @@ async function aSonarQube() {
 
 async function daemonWith(t, { name, quality, sonarProjectKey = 'board-key', sonarUrl = null,
     sonarBranches = null, token = 'sqp_the_machines_token', refusesBranches = false, agentWrites = false,
-    versionFiles = [], workspaceFiles = {} }) {
+    versionFiles = [], workspaceFiles = {}, findingsToProve = [], sonarAnswer }) {
   const workspace = await aRepository();
   // R587: files committed in the checkout (a package.json, say), and the
   // claim's list of which of them declare the project's version.
@@ -179,7 +185,7 @@ async function daemonWith(t, { name, quality, sonarProjectKey = 'board-key', son
     await run('git', ['add', '.'], { cwd: workspace });
     await run('git', ['commit', '-q', '-m', 'version files'], { cwd: workspace });
   }
-  const sonar = await aSonarQube();
+  const sonar = await aSonarQube(sonarAnswer);
   const platform = await fakePlatform({
     offers: [CODING],
     workflow: TEST_THEN_MEMORY,
@@ -188,6 +194,7 @@ async function daemonWith(t, { name, quality, sonarProjectKey = 'board-key', son
     sonarUrl: sonarUrl ?? sonar.url,
     sonarBranches,
     versionFiles,
+    findingsToProve,
   });
   const home = await mkdtemp(join(tmpdir(), 'cawdev-quality-cfg-'));
   const scanner = await aStubScanner(home, { refusesBranches });
@@ -588,4 +595,142 @@ test('R587: a scratch project scan carries it too', async (t) => {
   assert.ok(await untilStageBegan(platform, 'MEMORY'), said());
   const [invocation] = await invocations();
   assert.equal(versionArg(invocation), '-Dsonar.projectVersion=1.2.3');
+});
+
+// --- R318: the fix proves itself ---------------------------------------------
+
+const A_BUG = {
+  entryId: 'card-1', key: 'AZQold', type: 'BUG', rule: 'java:S2871',
+  path: 'src/main/java/RunService.java', lineHash: 'h-old',
+};
+
+/** The issue search a branch check makes: the rule in the file, on the branch. */
+const issuesFor = (issues) => (url) => {
+  if (!url.pathname.startsWith('/api/issues/search')) return null;
+  if (!url.searchParams.get('rules')) return null;
+  return { body: { total: issues.length, issues } };
+};
+
+test('R318: BRANCH, the finding gone: fixedKeys carries it and stillOpenKeys is empty', async (t) => {
+  const { platform, sonar, said } = await daemonWith(t, {
+    name: 'test-prove-gone', quality: {}, findingsToProve: [A_BUG], sonarAnswer: issuesFor([]),
+  });
+
+  assert.ok(await untilStageBegan(platform, 'MEMORY'), said());
+  const [reading] = platform.qualityReports;
+  assert.deepEqual(reading.fixedKeys, ['AZQold']);
+  assert.deepEqual(reading.stillOpenKeys, []);
+  const asked = sonar.asked.find((each) => each.url.includes('/api/issues/search')).url;
+  assert.match(asked, /components=board-key%3Asrc%2Fmain%2Fjava%2FRunService\.java/);
+  assert.match(asked, /rules=java%3AS2871/);
+  assert.match(asked, /branch=r1-work/);
+  assert.match(said(), /fixed 1 · still reported 0/);
+});
+
+test('R318: BRANCH, same rule and file with the same line hash: still reported', async (t) => {
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-prove-same-hash', quality: {}, findingsToProve: [A_BUG],
+    sonarAnswer: issuesFor([{ key: 'AZQnew', hash: 'h-old' }]),
+  });
+
+  assert.ok(await untilStageBegan(platform, 'MEMORY'), said());
+  const [reading] = platform.qualityReports;
+  assert.deepEqual(reading.stillOpenKeys, ['AZQold']);
+  assert.deepEqual(reading.fixedKeys, []);
+});
+
+test('R318: BRANCH, same rule and file but a different line hash: fixed', async (t) => {
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-prove-other-hash', quality: {}, findingsToProve: [A_BUG],
+    sonarAnswer: issuesFor([{ key: 'AZQother', hash: 'h-different' }]),
+  });
+
+  assert.ok(await untilStageBegan(platform, 'MEMORY'), said());
+  assert.deepEqual(platform.qualityReports[0].fixedKeys, ['AZQold']);
+});
+
+test('R318: a finding with no hash falls back to the rule in the file', async (t) => {
+  const { platform, said } = await daemonWith(t, {
+    name: 'test-prove-no-hash', quality: {}, findingsToProve: [{ ...A_BUG, lineHash: null }],
+    sonarAnswer: issuesFor([{ key: 'AZQother', hash: 'whatever' }]),
+  });
+
+  assert.ok(await untilStageBegan(platform, 'MEMORY'), said());
+  assert.deepEqual(platform.qualityReports[0].stillOpenKeys, ['AZQold']);
+});
+
+test('R318: a server that answers 400 to `components` is asked again with `componentKeys`', async (t) => {
+  const { platform, sonar, said } = await daemonWith(t, {
+    name: 'test-prove-older-server', quality: {}, findingsToProve: [A_BUG],
+    sonarAnswer: (url) => {
+      if (!url.pathname.startsWith('/api/issues/search') || !url.searchParams.get('rules')) return null;
+      return url.searchParams.has('components')
+        ? { status: 400, body: {} }
+        : { body: { total: 1, issues: [{ key: 'AZQnew', hash: 'h-old' }] } };
+    },
+  });
+
+  assert.ok(await untilStageBegan(platform, 'MEMORY'), said());
+  assert.deepEqual(platform.qualityReports[0].stillOpenKeys, ['AZQold']);
+  assert.ok(sonar.asked.some((each) => each.url.includes('componentKeys=')));
+});
+
+test('R318: MAIN asks for the key itself: unresolved is still reported, resolved is fixed', async (t) => {
+  const stillThere = await daemonWith(t, {
+    name: 'test-prove-main-open', quality: { whenBranchesRefused: 'main' }, sonarBranches: 'REFUSED',
+    findingsToProve: [A_BUG],
+    sonarAnswer: (url) => url.searchParams.get('issues') === 'AZQold'
+      ? { body: { issues: [{ key: 'AZQold', status: 'OPEN' }] } } : null,
+  });
+  assert.ok(await untilStageBegan(stillThere.platform, 'MEMORY'), stillThere.said());
+  assert.equal(stillThere.platform.qualityReports[0].analysedAs, 'MAIN');
+  assert.deepEqual(stillThere.platform.qualityReports[0].stillOpenKeys, ['AZQold']);
+
+  const resolved = await daemonWith(t, {
+    name: 'test-prove-main-resolved', quality: { whenBranchesRefused: 'main' }, sonarBranches: 'REFUSED',
+    findingsToProve: [A_BUG],
+    sonarAnswer: (url) => url.searchParams.get('issues') === 'AZQold'
+      ? { body: { issues: [{ key: 'AZQold', status: 'RESOLVED', resolution: 'FIXED' }] } } : null,
+  });
+  assert.ok(await untilStageBegan(resolved.platform, 'MEMORY'), resolved.said());
+  assert.deepEqual(resolved.platform.qualityReports[0].fixedKeys, ['AZQold']);
+});
+
+test('R318: PROJECT looks for the rule in the file under the scratch key', async (t) => {
+  const { platform, sonar, said } = await daemonWith(t, {
+    name: 'test-prove-project', quality: { whenBranchesRefused: 'project' }, sonarBranches: 'REFUSED',
+    agentWrites: true, findingsToProve: [A_BUG],
+    sonarAnswer: issuesFor([{ key: 'AZQscratch', hash: 'h-old' }]),
+  });
+
+  assert.ok(await untilStageBegan(platform, 'MEMORY'), said());
+  const [reading] = platform.qualityReports;
+  assert.equal(reading.analysedAs, 'PROJECT');
+  assert.deepEqual(reading.stillOpenKeys, ['AZQold']);
+  const asked = sonar.asked.find((each) => each.url.includes('rules=')).url;
+  assert.match(asked, /components=board-key%3Abranch%3Ar1-work-[0-9a-f]{6}%3Asrc/);
+  assert.ok(!asked.includes('branch=r1-work&') && !/[?&]branch=/.test(asked), asked);
+});
+
+test('R318: a hotspot is searched through files= and filtered on its rule key', async (t) => {
+  const hotspot = { entryId: 'card-1', key: 'AZQhot', type: 'HOTSPOT', rule: 'java:S5443', path: 'src/Tmp.java', lineHash: null };
+  const { platform, sonar, said } = await daemonWith(t, {
+    name: 'test-prove-hotspot', quality: {}, findingsToProve: [hotspot],
+    sonarAnswer: (url) => url.pathname.startsWith('/api/hotspots/search') && url.searchParams.get('files')
+      ? { body: { paging: { total: 2 }, hotspots: [{ key: 'x', ruleKey: 'java:S1' }, { key: 'y', ruleKey: 'java:S5443' }] } }
+      : null,
+  });
+
+  assert.ok(await untilStageBegan(platform, 'MEMORY'), said());
+  assert.deepEqual(platform.qualityReports[0].stillOpenKeys, ['AZQhot']);
+  assert.ok(sonar.asked.some((each) => each.url.includes('files=src%2FTmp.java')));
+});
+
+test('R318: nothing to prove sends neither field and asks the server nothing more', async (t) => {
+  const { platform, sonar, said } = await daemonWith(t, { name: 'test-prove-none', quality: {} });
+
+  assert.ok(await untilStageBegan(platform, 'MEMORY'), said());
+  const [reading] = platform.qualityReports;
+  assert.ok(!('fixedKeys' in reading) && !('stillOpenKeys' in reading), JSON.stringify(reading));
+  assert.ok(!sonar.asked.some((each) => each.url.includes('rules=')));
 });

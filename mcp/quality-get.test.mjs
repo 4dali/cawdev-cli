@@ -281,3 +281,25 @@ test('connected but never read is said as that, not as a clean bill', async (t) 
 
   assert.match(text, /^Default branch: connected to SonarQube, but nothing has read it yet/m);
 });
+
+test('R318: a branch reading says in words whether the card\'s finding is still reported', async (t) => {
+  const withFindings = (findings, counts = {}) => ({
+    ...A_READING,
+    branch: { ...A_READING.branch, reading: { ...A_READING.branch.reading, ...counts, findings } },
+  });
+  const finding = (verdict) => ({
+    key: 'AZQ1', rule: 'java:S2871', path: 'src/main/java/dev/caw/RunService.java', type: 'BUG', verdict,
+  });
+
+  const fixed = await fakePlatform({ reading: withFindings([finding('FIXED')], { newBugs: 0, newVulnerabilities: 0 }) });
+  t.after(() => fixed.close());
+  assert.match(await callTool(fixed.url, {}), /^ {2}Fixed S2871 in RunService\.java · 0 new problems$/m);
+
+  const open = await fakePlatform({ reading: withFindings([finding('STILL_OPEN')], { newBugs: 1, newVulnerabilities: 0 }) });
+  t.after(() => open.close());
+  assert.match(await callTool(open.url, {}), /^ {2}Still reported: S2871 in RunService\.java · 1 new bug$/m);
+
+  const none = await fakePlatform({ reading: withFindings([]) });
+  t.after(() => none.close());
+  assert.doesNotMatch(await callTool(none.url, {}), /Still reported|Fixed S/);
+});

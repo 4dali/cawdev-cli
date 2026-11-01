@@ -30,8 +30,10 @@ import { asker, askOne, mintForThisMachine, setUpThisMachine } from './bootstrap
 import { liveSockets, probeSocket, socketPathFor } from './control.mjs';
 import {
   addProject, addWorkspace, readConfigFile, reloadIfRunning, removeProject, setAcceptsRulesFromConsole,
-  setMaxPlanningRuns, setQuality, setAgentEnabled, thisRunnerId,
+  setMaxPlanningRuns, setQuality, setAgentEnabled, thisRunnerId, pathsOf,
 } from './configure.mjs';
+import { cardsFrom, importCards, projectFor, resultLines } from './card-import.mjs';
+import { absolute, expandHome } from './paths.mjs';
 import { restartNeededFor, runnerNameOf } from '../lib/runner-config.mjs';
 import { Select } from './select.mjs';
 import { storedSession } from './sign-in.mjs';
@@ -71,6 +73,16 @@ const USAGE = `
                                          SonarQube after a run's TEST stage
   cawdev config planning-limit <n>       how many planning runs (PLAN, SCOPE, AUDIT, REVIEW) run here at once; 0 is no limit
   cawdev config show                     this machine's config, token redacted
+
+  cawdev import <file.json>              file the cards of a JSON file: a list
+                                         of {title, body, severity, tags, …},
+                                         or {"cards": [...]}. Checks first, then
+                                         asks. --project <slug> (else the
+                                         checkout you stand in), --status <S>
+                                         where cards naming none land,
+                                         --dry-run to only check, --yes to not ask.
+                                         A card whose title is taken is skipped;
+                                         --allow-duplicates files it anyway
 
   On a machine with no config, cawdev sets one up: it signs you in through the
   browser, asks which projects this machine should run agents for, clones them,
@@ -568,6 +580,58 @@ export async function runAction([verb, ...rest], { configPath, file, url, sessio
   throw new Error(`Not a cawdev config command: ${verb}. See cawdev --help.`);
 }
 
+/**
+ * `cawdev import <file>` — the cards of a JSON file, filed as you. A dry run
+ * goes first and is shown, so what would be refused is read before anything
+ * is written; then it asks, unless `--yes`. Running it twice files the cards
+ * twice, which is why it asks.
+ */
+export async function runImport(args, ink, { cwd = process.cwd(), say = (line) => console.log(line) } = {}) {
+  const takesValue = new Set(['--project', '--status', '--config', '--url', '--runner']);
+  const path = args.find((arg, at) => !arg.startsWith('--') && !takesValue.has(args[at - 1]));
+  if (!path) {
+    throw new Error('Name the file: cawdev import <file.json> [--project <slug>] [--dry-run]');
+  }
+  const cards = cardsFrom(await readFile(resolve(cwd, expandHome(path)), 'utf8').catch((failure) => {
+    throw new Error(`Could not read ${path}: ${failure.message}`);
+  }));
+
+  const configPath = await findConfig(args, process.env, cwd);
+  const file = configPath ? await readConfigFile(configPath) : null;
+  const slug = valueOf(args, '--project') ?? projectFor(file?.projects, cwd, { pathsOf, absolute });
+  if (!slug) {
+    throw new Error('Which project? Name it: cawdev import <file.json> --project <slug>');
+  }
+  const session = await storedSession(signInUrl(file, args));
+  if (!session.signedIn) {
+    throw new Error('Not signed in on this machine. Run `cawdev` and /login, or `cawdev --setup`.');
+  }
+  const status = valueOf(args, '--status') ?? undefined;
+  const allowDuplicates = args.includes('--allow-duplicates');
+
+  say(`  ${ink.muted(`${path}: ${cards.length} card${cards.length === 1 ? '' : 's'}, checking against ${slug}…`)}`);
+  const checked = await importCards(session, slug, cards, { dryRun: true, status, allowDuplicates });
+  for (const line of resultLines(checked, slug, ink)) say(line);
+  if (args.includes('--dry-run') || !checked.filed?.length) {
+    return checked;
+  }
+  if (!args.includes('--yes')) {
+    const ask = asker();
+    try {
+      const answer = (await ask.line(`  File ${checked.filed.length} on ${slug}? [y/N] `)).trim();
+      if (!/^y(es)?$/i.test(answer)) {
+        say(`  ${ink.muted('Nothing filed.')}`);
+        return checked;
+      }
+    } finally {
+      ask.close();
+    }
+  }
+  const done = await importCards(session, slug, cards, { status, allowDuplicates });
+  for (const line of resultLines(done, slug, ink)) say(line);
+  return done;
+}
+
 /** The config as somebody would want to read it back — never the secret. */
 export function printConfig(file, ink, say) {
   const shown = { ...file };
@@ -589,6 +653,11 @@ async function main() {
 
   if (argv[0] === 'config') {
     await runConfig(argv.slice(1), ink);
+    return;
+  }
+
+  if (argv[0] === 'import') {
+    await runImport(argv.slice(1), ink);
     return;
   }
 

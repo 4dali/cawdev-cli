@@ -14,7 +14,7 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-  access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile,
+  access, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile,
 } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -763,7 +763,7 @@ async function sayWhichServedProjectsTheTokenCannotReach(config) {
 
 // --- talking to cawdev -------------------------------------------------------
 
-async function api(config, path, { method = 'GET', body, token } = {}) {
+async function api(config, path, { method = 'GET', body, token, raw } = {}) {
   const response = await fetch(`${config.url}${path}`, {
     method,
     headers: {
@@ -777,8 +777,11 @@ async function api(config, path, { method = 'GET', body, token } = {}) {
       // could raise them for any run it has ever been offered.
       authorization: `Bearer ${token ?? config.token}`,
       ...(body ? { 'content-type': 'application/json' } : {}),
+      // R604: the raw bytes of a screenshot. The platform never reads this
+      // header; it sniffs the bytes.
+      ...(raw ? { 'content-type': 'application/octet-stream' } : {}),
     },
-    body: body ? JSON.stringify(body) : undefined,
+    body: raw ?? (body ? JSON.stringify(body) : undefined),
   });
   const text = await response.text();
   const parsed = text ? safeJson(text) : null;
@@ -2677,6 +2680,7 @@ async function scanQuality(config, run, cwd, branch) {
       const problems = (reading.newBugs ?? 0) + (reading.newVulnerabilities ?? 0)
         + (reading.newSecurityHotspots ?? 0) + (reading.newCodeSmells ?? 0);
       log(`  quality: ${branch} gate ${reading.gate ?? 'NONE'} · ${problems} new problem${problems === 1 ? '' : 's'}`
+        + (reading.fixedKeys ? ` · fixed ${reading.fixedKeys.length} · still reported ${reading.stillOpenKeys.length}` : '')
         + (reading.warning ? ` · ${reading.warning}` : ''));
     }
   };
@@ -2751,7 +2755,7 @@ async function scanQuality(config, run, cwd, branch) {
       return await reportBranchReading({
         ask: askServer, reportTask, settled, key, branch, analysedAs: 'MAIN',
         warning: "This server does not analyse branches; the branch was analysed as the project's main analysis.",
-        headSha, report,
+        headSha, report, findings: run.findingsToProve,
       });
     }
 
@@ -2795,7 +2799,10 @@ async function scanQuality(config, run, cwd, branch) {
     const reportTask = parseProperties(await readFile(join(workDir, 'report-task.txt'), 'utf8'));
     const askServer = sonarAsker((reportTask.serverUrl ?? url).replace(/\/$/, ''), token);
     const settled = await waitForAnalysis(askServer, reportTask.ceTaskId, deadline, quality.timeoutSeconds);
-    await reportBranchReading({ ask: askServer, reportTask, settled, key, branch, analysedAs, warning, headSha, report });
+    await reportBranchReading({
+      ask: askServer, reportTask, settled, key, branch, analysedAs, warning, headSha, report,
+      findings: run.findingsToProve,
+    });
   } catch (failure) {
     await report({ headSha, error: failure.message.split('\n')[0] });
   } finally {
@@ -2811,7 +2818,7 @@ function trimSlash(url) {
 }
 
 /** The gate and the new-code measures, for a BRANCH or MAIN reading — never for PROJECT, which has neither. */
-async function reportBranchReading({ ask, reportTask, settled, key, branch, analysedAs, warning, headSha, report }) {
+async function reportBranchReading({ ask, reportTask, settled, key, branch, analysedAs, warning, headSha, report, findings }) {
   const { projectStatus } = await ask(`/api/qualitygates/project_status?analysisId=${encodeURIComponent(settled.analysisId)}`);
   const metrics = 'new_bugs,new_vulnerabilities,new_security_hotspots,new_code_smells,new_coverage';
   const { component } = await ask(`/api/measures/component?component=${encodeURIComponent(key)}`
@@ -2838,7 +2845,78 @@ async function reportBranchReading({ ask, reportTask, settled, key, branch, anal
     newCoverage: measure('new_coverage'),
     dashboardUrl: reportTask.dashboardUrl ?? null,
     warning,
+    ...(await proveFindings({ ask, scanKey: key, branch, analysedAs, findings })),
   });
+}
+
+/**
+ * R318: asks the server whether each finding a fix card was filed from
+ * (`run.findingsToProve`, sent with the claim) is still reported on the tree
+ * just scanned. Returns `{ fixedKeys, stillOpenKeys }`, or `{}` when the claim
+ * named none — then neither field is sent and no request is made, which is
+ * also what a platform older than R318 gets.
+ *
+ * SonarQube gives an issue a NEW key when it copies it onto a branch, so the
+ * finding's own key finds nothing there and a lookup by it would call every
+ * finding fixed. On a BRANCH or PROJECT reading the match is the rule in the
+ * file, narrowed to the line's `hash` when the finding has one (lines move;
+ * the hash of a line's text does not). Without a hash it errs one way only:
+ * another issue of the same rule in that file reads as "still reported". On a
+ * MAIN reading the analysis IS the project's main one, so the key is valid.
+ *
+ * Anything thrown lands in `scanQuality`'s catch and becomes an error
+ * reading, which carries no verdict.
+ */
+async function proveFindings({ ask, scanKey, branch, analysedAs, findings }) {
+  if (!Array.isArray(findings) || findings.length === 0) return {};
+  const fixedKeys = [];
+  const stillOpenKeys = [];
+  const enc = encodeURIComponent;
+  const onBranch = analysedAs === 'BRANCH' ? `&branch=${enc(branch)}` : '';
+  for (const finding of findings) {
+    const hotspot = finding.type === 'HOTSPOT';
+    let open;
+    if (analysedAs === 'MAIN') {
+      open = hotspot ? await hotspotStillToReview(ask, finding.key) : await issueStillUnresolved(ask, finding.key);
+    } else if (hotspot) {
+      const found = await pagedSearch(ask,
+        `/api/hotspots/search?projectKey=${enc(scanKey)}${finding.path ? `&files=${enc(finding.path)}` : ''}`
+        + `&status=TO_REVIEW${onBranch}`, 'hotspots');
+      open = found.some((each) => each.ruleKey === finding.rule);
+    } else {
+      const component = finding.path ? `${scanKey}:${finding.path}` : scanKey;
+      const query = (parameter) => `/api/issues/search?${parameter}=${enc(component)}`
+        + `&rules=${enc(finding.rule)}&resolved=false${onBranch}`;
+      let found;
+      try {
+        found = await pagedSearch(ask, query('components'), 'issues');
+      } catch (failure) {
+        // Servers before 10.2 know only `componentKeys`.
+        if (!/answered 400/.test(failure.message)) throw failure;
+        found = await pagedSearch(ask, query('componentKeys'), 'issues');
+      }
+      open = finding.lineHash ? found.some((each) => each.hash === finding.lineHash) : found.length > 0;
+    }
+    (open ? stillOpenKeys : fixedKeys).push(finding.key);
+  }
+  return { fixedKeys, stillOpenKeys };
+}
+
+/** MAIN: the key is valid. Open while it comes back unresolved; purged (not returned) is fixed. */
+async function issueStillUnresolved(ask, key) {
+  const body = await ask(`/api/issues/search?issues=${encodeURIComponent(key)}`);
+  return (body.issues ?? []).some((each) => each.key === key && !each.resolution);
+}
+
+/** MAIN, hotspot: open while TO_REVIEW; a 404 is a hotspot the server no longer has. */
+async function hotspotStillToReview(ask, key) {
+  try {
+    const body = await ask(`/api/hotspots/show?hotspot=${encodeURIComponent(key)}`);
+    return body.status === 'TO_REVIEW';
+  } catch (failure) {
+    if (/answered 404/.test(failure.message)) return false;
+    throw failure;
+  }
 }
 
 /**
@@ -2942,6 +3020,9 @@ async function scanAsScratchProject({ quality, run, cwd, branch, key, url, token
   }
   const newSecurityHotspots = hotspots.filter((hotspot) => counted(hotspot.component, hotspot.line)).length;
 
+  const proven = await proveFindings({
+    ask, scanKey: scratchKey, branch, analysedAs: 'PROJECT', findings: run.findingsToProve });
+
   await report({
     headSha,
     gate: 'NONE',
@@ -2954,6 +3035,7 @@ async function scanAsScratchProject({ quality, run, cwd, branch, key, url, token
     dashboardUrl: reportTask.dashboardUrl ?? null,
     warning: 'This server does not analyse branches; the branch was analysed as its own SonarQube project, '
       + 'counting problems on the lines it changed. No gate was computed.',
+    ...proven,
   });
 }
 
@@ -5568,11 +5650,17 @@ async function reportUsageLimit(config, run, limit, lastText) {
  * nothing for the session that was asking. One function for both paths now,
  * so they cannot come apart again.
  */
-function argsBefore(agentArgs, { listOnly = false } = {}) {
+function argsBefore(agentArgs, { listOnly = false, dropMode = false } = {}) {
   const kept = [];
   for (let i = 0; i < agentArgs.length; i++) {
     if (agentArgs[i] === '--allowedTools') {
       break; // variadic: everything after it is a permission
+    }
+    // R604. SHOW drops the MODE and keeps the prompt tool: nothing is allowed
+    // by a mode, so whatever the list does not name reaches a person.
+    if (dropMode && agentArgs[i] === '--permission-mode') {
+      i += 1;
+      continue;
     }
     if (listOnly && (agentArgs[i] === '--permission-mode'
         || agentArgs[i] === '--permission-prompt-tool')) {
@@ -5755,11 +5843,32 @@ function stagePrompt(stage, carried, hasPlan = true) {
         + 'to hide. ' + WAIT_FOR_COMMANDS + ' Then commit the branch\'s changes — no stage '
         + 'after this one writes code, and work left uncommitted is work nothing can push. '
         + DONE_WHEN_TICK,
+    // R604. The folder is the daemon's, the captions are the person's reading
+    // guide, and the tree check afterwards is why "change nothing else" is a
+    // fact and not a request.
+    SHOW: 'SHOW THE PERSON what was built, before a pull request is proposed. Write 1 to 8 '
+      + 'files into `.cawdev/shots/` — a PNG or JPEG of the real screen, taken with the '
+      + 'repository\'s own Playwright, or with Claude in Chrome when you have it; or, when '
+      + 'neither can run here, a STATIC, self-contained HTML mock (no scripts, no external '
+      + 'URLs, inline CSS, images as `data:` URIs). Then write `.cawdev/shots/shots.json` as '
+      + '`[{"file": "name.png", "caption": "what to look at"}]`, one caption per file. Each '
+      + 'file must be 2 MB or smaller. CHANGE NOTHING ELSE and do not commit: the stage fails, '
+      + 'naming the paths, if the tree changes outside that folder (build output that is not '
+      + 'gitignored counts). Start the app in the background, take the shots, then STOP every '
+      + 'background command and READ its final output before you end the turn — a command left '
+      + 'running fails the stage. ' + WAIT_FOR_COMMANDS,
     MEMORY: 'Write what the NEXT session on this branch needs to know: what was done, what was '
       + 'tried and rejected and why, and anything that turned out to matter and would not be '
       + 'obvious from the diff. Be brief and concrete. This is saved as this branch\'s '
       + 'briefing and handed to whoever comes next.',
   }[stage.stage] ?? `Carry out the ${stage.stage} stage.`;
+
+  // R604. A refused SHOW sends IMPLEMENT round again; the person's words lead.
+  const rework = stage.rework
+    ? `### What the person asked to change after round ${stage.rework.round}\n\n`
+      + `${stage.rework.comments}\n\nMake these changes on this branch. TEST and SHOW run again `
+      + 'after you, and the person will look at a new round of screenshots.\n\n'
+    : '';
 
   const before = [];
   for (const [name, text] of Object.entries(carried ?? {})) {
@@ -5768,7 +5877,7 @@ function stagePrompt(stage, carried, hasPlan = true) {
     }
   }
 
-  return `\n\n---\n\n## This is the ${stage.stage} stage\n\n${asked}`
+  return `\n\n---\n\n## This is the ${stage.stage} stage\n\n${rework}${asked}`
     + (before.length ? `\n\n${before.join('\n\n')}` : '');
 }
 
@@ -6717,6 +6826,13 @@ function noteQueued(run, why, reported = why) {
   log(`${why}; leaving "${run.label}" queued`);
 }
 
+/** The stage a child is and the stages of its walk, by name; none on an unstaged run. */
+function stamp(child, stage, lifecycle) {
+  child.cawdevStartedAt ??= new Date().toISOString();
+  child.cawdevStage = stage?.stage ?? null;
+  child.cawdevStages = Array.isArray(lifecycle) && stage ? lifecycle.map((each) => each.stage) : null;
+}
+
 /**
  * This machine, as somebody attached to it sees it — R52.
  *
@@ -6745,6 +6861,10 @@ function snapshotRuns() {
       agent: child.cawdevAgent ?? null,
       model: child.cawdevModel ?? null,
       startedAt: child.cawdevStartedAt ?? null,
+      // The stage this child is and the walk it belongs to — a card's
+      // progress line in advanced mode (session-cards.mjs `stageWalk`).
+      stage: child.cawdevStage ?? null,
+      stages: child.cawdevStages ?? null,
     });
   }
   for (const [id, claim] of taken) {
@@ -6809,6 +6929,9 @@ async function startRun(config, offered, workspace, source = null) {
   let briefing = null;
   let plan = null;
   let lifecycle = [];
+  // R604. The stages a refused SHOW walks again, and the comments of the latest
+  // refused round when this walk begins after one.
+  let showWalk = { rework: [], comments: null };
   let shield = null;
   // R155. What `git merge` did before anything was spawned, on a MERGE run.
   let merge = null;
@@ -6877,6 +7000,8 @@ async function startRun(config, offered, workspace, source = null) {
     // R587. The project's declared version files: the scan reads the first it
     // can parse from the workspace and sends it as sonar.projectVersion.
     run.versionFiles = Array.isArray(claimed.versionFiles) ? claimed.versionFiles : [];
+    // R318: the findings the card was filed from, for the scan to prove fixed.
+    run.findingsToProve = Array.isArray(claimed.findingsToProve) ? claimed.findingsToProve : [];
     // R69. Whether this is the same conversation picked back up, and which one.
     // Null on an ordinary claim, which is nearly all of them.
     resume = claimed.resume ?? null;
@@ -6921,6 +7046,10 @@ async function startRun(config, offered, workspace, source = null) {
     // one. Read here with everything else the claim carries.
     plan = claimed.plan ?? null;
     lifecycle = Array.isArray(claimed.workflow) ? claimed.workflow : [];
+    showWalk = {
+      rework: Array.isArray(claimed.rework) ? claimed.rework : [],
+      comments: claimed.showComments ?? null,
+    };
     shield = claimed.shield ?? null;
     // R562. Every session is told the list up front, whichever profile it is.
     run.protectedLine = protectedLine(protectedPolicy(shield));
@@ -7084,7 +7213,7 @@ async function startRun(config, offered, workspace, source = null) {
     }
 
     const said = await walkLifecycle(config, run, runToken, cwd, baseCommit, workspace,
-        resume, mcpServers, expertAgents, skills, instincts, briefing, plan, lifecycle, shield);
+        resume, mcpServers, expertAgents, skills, instincts, briefing, plan, lifecycle, shield, showWalk);
 
     if (merge) {
       // R155. The session has gone. Whether it resolved anything is a question
@@ -7198,7 +7327,8 @@ async function skipRest(config, run, lifecycle, from, why) {
 }
 
 async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, resume,
-    projectServers, expertAgents, skills, instincts, briefing, plan, lifecycle, shield) {
+    projectServers, expertAgents, skills, instincts, briefing, plan, lifecycle, shield,
+    show = null) {
   const spawn = (stage, carried, usage) => spawnAgent(config, run, runToken, cwd, baseCommit,
     workspace, resume, projectServers, expertAgents, skills, instincts, briefing, plan, lifecycle,
     shield, stage, carried, usage);
@@ -7218,6 +7348,22 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
   const carried = {};
   let last = null;
 
+  // R604. A mutable copy: a refused SHOW splices IMPLEMENT, TEST and SHOW back in
+  // after itself. Every skipRest below is passed THIS, not the claim's list.
+  const walk = [...lifecycle];
+  // The comments of a round that was refused before this walk began (the daemon
+  // died, or the run was carried on): the first IMPLEMENT leads with them, and a
+  // walk that starts later is told in `carried`.
+  if (show?.comments) {
+    const first = walk.findIndex((each) => each.stage === 'IMPLEMENT');
+    const rework = { round: show.comments.round, comments: show.comments.comments };
+    if (first === 0) {
+      walk[0] = { ...walk[0], rework };
+    } else {
+      carried[`SHOW (comments on round ${rework.round})`] = rework.comments;
+    }
+  }
+
   // R305. What the RUN has been credited with so far. Each stage is its own
   // process with its own cumulative counter, so the base the next child adds
   // to must move — read once from the claim, it stayed at zero and the platform
@@ -7233,22 +7379,32 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
   // answers without the fields and the base is zero, which is today's number.
   const stored = await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/stages`)
     .catch(() => []);
+  // R604: a stage walked again after a refused SHOW is not told again about the
+  // failure the person had already moved past.
+  const retold = new Set();
+  const credits = new Map();
   const creditedTo = (name) => {
-    const row = Array.isArray(stored) ? stored.find((each) => each?.stage === name) : null;
-    return { tokensIn: Number(row?.tokensIn) || 0, tokensOut: Number(row?.tokensOut) || 0 };
+    // R604. One per stage NAME for the whole walk: a stage walked again after
+    // a refused SHOW keeps accumulating instead of starting from the stored base.
+    if (!credits.has(name)) {
+      const row = Array.isArray(stored) ? stored.find((each) => each?.stage === name) : null;
+      credits.set(name, { tokensIn: Number(row?.tokensIn) || 0, tokensOut: Number(row?.tokensOut) || 0 });
+    }
+    return credits.get(name);
   };
 
   const storedRow = (name) => (Array.isArray(stored)
     ? stored.find((each) => each?.stage === name) : null);
 
-  for (let at = 0; at < lifecycle.length; at++) {
-    const stage = lifecycle[at];
+  walking: for (let at = 0; at < walk.length; at++) {
+    const stage = walk[at];
     // Where a carried-on run resumes, and what its DONE stages said, is the
     // platform's (R263, `WorkflowService.resumeFrom`): the claim's lifecycle
     // starts at the first stage not DONE. What only the daemon knows is WHY
     // the stage about to run stopped last time — so that is handed to it.
     const before = storedRow(stage.stage);
-    if (before?.state === 'FAILED' && before.outcome) {
+    if (before?.state === 'FAILED' && before.outcome && !retold.has(stage.stage)) {
+      retold.add(stage.stage);
       // The attempt that stopped, handed to the one about to run.
       carried[`${stage.stage} (the attempt that stopped)`] = `${before.outcome}\n\n`
         + 'This stage is being run again to finish that. Run the commands — and the agents — '
@@ -7267,6 +7423,8 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
     // loop nobody asked for.
     for (let attempt = 0; attempt < 2; attempt++) {
       await reportStage(config, run, stage.stage, 'begin');
+      // R604. What the tree looks like before SHOW, for the check after it.
+      const treeBefore = stage.stage === 'SHOW' ? await snapshotTree(cwd) : null;
       log(`  ${stage.stage}${stage.model ? ` on ${stage.model}` : ''}`
         + `${attempt ? ' (again, after the gate refused it)' : ''}`);
 
@@ -7331,7 +7489,7 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
             plan: stage.stage === 'PLAN' ? last?.text ?? null : null,
             outcome: `${why} ${last?.text ?? ''}`.trim(),
           });
-          await skipRest(config, run, lifecycle, at + 1, why);
+          await skipRest(config, run, walk, at + 1, why);
           return;
         }
 
@@ -7347,7 +7505,7 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
             plan: stage.stage === 'PLAN' ? last?.text ?? null : null,
             outcome: `${why} ${last?.text ?? ''}`.trim(),
           });
-          await skipRest(config, run, lifecycle, at + 1, why);
+          await skipRest(config, run, walk, at + 1, why);
           return;
         }
 
@@ -7381,6 +7539,84 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
         return;
       }
 
+      // R604. SHOW: judge the tree, upload, raise the gate, and report DONE
+      // only AFTER the person accepts — a daemon that died while the gate was
+      // waiting must resume at SHOW and not skip to MEMORY with nobody having
+      // decided. Never enters the two-attempt refusal path: a refusal re-walks
+      // IMPLEMENT and TEST, with no cap.
+      if (stage.stage === 'SHOW') {
+        const stray = await strayChanges(treeBefore, cwd);
+        if (stray.length) {
+          const why = strayLine(stray);
+          log(`  ${why}`);
+          await reportStage(config, run, 'SHOW', 'report', { state: 'FAILED', outcome: why });
+          await finish(config, run, 'FAILED', why);
+          return;
+        }
+        let sealed;
+        try {
+          sealed = await uploadShots(config, run, cwd);
+        } catch (refused) {
+          const why = `The SHOW stage could not hand over its screenshots: ${refused.message}`;
+          log(`  ${why}`);
+          await reportStage(config, run, 'SHOW', 'report', { state: 'FAILED', outcome: why });
+          await finish(config, run, 'FAILED', why);
+          return;
+        }
+        const shots = sealed.attachments ?? [];
+        const summary = `${shots.length} screenshot${shots.length === 1 ? '' : 's'} to look at\n\n`
+          + shots.map((each) => `- **${each.name}** — ${each.caption ?? 'no caption'}`).join('\n');
+        const decision = await awaitGate(config, run, runToken, stage, summary, {
+          toolInput: { stage: 'SHOW', round: sealed.round, attachments: shots.map((each) => each.id) },
+        });
+        if (decision.failed) {
+          // A gate that could not be raised, or whose wait broke, FAILS the stage
+          // rather than reading as a refusal: with no cap, a refusal would loop
+          // IMPLEMENT and TEST for ever on a network blip. /continue re-runs
+          // SHOW, whose new gate supersedes the stale one.
+          const why = `The SHOW gate could not be reached: ${decision.reason}`;
+          await reportStage(config, run, 'SHOW', 'report', { state: 'FAILED', outcome: why });
+          await finish(config, run, 'FAILED', why);
+          return;
+        }
+        if (decision.expired) {
+          const why = `Stopped at the SHOW gate: ${decision.reason}. Nothing was refused — start the `
+            + 'run again when somebody can look.';
+          await reportStage(config, run, 'SHOW', 'report', { state: 'SKIPPED', outcome: why });
+          await skipRest(config, run, walk, at + 1, why);
+          await finish(config, run, 'FINISHED', why, cwd);
+          return;
+        }
+        if (!decision.allowed) {
+          // Comments. The platform has already put IMPLEMENT, TEST and SHOW back
+          // to PENDING; this walks them again, the comments leading IMPLEMENT.
+          log(`  the SHOW gate was sent back with comments (round ${sealed.round}); implementing again`);
+          delete carried.IMPLEMENT;
+          delete carried.TEST;
+          delete carried.SHOW;
+          for (const key of Object.keys(carried)) {
+            if (key.startsWith('SHOW (comments on round')) delete carried[key];
+          }
+          const again = (show?.rework ?? []).map((each) => ({
+            ...each,
+            ...(each.stage === 'IMPLEMENT'
+              ? { rework: { round: sealed.round, comments: decision.reason ?? 'No comment was written.' } }
+              : {}),
+          }));
+          if (!again.length) {
+            const why = 'The SHOW gate was sent back with comments, and this platform did not say which '
+              + 'stages to walk again. Continue the run to start over from IMPLEMENT.';
+            await finish(config, run, 'FAILED', why);
+            return;
+          }
+          walk.splice(at + 1, 0, ...again);
+          continue walking;
+        }
+        await reportStage(config, run, 'SHOW', 'report', { state: 'DONE', outcome: summary });
+        last = { ...last, text: summary };
+        break;
+      }
+
       await reportStage(config, run, stage.stage, 'report', {
         state: 'DONE',
         // The PLAN's text IS the plan — the artefact R109 exists to store, and
@@ -7402,7 +7638,7 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
         // second stage on a plan nobody has looked at yet.
         const why = `Stopped at the ${stage.stage} gate: ${decision.reason}. Nothing was `
           + 'refused — start the run again when somebody can read it.';
-        await skipRest(config, run, lifecycle, at + 1, why);
+        await skipRest(config, run, walk, at + 1, why);
         await finish(config, run, 'FINISHED', why, cwd);
         return;
       }
@@ -7411,7 +7647,7 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
         // The same trail R122 came from: a run that ends here never reaches the
         // stages after it, and stages left PENDING on a run that is over read
         // as a lifecycle still going.
-        await skipRest(config, run, lifecycle, at + 1, why);
+        await skipRest(config, run, walk, at + 1, why);
         await finish(config, run, 'FINISHED', why, cwd);
         return;
       }
@@ -7473,6 +7709,115 @@ async function reportStage(config, run, stage, what, body = {}) {
 }
 
 /**
+ * What the tree looked like when SHOW began — R604. Per-path content hashes of
+ * everything that differs from HEAD (tracked) and everything untracked and not
+ * ignored, so `strayChanges` can say WHICH paths a stage touched, including a
+ * file it rewrote that was already dirty.
+ */
+async function snapshotTree(cwd) {
+  const head = await git(cwd, ['rev-parse', 'HEAD']).catch(() => '');
+  const hash = async (path) => {
+    try {
+      const info = await stat(join(cwd, path));
+      if (!info.isFile()) return 'not-a-file';
+      if (info.size > 64 * 1024 * 1024) return `big:${info.size}:${info.mtimeMs}`;
+      return createHash('sha256').update(await readFile(join(cwd, path))).digest('hex');
+    } catch {
+      return 'gone';
+    }
+  };
+  // `-z`: git quotes a path with non-ASCII or special characters otherwise, and
+  // a quoted path hashes as "gone" before and after, hiding the change.
+  const lines = async (args) => (await git(cwd, args).catch(() => ''))
+    .split('\0').filter(Boolean);
+  const files = new Map();
+  for (const path of [
+    ...await lines(['diff', 'HEAD', '--name-only', '-z']),
+    ...await lines(['ls-files', '--others', '--exclude-standard', '-z']),
+  ]) {
+    files.set(path, await hash(path));
+  }
+  return { head, files };
+}
+
+/**
+ * The paths a SHOW stage changed outside `.cawdev/shots/`, and a commit if it
+ * made one — R604. The tree check is the real guard: SHOW holds a Bash that can
+ * write anywhere, and a narrowed tool list says what it was GIVEN, not what it did.
+ */
+async function strayChanges(before, cwd) {
+  const after = await snapshotTree(cwd);
+  const stray = [];
+  if (before.head !== after.head) {
+    stray.push('a commit (HEAD moved)');
+  }
+  for (const path of new Set([...before.files.keys(), ...after.files.keys()])) {
+    if (path.startsWith('.cawdev/shots/')) continue;
+    if (before.files.get(path) !== after.files.get(path)) stray.push(path);
+  }
+  return stray;
+}
+
+function strayLine(stray) {
+  const shown = stray.slice(0, 10).map((path) => `\`${path}\``).join(', ');
+  return `The SHOW stage changed the checkout outside \`.cawdev/shots/\`: ${shown}`
+    + `${stray.length > 10 ? ` and ${stray.length - 10} more` : ''}. SHOW may only write its screenshots; `
+    + 'build output that is not gitignored counts too (add it to .gitignore). Nothing was shown.';
+}
+
+/**
+ * Uploads what SHOW left and seals it as a round — R604. With the MACHINE's
+ * token: the session holds the run token and must not upload what it is judged
+ * by. Throws with the platform's own sentence on any refusal. Deletes the
+ * folder once the round is sealed.
+ */
+async function uploadShots(config, run, cwd) {
+  const dir = join(cwd, '.cawdev', 'shots');
+  let manifest;
+  try {
+    manifest = JSON.parse(await readFile(join(dir, 'shots.json'), 'utf8'));
+  } catch {
+    throw new Error('SHOW left no valid `.cawdev/shots/shots.json` — it must be a JSON list of '
+      + '{"file", "caption"}, one entry per screenshot.');
+  }
+  if (!Array.isArray(manifest) || manifest.length === 0
+      || manifest.some((each) => typeof each?.file !== 'string' || !each.file)) {
+    throw new Error('`.cawdev/shots/shots.json` must be a non-empty JSON list of '
+      + '{"file", "caption"}, one entry per screenshot.');
+  }
+  const base = `/api/projects/${run.projectSlug}/runs/${run.id}/attachments`;
+  const files = [];
+  for (const each of manifest) {
+    const name = each.file;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
+      throw new Error(`\`${name}\` is not a usable name: letters, digits, \`.\`, \`_\` and \`-\`, `
+        + 'ending .png, .jpg, .jpeg or .html.');
+    }
+    let info;
+    try {
+      info = await lstat(join(dir, name));
+    } catch {
+      throw new Error(`\`shots.json\` lists \`${name}\` and it is not in \`.cawdev/shots/\`.`);
+    }
+    if (!info.isFile()) {
+      // A symlink would be read as the machine and uploaded: only plain files.
+      throw new Error(`\`${name}\` is not a plain file in \`.cawdev/shots/\`.`);
+    }
+    if (info.size > 2 * 1024 * 1024) {
+      throw new Error(`\`${name}\` is ${(info.size / 1048576).toFixed(1)} MB; a screenshot must be `
+        + '2 MB or smaller.');
+    }
+    await api(config, `${base}/${encodeURIComponent(name)}`, {
+      method: 'PUT', raw: await readFile(join(dir, name)),
+    });
+    files.push({ name, caption: typeof each.caption === 'string' ? each.caption : null });
+  }
+  const sealed = await api(config, `${base}/rounds`, { method: 'POST', body: { files } });
+  await rm(dir, { recursive: true, force: true });
+  return sealed;
+}
+
+/**
  * Waits for a person at a gated stage — R112.
  *
  * <p>On R51's approval and NOT on a third way of waiting. That is worth the
@@ -7488,7 +7833,7 @@ async function reportStage(config, run, stage, what, body = {}) {
  * this can fail in: a gate that let the run through when the platform was down
  * would be a gate that opens under exactly the conditions nobody is watching.
  */
-async function awaitGate(config, run, runToken, stage, text) {
+async function awaitGate(config, run, runToken, stage, text, { toolInput } = {}) {
   let asked;
   try {
     asked = await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/approvals`, {
@@ -7498,14 +7843,14 @@ async function awaitGate(config, run, runToken, stage, text) {
       token: runToken,
       body: {
         toolName: `stage:${stage.stage}`,
-        toolInput: JSON.stringify({ stage: stage.stage }),
+        toolInput: JSON.stringify(toolInput ?? { stage: stage.stage }),
         summary: text?.trim()
           || `The ${stage.stage} stage finished without saying anything.`,
       },
     });
   } catch (failure) {
     log(`  could not raise the ${stage.stage} gate: ${failure.message}`);
-    return { allowed: false, reason: `the gate could not be raised (${failure.message})` };
+    return { allowed: false, failed: true, reason: `the gate could not be raised (${failure.message})` };
   }
 
   log(`  waiting at the ${stage.stage} gate`);
@@ -7538,7 +7883,7 @@ async function awaitGate(config, run, runToken, stage, text) {
       }
     } catch (failure) {
       log(`  waiting on the ${stage.stage} gate failed: ${failure.message}`);
-      return { allowed: false, reason: `waiting failed (${failure.message})` };
+      return { allowed: false, failed: true, reason: `waiting failed (${failure.message})` };
     }
   }
   return { allowed: false, expired: true, reason: 'nobody answered in time' };
@@ -7736,7 +8081,22 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   // is told about all agree. Everything else, and every process with no
   // lifecycle, gets them all.
   const readOnlyStage = Boolean(stage) && ['PLAN', 'VERIFY', 'MEMORY'].includes(stage.stage);
-  const stageExperts = readOnlyStage ? expertAgents.filter(readOnlyExpert) : expertAgents;
+  // R604. SHOW is not read-only, but it reaches only experts that cannot
+  // change anything: it has nothing to delegate that a Bash it already holds
+  // could not do, and a writer behind it would be a writer past the tree check's
+  // reading of the stage.
+  const showStage = stage?.stage === 'SHOW';
+  const stageExperts = readOnlyStage || showStage ? expertAgents.filter(readOnlyExpert) : expertAgents;
+
+  // R604. The folder SHOW writes into, kept out of git before anything can
+  // `git add -A` it, and made so the stage need not.
+  if (showStage) {
+    await excludeLocally(cwd, '.cawdev/shots');
+    // Emptied first: a SHOW that failed and was continued must not seal the
+    // files its last attempt left behind as this round.
+    await rm(join(cwd, '.cawdev', 'shots'), { recursive: true, force: true });
+    await mkdir(join(cwd, '.cawdev', 'shots'), { recursive: true });
+  }
   // R161. From `stageExperts` and NEVER from `expertAgents` — see the note
   // above; an expert a read-only stage cannot reach must not be required here.
   const cannotDelegate = readOnlyStage && expertAgents.length && !stageExperts.length
@@ -8088,8 +8448,12 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
   // has always done for the same profile spawned as one process. Without this
   // the list `toolsForStage` narrows was narrowed on paper: the mode wrote
   // files the list never named, and the prompt asked a person for the rest.
+  // R604. SHOW: no permission mode (no acceptEdits, never bypass — "allow
+  // everything" does not reach it), the prompt tool kept, and a list narrowed
+  // to the shots folder. The daemon's tree check is the real guard.
   const stageArgs = stage
-    ? [...argsBefore(agentArgs, { listOnly: !codesFreely || readOnlyStage }), '--allowedTools',
+    ? [...argsBefore(agentArgs, { listOnly: !codesFreely || readOnlyStage, dropMode: showStage }),
+      '--allowedTools',
       ...toolsForStage(stage.stage,
         withSkills(
           withDelegation(typeof profileTools === 'function' ? profileTools(run) : profileTools,
@@ -8102,7 +8466,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
         // handed is read-only — which `stageExperts` guarantees above.
         // R150. And a PLAN stage keeps `roadmap_create` when the run has no
         // card to plan, because writing it is the first thing it has to do.
-        { delegatesReadOnly: readOnlyStage && stageExperts.length > 0,
+        { delegatesReadOnly: (readOnlyStage || showStage) && stageExperts.length > 0,
           writesItsOwnCard: writesItsOwnCard(run) })]
     : null;
 
@@ -8154,6 +8518,7 @@ async function spawnAgent(config, run, runToken, cwd, baseCommit, workspace, res
     // `init` (below), which is also the only answer when none was asked.
     child.cawdevAgent = 'claude';
     child.cawdevModel = model ?? null;
+    stamp(child, stage, lifecycle);
     // The checkout this child holds, and what the queue serialises on. Null for
     // a run that took none, which is what lets an ASK session run alongside
     // three coding ones.
@@ -9262,6 +9627,7 @@ async function spawnAntigravity(config, run, runToken, cwd, baseCommit, resume, 
     child.cawdevProjectSlug = run.projectSlug;
     child.cawdevAgent = 'agy';
     child.cawdevModel = run.model ?? null;
+    stamp(child, stage, lifecycle);
     // The existing cancellation sweep (`reapCancelled`) reads this map by
     // run id and SIGTERMs whatever is in it — true for any child, so a
     // cancelled Antigravity run stops exactly the way a cancelled Claude
@@ -9608,6 +9974,7 @@ async function spawnCodex(config, run, runToken, cwd, baseCommit, resume, projec
     child.cawdevProjectSlug = run.projectSlug;
     child.cawdevAgent = 'codex';
     child.cawdevModel = model ?? null;
+    stamp(child, stage, lifecycle);
     // `reapCancelled` SIGTERMs whatever is here, whichever CLI it is.
     running.set(run.id, child);
 

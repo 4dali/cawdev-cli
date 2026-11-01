@@ -67,6 +67,18 @@ async function firstMessage(path, timeout = 8000) {
   throw last ?? new Error('nothing arrived on the socket');
 }
 
+/**
+ * R596: the socket's hello and the daemon's first heartbeat are not ordered, and
+ * a slow Linux runner delivers the hello first. Poll for the call instead of
+ * reading `seen` the instant the hello arrives (up to five seconds).
+ */
+async function untilSeen(platform, word) {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline && !platform.seen.some((call) => call.includes(word))) {
+    await new Promise((done) => setTimeout(done, 100));
+  }
+}
+
 test('the daemon registers, offers a socket, and says what it is', async (t) => {
   const platform = await fakePlatform();
   const directory = await mkdtemp(join(tmpdir(), 'cawdev-boot-'));
@@ -117,6 +129,7 @@ test('the daemon registers, offers a socket, and says what it is', async (t) => 
   assert.doesNotMatch(said, /does not accept --permission-prompt-tool/);
 
   assert.ok(platform.seen.includes('POST /api/runners'), platform.seen.join(', '));
+  await untilSeen(platform, 'heartbeat');
   assert.ok(platform.seen.some((call) => call.includes('heartbeat')), platform.seen.join(', '));
 });
 

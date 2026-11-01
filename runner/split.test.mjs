@@ -15,8 +15,8 @@ import { Attached } from './attach.mjs';
 import { History } from './input.mjs';
 import { loadPrefs } from './prefs.mjs';
 import {
-  MIN_ZONE_WIDTH, PROMPT_ROWS, actionsFor, branchForTask, carriesOnHere, composeFrame, parseNew,
-  roadmapStrip, builtNothing, commandWords, wordsText, subtitleFor, cardTitleFor, modelLabel, agentModelFor, sessionTag, splitLayout, tabsLine, tailOf, titleFor, toneFor, visibleSessions, windowLines,
+  MIN_ZONE_WIDTH, PROMPT_ROWS, actionsFor, batchStartedLines, boardPreviewLines, branchForTask, carriesOnHere, composeFrame, moveInStrip, parseNew,
+  roadmapStrip, builtNothing, commandWords, wordsText, stripColumns, subtitleFor, cardTitleFor, modelLabel, agentModelFor, sessionTag, splitLayout, tabsLine, tailOf, titleFor, toneFor, visibleSessions, windowLines,
   readerFrame, wordsIn,
 } from './split.mjs';
 
@@ -176,6 +176,21 @@ test('an ended plan offers its development; an ended dev offers the pull request
   assert.equal(actionsFor({ ended: true, view: { profile: 'CODE', state: 'FAILED', branch: 'r3-x' } }), '/close');
 });
 
+test('a finished development on a card offers /review, and /drop is the command alone', () => {
+  const dev = {
+    ended: true,
+    commits: 3,
+    view: {
+      profile: 'CODE', state: 'FINISHED', entryRef: 'R12', branch: 'r12-pay',
+      prUrl: 'https://github.com/benmoez/saasng/pull/369', workspace: '/home/ben/dev/cawdev-workspaces/saasng-auto-2',
+    },
+  };
+  assert.equal(actionsFor(dev), 'PR https://github.com/benmoez/saasng/pull/369 · /open · /review · /drop · /close');
+  assert.equal(actionsFor({ ...dev, view: { ...dev.view, entryRef: null } }),
+    'PR https://github.com/benmoez/saasng/pull/369 · /open · /drop · /close', 'no card, nothing to review');
+  assert.doesNotMatch(actionsFor({ ...dev, commits: 0 }), /\/review/, 'nothing built, nothing to review');
+});
+
 test('/new plan|dev with words is the task in words, not a card', () => {
   const one = { projects: ['saasng'] };
   assert.deepEqual(parseNew(['plan', 'add', 'a', 'CSV', 'export', '@saasng'], one),
@@ -218,6 +233,48 @@ test('/new reads a kind, a card or a question, and a project', () => {
   assert.match(parseNew(['ask'], one).error, /ask what\?/);
   assert.match(parseNew(['build', 'R3'], one).error, /no such session kind/);
   assert.match(parseNew([], one).error, /\/new plan R3/);
+});
+
+test('/new with several cards is a batch, in the order written — R606', () => {
+  const one = { projects: ['saasng'] };
+  assert.deepEqual(parseNew(['dev', 'R3', 'R5', 'i7', '@saasng'], one),
+    { kind: 'dev', slug: 'saasng', refs: ['R3', 'R5', 'i7'] });
+  assert.deepEqual(parseNew(['plan', '3,5', '@saasng'], one), { kind: 'plan', slug: 'saasng', refs: ['R3', 'R5'] });
+  assert.deepEqual(parseNew(['plan+dev', 'R3', 'R5', '@saasng'], one),
+    { kind: 'plan+dev', slug: 'saasng', refs: ['R3', 'R5'] });
+  // plan+dev is always a batch: the chain is what holds "build it, then plan the next".
+  assert.deepEqual(parseNew(['plan+dev', 'R3', '@saasng'], one), { kind: 'plan+dev', slug: 'saasng', refs: ['R3'] });
+  assert.deepEqual(parseNew(['dev', 'R3', 'R5', '--in-order', '--branch', 'r3-both', '@saasng'], one),
+    { kind: 'dev', slug: 'saasng', refs: ['R3', 'R5'], inOrder: true, branch: 'r3-both' });
+  // A sentence with a comma is still a sentence, and one card is still one card.
+  assert.deepEqual(parseNew(['dev', 'R3,', 'then', 'R5', '@saasng'], one),
+    { kind: 'dev', slug: 'saasng', text: 'R3, then R5' });
+  assert.deepEqual(parseNew(['dev', 'R3', '@saasng'], one), { kind: 'dev', slug: 'saasng', ref: 'R3' });
+
+  assert.match(parseNew(['dev', 'R3', 'R3', '@saasng'], one).error, /R3 is on the line twice/);
+  assert.match(parseNew(['plan+dev', 'an', 'idea', '@saasng'], one).error, /plan\+dev takes cards/);
+  assert.match(parseNew(['plan', 'R3', 'R5', '--in-order', '@saasng'], one).error, /for several dev cards/);
+  assert.match(parseNew(['dev', 'R3', '--in-order', '@saasng'], one).error, /for several dev cards/);
+  assert.match(parseNew(['dev', 'R3', 'R5', '--branch', 'x', '@saasng'], one).error, /names the one branch of --in-order/);
+  assert.match(parseNew(['dev', 'R3', 'R5', '--in-order', '--branch', '@saasng'], one).error, /--branch what\?/);
+  assert.equal(parseNew(['plan+dev', 'R3', 'R5'], one).needsProject, true);
+});
+
+test('what a batch did reads as both halves: what went, in order, and what was skipped', () => {
+  const started = [{ entryRef: 'R3', branch: 'r3-a' }, { entryRef: 'R5', branch: 'r3-a' }];
+  const refused = [{ ref: 'R9', reason: 'It is already being planned.' }];
+  assert.deepEqual(batchStartedLines({ kind: 'plan+dev' }, { started, refused }, 'saasng', 'codex'), [
+    'planning then building R3 → R5 on saasng with codex, one card at a time',
+    'skipped R9: It is already being planned.',
+  ]);
+  assert.deepEqual(batchStartedLines({ kind: 'plan' }, { started, refused: [] }, 'saasng'),
+    ['planning R3 → R5 on saasng, in order']);
+  assert.deepEqual(batchStartedLines({ kind: 'dev', inOrder: true }, { started, refused: [] }, 'saasng'),
+    ['building R3 → R5 on saasng, in order on r3-a']);
+  assert.deepEqual(batchStartedLines({ kind: 'dev' }, { started, refused: [] }, 'saasng'),
+    ['building R3, R5 on saasng, a branch each, queued on this machine']);
+  assert.deepEqual(batchStartedLines({ kind: 'dev' }, { started: [], refused }, 'saasng'),
+    ['nothing started on saasng', 'skipped R9: It is already being planned.']);
 });
 
 // --- the roadmap strip -----------------------------------------------------------
@@ -365,8 +422,8 @@ test('advanced mode takes the alternate screen and gives it back', async () => {
     'no auto-wrap and the wheel sent to the program — the screen holds still, as in nano');
   ui.flush();
   const frame = ui.split.screen.last.map(stripAnsi).join('\n');
-  assert.match(frame, /1 plan · running · Push notifications /);
-  assert.match(frame, /[│┃]▸ saasng +[│┃]/, 'the project on a line of its own, under the title');
+  assert.match(frame, /━ 1  PLAN  Push notifications ━+ ● running ━┓/, 'a card: its number, kind, card and status');
+  assert.match(frame, /┃ ▸ saasng +┃/, 'the project on a line of its own, under the title');
   assert.match(frame, /cawdev ▸ laptop · ben@cawdev\.test/);
 
   await ui.runCommand('/advanced-mode');
@@ -376,15 +433,19 @@ test('advanced mode takes the alternate screen and gives it back', async () => {
     'both put back before the normal screen returns');
 });
 
-test('output goes to the session\'s window, not the scrollback, and tab moves the focus', async () => {
+test('output goes to the session\'s card as one line, not the scrollback, and tab moves the focus', async () => {
   const { ui } = client();
   ui.onEvent({ type: 'runs', runs: [PLAN, DEV] });
   ui.watching = PLAN.id;
   await ui.runCommand('/advanced-mode');
   ui.onEvent({ type: 'output', runId: PLAN.id, line: { kind: 'ASSISTANT', body: 'reading the schema' } });
   assert.deepEqual(ui.pending.filter((line) => /reading the schema/.test(line)), []);
+  ui.onEvent({ type: 'output', runId: PLAN.id, line: { kind: 'TOOL', body: 'Read schema.sql' } });
+  ui.onEvent({ type: 'output', runId: PLAN.id, line: { kind: 'ASSISTANT', body: 'the schema has three tables' } });
   ui.flush();
-  assert.match(ui.split.screen.last.map(stripAnsi).join('\n'), /reading the schema/);
+  const frame = ui.split.screen.last.map(stripAnsi).join('\n');
+  assert.match(frame, /now: Read schema\.sql/, 'the last tool call, not the log');
+  assert.doesNotMatch(frame, /reading the schema|three tables/);
 
   assert.equal(ui.split.focus, PLAN.id);
   ui.onKey('\t');
@@ -408,7 +469,8 @@ test('an ended plan stays in its window, and /develop starts its card on this ma
   await settle();
   ui.flush();
   const frame = ui.split.screen.last.map(stripAnsi).join('\n');
-  assert.match(frame, /plan · finished · R2 Push notifications/);
+  assert.match(frame, /1  PLAN  R2 Push notifications [─━]+ ✓ planned [─━]/);
+  assert.match(frame, /\[o_o\] ✓ plan done/, 'a planned card has its robot, not the rain');
   assert.match(frame, /d develops R2 here, in place of this plan · \/open reads the plan on cawdev · \/close/);
 
   await ui.runCommand('/develop');
@@ -765,7 +827,7 @@ test('/open opens the pull request; /drop deletes a finished on-demand checkout,
   ui.onEvent({ type: 'runs', runs: [] });
   await settle();
   ui.flush();
-  assert.match(ui.split.screen.last.map(stripAnsi).join('\n'), /\/drop deletes its checkout/);
+  assert.match(ui.split.screen.last.map(stripAnsi).join('\n'), /· \/drop · \/close/);
 
   await ui.openInBrowser();
   assert.deepEqual(opened, ['https://github.com/x/y/pull/12']);
@@ -823,6 +885,60 @@ test('a stopped session offers /carry-on, and says so once it is asked for', () 
     'discarded, or nothing to go on from: nothing offered');
 });
 
+test('a session stopped on a stale git lock offers /clean beside /continue', async () => {
+  const exitSummary = "git checkout -b r104-x origin/main failed: fatal: Unable to create '/work/saasng/.git/index.lock': File exists.";
+  const failed = {
+    ended: true,
+    view: { profile: 'CODE', state: 'FAILED', branch: 'r104-x', canCarryOn: true, workspace: '/work/saasng', exitSummary },
+  };
+  assert.equal(actionsFor(failed),
+    '/clean removes the stale git lock · /continue picks it back up here · /close');
+  assert.equal(actionsFor({ ...failed, lockCleaned: true }), '/continue picks it back up here · /close');
+  assert.equal(actionsFor({ ended: true, view: { ...failed.view, workspace: '/work/other' } }),
+    '/continue picks it back up here · /close', 'a lock outside its checkout is not offered');
+
+  const run = {
+    id: 'run-locked', profile: 'CODE', state: 'FAILED', live: false, label: 'Compose button',
+    branch: 'r104-x', canCarryOn: true, startedByEmail: 'ben@cawdev.test', runnerId: 'runner-1',
+    workspace: '/work/saasng', exitSummary,
+  };
+  const removed = [];
+  const { ui } = client({
+    'GET /api/projects/saasng/runs?limit=50': () => [run, { ...run, id: 'run-locked-2' }],
+  });
+  ui.options.removeLock = async (path) => (removed.push(path), { removed: true, said: `removed ${path}` });
+  ui.session.email = 'ben@cawdev.test';
+  await ui.findStopped();
+  assert.ok(ui.pending.some((line) => /\/clean removes it first/.test(stripAnsi(line))));
+
+  await ui.runCommand('/clean');
+  assert.deepEqual(removed, ['/work/saasng/.git/index.lock']);
+  assert.ok([...ui.sessions.values()].every((meta) => meta.lockCleaned), 'one lock, every session it stopped');
+  assert.ok(ui.pending.some((line) => /removed \/work\/saasng\/\.git\/index\.lock — \/continue/.test(stripAnsi(line))));
+});
+
+test('/clean refuses a session that did not stop on a lock, or whose checkout is elsewhere', async () => {
+  const exitSummary = "fatal: Unable to create '/work/saasng/.git/index.lock': File exists.";
+  const run = {
+    id: 'run-a', profile: 'CODE', state: 'FAILED', live: false, label: 'A', canCarryOn: true,
+    startedByEmail: 'ben@cawdev.test', runnerId: 'runner-1', workspace: '/work/saasng',
+    exitSummary: '/work/saasng has uncommitted changes',
+  };
+  const removed = [];
+  const { ui } = client({ 'GET /api/projects/saasng/runs?limit=50': () => [run] });
+  ui.options.removeLock = async (path) => (removed.push(path), { removed: true, said: 'removed' });
+  ui.session.email = 'ben@cawdev.test';
+  await ui.findStopped();
+  await ui.runCommand('/clean');
+  assert.match(ui.status, /did not stop on a git lock/);
+
+  const meta = ui.sessions.get('run-a');
+  meta.view = { ...meta.view, exitSummary, runnerId: 'runner-2', runnerName: 'the-laptop' };
+  await ui.runCommand('/clean');
+  assert.match(ui.status, /on the-laptop — clean it there/);
+  assert.deepEqual(removed, []);
+});
+
 test('carriesOnHere is the API\'s refusals read in advance', () => {
   const view = { canCarryOn: true, startedByEmail: 'ben@cawdev.test', runnerId: 'runner-1' };
   assert.equal(carriesOnHere(view, 'runner-1', 'ben@cawdev.test'), true);
@@ -856,8 +972,8 @@ test('a session that failed before this terminal attached gets a window, and /ca
   await ui.runCommand('/advanced-mode');
   ui.flush();
   const frame = ui.split.screen.last.map(stripAnsi).join('\n');
-  assert.match(frame, /dev · failed · Messaging as a module/);
-  assert.match(frame, /stopped: \/work\/saasng has uncommitted changes/, 'the window opens on why');
+  assert.match(frame, /1  DEV  Messaging as a module [─━]+ ✕ failed [─━]/);
+  assert.match(frame, /why: \/work\/saasng has uncommitted changes/, 'the card says why');
   assert.match(frame, /\/continue picks it back up here/);
 
   await ui.runCommand('/continue');
@@ -870,8 +986,8 @@ test('a session that failed before this terminal attached gets a window, and /ca
   assert.equal(ui.sessions.get('run-failed').ended, false);
   assert.equal(ui.sessions.get('run-failed').carryAsked, false);
   ui.flush();
-  assert.doesNotMatch(ui.split.screen.last.map(stripAnsi).join('\n'), /stopped: \/work\/saasng/,
-    'back to life: the old failure no longer heads the window');
+  assert.doesNotMatch(ui.split.screen.last.map(stripAnsi).join('\n'), /why: \/work\/saasng/,
+    'back to life: the old failure no longer heads the card');
 });
 
 // --- /pr follows the machine's answer ---------------------------------------------
@@ -934,7 +1050,10 @@ test('a question is shown whole in the prompt, and its lines leave once it is an
   ui.questions.set(PLAN.id, { question: { id: 'q-1', question: long, options: [] }, yours: true });
   ui.announce();
   ui.flush();
-  const asked = ui.split.screen.last.map(stripAnsi).join('\n');
+  const screen = ui.split.screen.last.map(stripAnsi);
+  const asked = screen.slice(screen.findIndex((line) => line.includes('cawdev ▸ laptop'))).join('\n');
+  assert.match(screen.join('\n'), /┃ ◆ Should the export include archived/, 'its card says what it asks');
+  assert.match(screen.join('\n'), /◆ waiting on you ━/);
   assert.match(asked, /from 1 · plan/);
   assert.match(asked, /│ +fiscal year\? +│/, 'every word of it, the rest on the next line under the label');
   assert.doesNotMatch(asked, /fiscal ye\s*│\s*│ar/, 'wrapped between words');
@@ -1074,7 +1193,7 @@ test('advanced mode narrowed to one project: /new asks no project, it is that on
   clearInterval(ui.split.plannedTimer);
 });
 
-test('the focused window is heavy and solid, every other session window dotted', async () => {
+test('the focused card is heavy, every other one thin', async () => {
   const { ui } = client();
   ui.onEvent({ type: 'runs', runs: [PLAN, DEV] });
   ui.watching = PLAN.id;
@@ -1083,15 +1202,14 @@ test('the focused window is heavy and solid, every other session window dotted',
   const frame = ui.split.screen.last.map(stripAnsi);
   const top = frame.find((line) => line.includes('Push notifications') && line.includes('Payments'));
   assert.ok(top, frame.join('\n'));
-  assert.match(top, /┏━ 1 plan · running · Push notifications ━+┓/, 'focused: heavy');
-  assert.match(top, /┌┄ 2 dev · running · Payments ┄+┐/, 'not focused: dotted');
-  assert.ok(frame.some((line) => /^┆.*┆$/.test(line.slice(line.indexOf('┆')))), 'dotted sides too');
+  assert.match(top, /┏━ 1  PLAN  Push notifications ━+ ● running ━┓/, 'focused: heavy');
+  assert.match(top, /┌─ 2  DEV  Payments ─+ ● running ─┐/, 'not focused: thin');
   assert.match(frame.join('\n'), /┌─ cawdev ▸ laptop/, 'the prompt keeps its solid line');
   ui.onKey('\t');
   ui.flush();
   const after = ui.split.screen.last.map(stripAnsi).find((line) => line.includes('Payments'));
-  assert.match(after, /┏━ 2 dev/, 'tab moves the heavy line with the focus');
-  assert.match(after, /┌┄ 1 plan/);
+  assert.match(after, /┏━ 2  DEV/, 'tab moves the heavy line with the focus');
+  assert.match(after, /┌─ 1  PLAN/);
   clearInterval(ui.split.plannedTimer);
 });
 
@@ -1235,7 +1353,7 @@ test('on a prompt line ↑ recalls anything sent; outside advanced mode ↑ open
 
 // --- /view: the session on cawdev -------------------------------------------------
 
-test('/view opens the focused session on cawdev; /view card prints its card here', async () => {
+test('/view in advanced mode is the session\'s log over the screen; outside it, its page on cawdev', async () => {
   const opened = [];
   const { ui } = client({
     'GET /api/projects/saasng/runs/run-dev': () => ({ profile: 'CODE', state: 'RUNNING', live: true, entryRef: 'R12' }),
@@ -1245,13 +1363,79 @@ test('/view opens the focused session on cawdev; /view card prints its card here
   ui.onEvent({ type: 'runs', runs: [DEV] });
   await ui.runCommand('/advanced-mode');
   await settle();
+  ui.onEvent({ type: 'output', runId: DEV.id, line: { kind: 'ASSISTANT', body: 'the refund needs its own table' } });
   await ui.runCommand('/view');
+  assert.equal(ui.reader?.session, true);
+  ui.flush();
+  assert.match(ui.split.screen.last.map(stripAnsi).join('\n'), /the refund needs its own table/);
+  ui.onKey(ESC);
+  assert.equal(ui.reader, null, 'esc gives the cards back');
+
   await ui.runCommand('/view card');
   await settle();
-  assert.deepEqual(opened, ['http://localhost:8091/projects/saasng/runs/run-dev'], '/view card opens no browser');
   const said = ui.pending.map(stripAnsi).join('\n');
   assert.match(said, /R12 Payments/);
   assert.match(said, /status +In development/);
+  assert.deepEqual(opened, [], 'no browser in advanced mode');
+
+  ui.leaveSplit();
+  await ui.runCommand('/view');
+  assert.deepEqual(opened, ['http://localhost:8091/projects/saasng/runs/run-dev']);
+});
+
+test('/view 2, /view R12 and v open that session\'s log; tab steps to the next without leaving', async () => {
+  const { ui } = client({
+    'GET /api/projects/saasng/runs/run-dev': () => ({ profile: 'CODE', state: 'RUNNING', live: true, entryRef: 'R12' }),
+  });
+  ui.onEvent({ type: 'runs', runs: [PLAN, DEV] });
+  ui.watching = PLAN.id;
+  await ui.runCommand('/advanced-mode');
+  await settleUntil(() => ui.sessions.get(DEV.id)?.view);
+  await ui.runCommand('/view 2');
+  assert.equal(ui.reader.runId, DEV.id);
+  assert.equal(ui.split.focus, DEV.id, 'the card it opened is the focused one');
+  ui.onKey('\t');
+  assert.equal(ui.reader.runId, PLAN.id, 'tab: the next session, still over the screen');
+  ui.onKey(ESC);
+  await ui.runCommand('/view R12');
+  assert.equal(ui.reader.runId, DEV.id, 'a ref a card is on is that session');
+  ui.onKey(ESC);
+  ui.onKey('\t');
+  ui.onKey('v');
+  assert.equal(ui.reader.runId, PLAN.id, 'v: the focused card');
+
+  // Following the end: scrolled up it holds still, G follows again.
+  for (let i = 0; i < 80; i++) ui.onEvent({ type: 'output', runId: PLAN.id, line: { kind: 'ASSISTANT', body: `line ${i}` } });
+  ui.flush();
+  assert.match(ui.split.screen.last.map(stripAnsi).join('\n'), /line 79/);
+  ui.onKey('g');
+  ui.flush();
+  assert.equal(ui.reader.follow, false);
+  ui.onEvent({ type: 'output', runId: PLAN.id, line: { kind: 'ASSISTANT', body: 'line 80' } });
+  ui.flush();
+  assert.doesNotMatch(ui.split.screen.last.map(stripAnsi).join('\n'), /line 80/);
+  ui.onKey('G');
+  ui.flush();
+  assert.match(ui.split.screen.last.map(stripAnsi).join('\n'), /line 80/);
+  clearInterval(ui.split.plannedTimer);
+});
+
+test('/matrix off stills the cards and is remembered; on brings the rain back', async () => {
+  const { ui } = client();
+  ui.onEvent({ type: 'runs', runs: [PLAN] });
+  await ui.runCommand('/advanced-mode');
+  ui.rainTick = 3;
+  ui.flush();
+  const rain = (frame) => frame.some((line) => /[ｱ-ﾝ]/.test(line));
+  assert.ok(rain(ui.split.screen.last.map(stripAnsi)), 'a running card rains');
+  await ui.runCommand('/matrix off');
+  ui.flush();
+  assert.ok(!rain(ui.split.screen.last.map(stripAnsi)));
+  await until(async () => (await loadPrefs(ui.session.url)).matrix === false);
+  assert.equal((await loadPrefs(ui.session.url)).matrix, false);
+  await ui.runCommand('/matrix on');
+  await until(async () => (await loadPrefs(ui.session.url)).matrix === undefined);
+  assert.equal((await loadPrefs(ui.session.url)).matrix, undefined, 'on is the default, so nothing is kept');
   clearInterval(ui.split.plannedTimer);
 });
 
@@ -1482,7 +1666,7 @@ test('the prompt names the window a command will act on, and the answer names th
 
 // --- a failed session says why, in its window ---------------------------------
 
-test('a session that ends FAILED shows why in its window, once', async () => {
+test('a session that ends FAILED says why on its card, and in full under /view, once', async () => {
   const why = 'Codex CLI cannot write code on this machine yet: …\n\nTo allow it:\n  2. On cawdev: http://x/settings/runners → laptop → tick "Allow everything".';
   const { ui } = client({
     'GET /api/projects/saasng/runs/run-dev': () => ({ profile: 'CODE', state: 'FAILED', live: false, exitSummary: why }),
@@ -1493,8 +1677,12 @@ test('a session that ends FAILED shows why in its window, once', async () => {
   await until(() => ui.sessions.get(DEV.id)?.failureSaid);
   ui.flush();
   const frame = ui.split.screen.last.map(stripAnsi).join('\n');
-  assert.match(frame, /failed:/);
-  assert.match(frame, /tick "Allow everything"/);
+  assert.match(frame, /✕ failed [─━]/);
+  assert.match(frame, /why: Codex CLI cannot write code on this machine yet/, 'the card says why in a line');
+  await ui.runCommand('/view');
+  ui.flush();
+  assert.match(ui.split.screen.last.map(stripAnsi).join('\n'), /tick "Allow everything"/, '/view has all of it');
+  ui.onKey(ESC);
   await ui.readView(ui.sessions.get(DEV.id));
   assert.equal(ui.lines.get(DEV.id).filter((line) => line.body === 'failed:').length, 1, 'said once, not per read');
   clearInterval(ui.split.plannedTimer);
@@ -1538,11 +1726,12 @@ test('commits that land after FINISHED are not "nothing built" — a zero is rea
   ui.flush();
   const frame = ui.split.screen.last.map(stripAnsi).join('\n');
   assert.doesNotMatch(frame, /nothing built|nothing was committed/);
-  assert.match(frame, /dev · finished · R29/);
+  assert.match(frame, /DEV  R29 Payments [─━]+ ✓ finished [─━]/);
+  assert.match(frame, /2 commits on r29-x/);
   clearInterval(ui.split.plannedTimer);
 });
 
-test('its window says why it built nothing, from its summary', async () => {
+test('its card says why it built nothing, from its summary', async () => {
   const why = 'R24 non implémentée.\nIMPLEMENT s’est arrêté parce que le plan était incomplet.';
   const { ui } = client({
     'GET /api/projects/saasng/runs/run-dev': () => ({ profile: 'CODE', state: 'FINISHED', live: false, branch: 'r24-x', entryRef: 'R24', exitSummary: why }),
@@ -1555,11 +1744,16 @@ test('its window says why it built nothing, from its summary', async () => {
   await until(() => ui.sessions.get(DEV.id)?.failureSaid);
   ui.flush();
   const frame = ui.split.screen.last.map(stripAnsi).join('\n');
-  assert.match(frame, /dev · finished · nothing built · R24/);
-  assert.match(frame, /nothing built:/);
-  assert.match(frame, /le plan était incomplet/);
-  assert.match(frame, /nothing was committed — \/new plan R24 to re-plan it/);
-  assert.doesNotMatch(frame, /\/pr opens the pull request/);
+  assert.match(frame, /DEV  R24 Payments [─━]+ ✓ finished · nothing built [─━]/);
+  assert.match(frame, /why: R24 non implémentée\./);
+  await ui.runCommand('/view');
+  ui.flush();
+  assert.match(ui.split.screen.last.map(stripAnsi).join('\n'), /le plan était incomplet/, '/view has all of it');
+  ui.onKey(ESC);
+  ui.flush();
+  const card = ui.split.screen.last.map(stripAnsi).join('\n');
+  assert.match(card, /nothing was committed — \/new plan R24 to re-plan it/);
+  assert.doesNotMatch(card, /\/pr opens the pull request/);
   clearInterval(ui.split.plannedTimer);
 });
 
@@ -1762,3 +1956,272 @@ test('advanced mode reads the issues, and d offers a confirmed one', async () =>
   assert.equal(post.body.entryNumber, 'i9');
   clearInterval(ui.split.plannedTimer);
 });
+
+// --- R605: --show / --no-show, /card --show, and /open at SHOW ---------------------
+
+test('/new dev R12 --no-show and --show carry the switch for one run', async () => {
+  for (const [flag, show] of [['--no-show', false], ['--show', true]]) {
+    const { ui, calls } = client();
+    await ui.runCommand(`/new dev R12 ${flag} @saasng`);
+    await settle();
+    const [run] = calls.filter((call) => call.method === 'POST');
+    assert.deepEqual(run.body, { entryNumber: 'R12', show, targetRunnerId: 'runner-1' }, flag);
+    assert.match(ui.pending.map(stripAnsi).join('\n'),
+      new RegExp(`the development of R12, ${show ? '' : 'not '}shown before its PR`));
+  }
+  const { ui, calls } = client();
+  await ui.runCommand('/new dev R12 @saasng');
+  await settle();
+  assert.ok(!('show' in calls.find((call) => call.method === 'POST').body), 'absent is the card\'s own switch');
+});
+
+test('--show on a plan or a question is refused in words, and both flags together too', async () => {
+  const { ui, calls } = client();
+  await ui.runCommand('/new plan R12 --show @saasng');
+  assert.match(ui.status, /--show is for a dev session/);
+  await ui.runCommand('/new ask what is this --no-show @saasng');
+  assert.match(ui.status, /--show is for a dev session/);
+  await ui.runCommand('/new dev R12 --show --no-show @saasng');
+  assert.match(ui.status, /--show or --no-show, not both/);
+  assert.deepEqual(calls.filter((call) => call.method === 'POST'), []);
+});
+
+test('/develop R12 --show carries it, and a dev from words does too', async () => {
+  const { ui, calls } = client({
+    'POST /api/projects/saasng/roadmap': () => ({ ref: 'R15', number: 15, title: 'x' }),
+  });
+  await ui.runCommand('/develop R12 --show @saasng');
+  await settle();
+  await ui.runCommand('/new dev fix the sort --no-show @saasng');
+  await settle();
+  const runs = calls.filter((call) => call.method === 'POST' && call.path.endsWith('/runs'));
+  assert.deepEqual(runs.map((call) => call.body.show), [true, false]);
+});
+
+test('/card an idea --show writes the card with the switch on, and the text has no flag', async () => {
+  const { ui, calls } = client({
+    'POST /api/projects/saasng/roadmap': () => ({ ref: 'R14', number: 14, title: 'dark mode' }),
+  });
+  await ui.runCommand('/card dark mode for the portal --show @saasng');
+  await settle();
+  const [card] = calls.filter((call) => call.method === 'POST');
+  assert.deepEqual(card.body, {
+    title: 'dark mode for the portal', body: 'dark mode for the portal', status: 'CONSIDERING', showBeforePr: true,
+  });
+  assert.match(ui.pending.map(stripAnsi).join('\n'), /shown before its PR/);
+});
+
+test('/open on a session waiting at SHOW opens its run page on cawdev', async () => {
+  const opened = [];
+  const made = client();
+  made.ui.options.openUrl = (url) => opened.push(url);
+  made.ui.onEvent({ type: 'runs', runs: [DEV] });
+  made.ui.watching = DEV.id;
+  made.ui.approvals.set(DEV.id, {
+    runId: DEV.id,
+    approval: { id: 'ap-9', toolName: 'stage:SHOW', summary: 'look', askedAt: '2026-10-28T10:00:00Z',
+      toolInput: JSON.stringify({ round: 1, attachments: ['a'] }) },
+  });
+  await made.ui.runCommand('/open');
+  assert.equal(opened.length, 1);
+  assert.match(opened[0], /\/runs\/run-dev$/);
+});
+
+test('/new dev --no-show with no card picks one, and the choice still carries the flag', async () => {
+  const { ui, calls } = client();
+  ui.planned = [{ slug: 'saasng', ref: 'R3', title: 'Something planned' }];
+  ui.refreshPlanned = async () => undefined;
+  await ui.runCommand('/new dev --no-show @saasng');
+  assert.equal(ui.select.kind, 'planned');
+  ui.chose(ui.select, ui.select.rows[0]);
+  await settle();
+  assert.equal(calls.find((call) => call.method === 'POST').body.show, false);
+});
+
+// --- R606: several cards from one /new ----------------------------------------------
+
+test('/new plan+dev R3 R5 posts ONE batch for this machine: plans in order, each built after its plan', async () => {
+  const { ui, calls } = client({
+    'POST /api/projects/saasng/runs/batch': () => ({
+      started: [{ entryRef: 'R3' }, { entryRef: 'R5' }],
+      refused: [{ ref: 'R9', reason: 'It is already being planned.' }],
+    }),
+  });
+  await ui.runCommand('/new plan+dev R3 R5 R9 --codex @saasng');
+  await settle();
+  assert.deepEqual(calls.filter((call) => call.method === 'POST'), [{
+    path: '/api/projects/saasng/runs/batch', method: 'POST',
+    body: {
+      strategy: 'QUEUED_ON_ONE', cards: [{ entryNumber: 'R3' }, { entryNumber: 'R5' }, { entryNumber: 'R9' }],
+      profile: 'PLAN', thenDevelop: true, agent: 'codex', targetRunnerId: 'runner-1',
+    },
+  }]);
+  const said = ui.pending.map(stripAnsi).join('\n');
+  assert.match(said, /planning then building R3 → R5 on saasng with codex, one card at a time/);
+  assert.match(said, /skipped R9: It is already being planned\./);
+});
+
+test('/new dev R3 R5 is a branch each queued here; --in-order is one branch; plans alone are PLAN', async () => {
+  const { ui, calls } = client();
+  await ui.runCommand('/new dev R3 R5 @saasng');
+  await ui.runCommand('/new dev R3 R5 --in-order --branch r3-both @saasng');
+  await ui.runCommand('/new plan R3 R5 @saasng');
+  await settle();
+  const bodies = calls.filter((call) => call.method === 'POST').map((call) => call.body);
+  const cards = [{ entryNumber: 'R3' }, { entryNumber: 'R5' }];
+  assert.deepEqual(bodies, [
+    { strategy: 'QUEUED_ON_ONE', cards, targetRunnerId: 'runner-1' },
+    { strategy: 'ONE_BRANCH_IN_ORDER', cards, branch: 'r3-both', targetRunnerId: 'runner-1' },
+    { strategy: 'QUEUED_ON_ONE', cards, profile: 'PLAN', targetRunnerId: 'runner-1' },
+  ]);
+});
+
+test('a batch refuses one card\'s answers (--again, --show) rather than giving them to every card', async () => {
+  const { ui, calls } = client();
+  await ui.runCommand('/new dev R3 R5 --again @saasng');
+  assert.match(ui.status, /--again is for one card/);
+  await ui.runCommand('/new dev R3 R5 --show @saasng');
+  assert.match(ui.status, /--show is for one card/);
+  assert.deepEqual(calls.filter((call) => call.method === 'POST'), []);
+});
+
+test('a batch the platform refuses whole says why, and a usage window offers --anyway', async () => {
+  const { ui } = client({
+    'POST /api/projects/saasng/runs/batch': () => {
+      throw new Error('The 5h window on laptop is at 92%.');
+    },
+  });
+  await ui.runCommand('/new plan+dev R3 R5 @saasng');
+  await settle();
+  assert.match(ui.status, /92%\. — add --anyway to start them regardless/);
+});
+
+// --- browsing the roadmap strip (`b` / `/board`) ---------------------------------
+
+test('stripColumns and moveInStrip walk the visible columns and cards in order', () => {
+  const two = [...SAASNG, card('ngsign', 'PLANNED', 1, 'ngsignshell --reply')];
+  const cols = stripColumns(180, two, ['saasng', 'ngsign']);
+  assert.deepEqual(
+    cols.map((col) => `${col.slug}:${col.status}:${col.cards.map((c) => c.ref).join(',')}`),
+    [
+      'saasng:CONSIDERING:R11',
+      'saasng:PLANNED:R10',
+      'saasng:IN_DEVELOPMENT:R5,R6,R7,R8',
+      'ngsign:PLANNED:R1',
+    ],
+  );
+  const start = moveInStrip(cols, null, 0, 0);
+  assert.deepEqual(start, { slug: 'saasng', ref: 'R11' });
+  const planned = moveInStrip(cols, start, 1, 0);
+  assert.deepEqual(planned, { slug: 'saasng', ref: 'R10' });
+  const inDev = moveInStrip(cols, planned, 1, 0);
+  assert.deepEqual(inDev, { slug: 'saasng', ref: 'R5' });
+  const r6 = moveInStrip(cols, inDev, 0, 1);
+  assert.deepEqual(r6, { slug: 'saasng', ref: 'R6' });
+  const wrappedUp = moveInStrip(cols, inDev, 0, -1);
+  assert.deepEqual(wrappedUp, { slug: 'saasng', ref: 'R8' });
+  const nextProject = moveInStrip(cols, r6, 1, 0);
+  assert.deepEqual(nextProject, { slug: 'ngsign', ref: 'R1' });
+});
+
+test('roadmapStrip marks the focused card with ❯ and scrolls an overflowing column to show it', () => {
+  const focusR6 = { slug: 'saasng', ref: 'R6' };
+  const onR6 = roadmapStrip(180, 4, SAASNG, ink, ['saasng'], focusR6).map(stripAnsi).slice(2).join('\n');
+  assert.match(onR6, /❯R6 Messaging as a module/, 'R6 is scrolled into view and marked with ❯');
+  assert.match(onR6, /\+2 more/, 'the remaining count stays honest');
+
+  const focusR8 = { slug: 'saasng', ref: 'R8' };
+  const onR8 = roadmapStrip(180, 4, SAASNG, ink, ['saasng'], focusR8).map(stripAnsi).slice(2).join('\n');
+  assert.match(onR8, /R7 Meetings list/);
+  assert.match(onR8, /❯R8 Clone action/, 'the last card in an overflowing column is reachable too');
+});
+
+test('boardPreviewLines wraps the full untruncated title and description inside a framed box', () => {
+  const full = {
+    slug: 'saasng',
+    ref: 'R5',
+    status: 'IN_DEVELOPMENT',
+    section: 'Workspace',
+    branch: 'feat/tasks-drag',
+    live: true,
+    title: 'Tasks board — drag and drop to reorder columns across every project workspace without losing scroll position',
+    body: 'Operators need to reorder columns directly on the board.\n\nKeyboard reordering must work too.',
+  };
+  const drawn = boardPreviewLines(80, 12, full, ink);
+  for (const line of drawn.lines) {
+    assert.equal(visibleWidth(line), 80);
+  }
+  const text = drawn.lines.map(stripAnsi).join('\n');
+  assert.match(text, /┏━ R5 · In development · Workspace · saasng/);
+  assert.match(text, /R5 Tasks board — drag and drop to reorder columns across every project/);
+  assert.match(text, /workspace without losing scroll position/);
+  assert.match(text, /Operators need to reorder columns directly on the board\./);
+  assert.match(text, /Keyboard reordering must work too\./);
+  assert.match(text, /←→↑↓ move · p plan · d develop · v full card · esc sessions/);
+});
+
+test('b in advanced mode focuses the roadmap strip, arrows browse cards and show their full title and description, and esc returns to sessions', async () => {
+  const r11Title = 'Dark mode across every dashboard chart and workspace sidebar without reloading the page';
+  const r10Title = 'Invoices export as PDF and CSV with per-client tax breakdowns';
+  const { ui, calls } = client({
+    'GET /api/projects/saasng/roadmap?brief=true': () => [
+      { ref: 'R11', title: r11Title, status: 'CONSIDERING', activeRun: false },
+      { ref: 'R10', title: r10Title, status: 'PLANNED', activeRun: false },
+    ],
+    'GET /api/projects/saasng/issues?brief=true': () => [],
+    'GET /api/projects/saasng/roadmap/R11': () => ({
+      ref: 'R11',
+      title: r11Title,
+      status: 'CONSIDERING',
+      section: 'Theme',
+      body: 'Every chart and sidebar should respect the operator theme preference.',
+    }),
+    'GET /api/projects/saasng/roadmap/R10': () => ({
+      ref: 'R10',
+      title: r10Title,
+      status: 'PLANNED',
+      section: 'Billing',
+      body: 'Export monthly invoices with line-item VAT and currency conversion.',
+    }),
+  });
+  ui.onEvent({ type: 'runs', runs: [PLAN] });
+  await ui.runCommand('/advanced-mode');
+  await settle();
+  ui.flush();
+
+  // Before pressing `b`, the strip truncates the long title and no preview box is drawn.
+  const before = ui.split.screen.last.map(stripAnsi).join('\n');
+  assert.doesNotMatch(before, /without reloading the page/);
+
+  // Press `b` to focus the roadmap strip on the first card (R11 in Considering).
+  ui.onKey('b');
+  await settle();
+  ui.flush();
+  assert.deepEqual(ui.split.boardFocus, { slug: 'saasng', ref: 'R11' });
+  const onR11 = ui.split.screen.last.map(stripAnsi).join('\n');
+  assert.match(onR11, /❯R11 Dark mode/, 'focused card is marked in the top strip');
+  assert.match(onR11, /without reloading the page/, 'full untruncated title is shown in the preview panel');
+  assert.match(onR11, /Every chart and sidebar should respect the operator theme preference\./, 'card description is shown');
+
+  // Press Right arrow (`ESC[C`) to move to Planned (R10).
+  ui.onKey(`${ESC}[C`);
+  await settle();
+  ui.flush();
+  assert.deepEqual(ui.split.boardFocus, { slug: 'saasng', ref: 'R10' });
+  const onR10 = ui.split.screen.last.map(stripAnsi).join('\n');
+  assert.match(onR10, /❯R10 Invoices/, 'R10 is now focused in the strip');
+  assert.match(onR10, /with per-client tax breakdowns/, 'R10 full title is shown');
+  assert.match(onR10, /Export monthly invoices with line-item VAT and currency conversion\./, 'R10 description is shown');
+  assert.ok(calls.some((call) => call.path === '/api/projects/saasng/roadmap/R10'));
+
+  // Press `esc` to return focus to the session cards and close the preview panel.
+  ui.onKey(ESC);
+  ui.flush();
+  assert.equal(ui.split.boardFocus, null);
+  const after = ui.split.screen.last.map(stripAnsi).join('\n');
+  assert.doesNotMatch(after, /Export monthly invoices with line-item VAT/);
+  assert.match(after, /┏━ 1  PLAN  Push notifications/, 'session card has the heavy focused border back');
+
+  await ui.runCommand('/advanced-mode off');
+});
+

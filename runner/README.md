@@ -356,18 +356,73 @@ browser anywhere and the terminal collects the session when you approve.
 error — it is what an expired session looks like, and the answer is the same as
 having none.
 
-### Advanced mode: one window per session
+### Advanced mode: one card per session
 
-`/advanced-mode` splits the terminal the way emacs does: **one window per
-session** this machine is running — or ran since you attached — above **the
-prompt, which stays at the bottom** the way a shell's does. Each window's title says what kind of
-session it is (`plan`, `dev`, `review`, `ask`…), where it stands, the card and
-the project, and its body is that session's output as it arrives. A frame's
-colour is its session's state — **red while it runs, green once it finished**
-(a plan planned, a dev developed), amber if it stopped any other way — and
-the focused window is drawn in heavy lines; `tab` and `shift+tab` move the focus, `1`–`9`
-jump to a window, and `enter` prompts the focused session exactly as it does
-outside the mode. `/advanced-mode` again (or `/advanced-mode off`) leaves.
+`/advanced-mode` gives **one card per session** this machine is running, or
+has run since you attached. The cards sit above **the prompt, which stays at
+the bottom** the way a shell's does. A session's log scrolling past in a corner was neither readable
+nor meant to be read live, so a card shows what a glance needs:
+
+```
+┏━ 1  DEV  R42 Payments refund flow ━━━━━━━━ ● running · 12m ━┓
+┃ Claude · Opus 5.5 ▸ saasng · …/saasng-auto-2                 ┃
+┃ plan ✓ ─ implement ● ─ test ○ ─ verify ○                     ┃
+┃ now: Bash npm test -- refund                                 ┃
+┃ ﾘｻ      ﾆ 2  3    ﾉ ﾆ7     2   3 ﾔ                           ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+```
+
+- **The top border** has the card's number, a badge for the kind of session,
+  the card and its title, and the status.
+  - Badges are reversed so they never read as a status: `PLAN` violet, `DEV`
+    terracotta, `REVIEW`/`MERGE`/`RELEASE` light, anything else grey.
+  - Statuses: `● running · 12m`, `◆ waiting on you` (or
+    `waiting · permission`, `waiting · screenshots`), `◌ queued`, `✓ finished`,
+    `✓ planned` (a plan that finished), `✓ finished · nothing built`, `✕ failed`.
+- **The rows inside**, top down:
+  - the agent and model, the project and the checkout;
+  - the stage walk while the session runs (from the daemon's snapshot, its
+    `stage` and `stages`), or the commits once it has finished;
+  - ONE line of what it is doing.
+- **The "doing" line.** While it works this is the last tool call (`now: …`),
+  even when it has said something since. Before its first tool, it is the last
+  thing it said. A queued session says why it waits. An ended session that
+  failed or built nothing gives the first line of why. While it waits on you,
+  this line holds the question or the tool asking permission.
+- **The last line** says what can be done: an ended session's next step, or
+  the keys for what it waits on.
+
+A card's frame, and everything inside it, take the status's colour: green
+running or finished, amber waiting or finished having built nothing, grey
+queued, red stopped. The focused card is drawn in heavy lines. **The rows a
+card does not need are rain**: falling glyphs in the status's colour, at its
+speed.
+
+| Status | Rain |
+|---|---|
+| running | green, fast, dense |
+| waiting on you | amber, half that speed |
+| queued | grey, slow and sparse |
+| finished | a slow green drizzle |
+| **planned** (a plan that finished) | no rain: a small robot paces along the bottom of the card, waving and blinking, holding up `✓ plan done` |
+| finished, nothing built | slow amber |
+| stopped or failed | slow red |
+
+It moves a step every 120 ms, and only while the cards are on screen.
+**`/matrix off`** stills it and is remembered (`prefs.mjs`); `/matrix on` brings
+it back. With it off the rain is gone, but a planned card keeps its robot,
+standing still, because the robot is the news that the card is ready to develop. `session-cards.mjs` is all of it, pure: the grid, a card, the rain at a
+given tick, a function of the session's id, so each session keeps its own drops.
+
+**A session's log is `/view`'s.** `/view` takes the focused card's session over
+the whole screen. `/view 2` takes card 2, `/view R42` the session on R42, and
+**`v`** on a card does the same. The log follows the end as it grows. Scroll up
+and it holds still; `G` follows again. **`tab`** goes to the next session's log
+without going back, and `esc` gives the cards back.
+
+On the cards, `tab` and `shift+tab` move the focus, `1`–`9` jump to a card,
+and `enter` prompts the focused session exactly as it does outside the mode.
+`/advanced-mode` again (or `/advanced-mode off`) leaves.
 
 It is drawn on the terminal's **alternate screen**, like nano or emacs, and
 holds still the way they do: auto-wrap is off, so nothing ever scrolls the
@@ -378,17 +433,23 @@ for printing into the scrollback still holds, and this mode is something you
 ask for rather than the default. On the way out, what the watched session said
 meanwhile is laid into the scrollback, so nothing was lost by watching it here.
 
-**The PLANNED cards run across the top, grouped by project** — a line with
-each project's name over its cards and a rule between two projects, every
-project this machine serves included ("nothing planned" is an answer) — one
-small box each, titled with the card and its status — `R3 (Planned)` — the cards of
-every project this machine serves that are ready to be developed, read again
-every thirty seconds. **`d`** lists them and develops the one you pick, on this
-machine and on the card's own branch — except on a finished plan's window, where
-it is that plan's `/develop` (below) with no list; `/new dev` with nothing after it does the
-same anywhere, and `/new dev R3` goes straight to one. A full-width rule
-under the strip separates the board from the session windows; it comes out of
-the strip's own rows, never the windows'.
+**The roadmap runs across the top, grouped by project** — Considering,
+Planned and In development side by side, one line per card, read again every
+thirty seconds. **`b`** (or **`/board`**) puts the focus into the roadmap
+strip (`❯` marks the focused card and an overflowing column scrolls with it):
+`←`/`→` (or `h`/`l`) step across columns and projects, `↑`/`↓` (or `j`/`k`)
+step through the column's cards, and a preview panel directly below the strip
+shows the focused card's **full untruncated title and description** (read on
+demand from `GET /api/projects/:slug/roadmap/:ref` and cached, scrolled with
+`space` / `PgDn` / `PgUp`). From a focused card in the strip, `p` plans it,
+`d` develops it, `v` (or `enter`) prints the full card record, and `esc` (or
+`b` / `/board off`) returns focus to the session cards. Outside board focus,
+**`d`** lists the PLANNED cards and CONFIRMED issues and develops the one you
+pick, on this machine and on the card's own branch — except on a finished
+plan's window, where it is that plan's `/develop` (below) with no list; `/new
+dev` with nothing after it does the same anywhere, and `/new dev R3` goes
+straight to one. A full-width rule under the strip separates the board from
+the session cards; it comes out of the strip's own rows, never the cards'.
 
 **`/refresh`** reads the cards again now rather than on the next tick, and
 says what it found per project — `saasng: 5 considering · 2 planned · 1 in
@@ -396,14 +457,16 @@ development` — and which project could not be read, and why. A project that
 cannot be read keeps its last cards and no other's: one unreadable slug used
 to leave every column of every project at 0, silently.
 
-**Four windows at most.** Past four, the rest are named on one line above the
-prompt — number, kind, state, card, in the state's colour — and `tab` (or the
-number) onto one brings it up in place of another. The focused session always
-has a window, then the ones still running, then the ended ones, each most
-recently looked at first.
+**As many cards as fit.** Up to three across, as many as the width holds at 38
+columns each, and as many rows as the height holds at six. Each row of cards is
+up to eleven tall, and the prompt has whatever is left. The cards that do not
+fit are named on one line above the prompt (number, kind, state, card, in the
+state's colour), and `tab` (or the number) onto one brings it up in place of
+another. The focused session always has a card, then the ones still running,
+then the ended ones, each most recently looked at first.
 
-A window stays up when its session ends, and its last line says what can be
-done next:
+A card stays up when its session ends, and its last line says what can be done
+next:
 
 - **`d`** or **`/develop`** on a finished plan — the window says `d develops R2
   here, in place of this plan` — starts the development of its card, on
@@ -436,6 +499,13 @@ done next:
   project's runs, kept when `carriesOnHere` — yours, `canCarryOn`, and its
   checkout on this machine or none), listed in the scrollback, and given a
   window that opens on why it stopped.
+- **`/clean`** is offered beside `/continue` when a session stopped on a git
+  lock a crash left behind (`Unable to create '…/.git/index.lock': File
+  exists`), which `/continue` alone would only fail on again
+  (`git-lock.mjs`). It removes the lock named in the failure, and only one
+  inside that run's own checkout (or its reading worktree's admin directory),
+  older than a minute, on a run this machine took. One `/clean` frees every
+  session stopped on the same lock; `/continue` then picks each up.
 - **Finished, having built nothing** — a dev session that ended FINISHED
   with no commit (IMPLEMENT stopped on a plan it would not follow, say) —
   reads `finished · nothing built`, in amber rather than green, offers no
@@ -476,6 +546,22 @@ sentence; `--anyway` starts it regardless, the same decision the console's
 panel asks for. All four commands need you signed in (`/login`), and they work
 outside advanced mode too, on the session you are watching.
 
+**Several cards on one line are one batch** (R606): `/new dev R3 R5 R7`,
+`/new plan R3,R5,R7`, `/new plan+dev R3 R5 R7`, in the order written, aimed at
+this machine. It is the console's *Start runs on 3 cards* (`POST
+…/runs/batch`), and the platform holds the order on the runs (`after_run_id`),
+so quitting the terminal does not stop the sequence. `dev` is a branch each,
+queued here; `--in-order` is one branch, each run from the last one's commits,
+named with `--branch <name>` or else the first card's. `plan` plans the cards
+one after another (a plan takes no checkout, so only the chain keeps them in
+turn). `plan+dev` plans a card, builds it as soon as its plan is written (the
+project's hand-off switch is not asked: you asked on the line), and plans the
+next once that build has finished: plan R3, build R3, plan R5, build R5. A build
+that fails or is cancelled holds the rest until it is carried on or started over.
+A card the platform skips is named with its reason (`batchStartedLines`).
+`--again` and `--show` are one card's answers and a batch refuses them;
+`--codex` and `/agent` apply to every card.
+
 **The prompt says which window it acts on.** In advanced mode the line at the
 bottom leads with the focused window's number — `[2] cawdev ▸ /pr`, `[2]
 enter prompts “…”` — and a command's answer keeps the number of the window it
@@ -514,8 +600,8 @@ card — in the browser, on the console this terminal signed in to.
 **On a session waiting for you** — a question, or a permission such as a stage
 gate whose summary is the whole plan — the prompt only has room for the start
 of it, and says so: `/view reads it all · /open answers it on cawdev`.
-**`/view`** then opens the READER: one window over the whole screen with the
-session's output and, under a rule, the request in full (the question and its
+**`/view`** then opens the READER: the session's log over the whole screen
+(as above) and, under a rule, the request in full (the question and its
 options; the permission's summary, its input and its keys). It opens on the
 request; `↑`/`↓` (and the wheel), `PgUp`/`PgDn`, `g`/`G` scroll it, `esc`
 closes it, and any other key closes it and does what it always does — `a`
@@ -570,6 +656,58 @@ is where an idea waits to be decided on, and writing one down does not need
 a model. Titled by its words (`cardTitleFor`), the whole text in its body;
 the project chosen exactly as `/new` chooses it (`@project`, else advanced
 mode narrowed to one, else asked).
+
+**`/review`** reads a card's branch and acts on it from here: the focused
+session's card, or `/review R42 (@project)`. The diff is local git
+(`diff-view.mjs`: `git fetch origin <base> <branch>`, which moves refs only,
+then `git diff base...branch` from the merge base, in the session's checkout or
+one the config names), so no diff crosses the API and a working checkout is
+never touched; a failed fetch reads what the checkout has and says it may be
+behind. File bytes are made printable before they are drawn. In advanced mode
+it is the reader (`n`/`p` files, `f` fold; lockfiles, binaries and files over
+`FOLD_OVER_LINES` start folded) with `d` Done, `c` changes requested (the note
+is asked in the prompt; empty goes back to the diff) and `m` merge, offered on
+a Done branch to a person holding Merge and pressed twice. Outside it the diff
+is printed and the acts are `/review done|changes <note>|merge|agent-merge`.
+Each act is the platform's endpoint (`work-items/{id}/verdict`, `/merge`,
+`/agent-merge`); after a merge the card is read every five seconds until it is
+MERGED or the merge FAILED (`followMerge`).
+
+**While it merges, the card's sessions are out of reach** (`markMerging`,
+`refuseWhileMerging`). Their cards turn grey and say `⇢ merging` and
+`r42-pay → main`. Instead of rain, a robot looking ahead (`[>_>]`) carries the
+branch (`[■]`) to `▶ main` and walks back for the next load
+(`session-cards.mjs` `mergingRobotLines`). Enter, `d`, `x` and the bare
+commands that act on the branch or its checkout are refused with the reason:
+`/pr`, `/continue`, `/clean`, `/drop`, `/close`, `/cancel`, `/develop` and
+`/review` (`DISABLED_WHILE_MERGING`). `/view` and `/open` still work.
+- **Once it lands**, the card closes by itself (a session still running only
+  loses the mark).
+- **If the merge hits a conflict** (the merge's `failure` is `CONFLICT`, or an
+  older runner's words say so), the card goes back to development
+  (`resolveConflict`).
+  - The branch is sent back, Not done, with an order as its note
+    (`conflictOrder`): merge `origin/main` into the branch, resolve every
+    conflict keeping what both sides meant, change nothing else, run the tests,
+    commit and push. The next session on the card is handed that note.
+  - That session is started here again (`again`), with the agent that built
+    the branch. The old card gives way to the new one, which takes the focus.
+  - Once it is Done, `/review` and `m` merge it again. `/review agent-merge`
+    is still there for an agent of its own.
+- **If the merge fails any other way** (not permitted, unreachable…), no
+  agent can fix it. The card comes back red, `✕ merge failed`, with the
+  machine's words and `/review` on its last line, and every act is offered
+  again.
+
+**`/import <file.json>`** files the cards of a JSON file (`card-import.mjs`,
+over `POST /api/projects/{slug}/roadmap/import`): a list of `{title, body,
+severity, tags, …}` or `{"cards": [...]}`. The project is `@project`, else
+advanced mode narrowed to one, else the one project served; with several it is
+asked for by name. `--dry-run` only checks. A card whose title is taken (on the
+board, or earlier in the file) is skipped and listed with what it repeats;
+`--allow-duplicates` files it anyway. From the shell, `cawdev import
+<file.json>` checks first, prints what would be filed and refused, and asks
+(`--yes` does not; `--project`, `--status`, `--dry-run` as above).
 
 **Across the top, the roadmap** (`roadmapStrip`): every project this machine
 serves as a small board — Considering, Planned and In development side by
@@ -1214,6 +1352,20 @@ Bitbucket project's pull request or merge to it: the button says "No machine of
 yours runs a cawdev runner that speaks Bitbucket. Restart the daemon to update
 it."
 
+**The fix proves itself (R318).** When the run's card was filed from a
+SonarQube finding, the claim carries it (`findingsToProve`) and the scan then
+asks the server whether it is still reported on the tree just scanned, and
+reports `fixedKeys` / `stillOpenKeys` with the reading. SonarQube gives an issue
+a *new key* when it copies it onto a branch, so on a `BRANCH` or `PROJECT`
+reading the match is the rule in the file — narrowed to the line's hash when the
+finding has one, since lines move. Without a hash, another issue of the same rule
+in that file reads as "still reported": the check can err toward blocking, never
+toward calling an unfixed finding fixed. On a `MAIN` reading the key itself is
+asked for. A reading is taken after TEST, so commits from a later stage, or
+pushed by hand, are not seen. **Restart the daemon** to read `findingsToProve`: a
+daemon started before R318 sends neither list, and the board then says *Not
+checked*.
+
 ### What the agent may push
 
 A coding session may commit on its card's branch and push **that branch and
@@ -1232,6 +1384,82 @@ are not flagged.
 shell and your credentials can get round a pattern match (`git -c alias.x='!…'`,
 a host CLI called through a script). **The real wall is branch protection on the
 host: protect the default branch and require a pull request.** Do that.
+
+## Showing a card before its pull request (R604)
+
+A card with *Show me before the PR* on walks **IMPLEMENT → TEST → SHOW → MEMORY**.
+SHOW is the agent's chance to show a person what it built, before anything is proposed.
+
+- **The folder.** The session writes 1–8 files into `.cawdev/shots/` — a PNG or JPEG of
+  the real screen (the repository's own Playwright, or Claude in Chrome), or a *static*
+  self-contained HTML mock — and `.cawdev/shots/shots.json`, `[{"file", "caption"}]`.
+  Each file is 2 MB or smaller. The daemon adds the folder to `.git/info/exclude`, so it
+  is never committed, and deletes it once the round is uploaded.
+- **The upload is the daemon's**, with the machine's token on `runner:operate`. The
+  session holds the run token and cannot upload what it is judged by.
+- **The tree check.** SHOW is spawned with a tool list that allows `Edit` only under
+  `.cawdev/shots/`, but its Bash can write anywhere, so the list is not the guard:
+  after the stage the daemon compares the tree with how it began. A commit, or any path
+  changed outside the folder (build output that is not gitignored counts), fails the
+  stage, names the paths, and raises no gate.
+- **No permission mode.** SHOW is spawned without `--permission-mode` (never
+  `acceptEdits`, never "allow everything") and with the permission prompt kept: a Bash
+  command that is not on the allowed list becomes a question for a person. On a machine
+  with few Bash patterns SHOW is chatty; the answer is a project rule for the app's start
+  command, not a mode. Codex and Antigravity cannot be narrowed this way, so for them
+  the tree check is the only guard.
+- **The gate.** The daemon raises `stage:SHOW` with the round and its screenshot ids.
+  `attach` shows it as a wait to look at (below); `/open` opens the run page. SHOW is reported DONE only after *Accept*, so a daemon that dies while the
+  gate waits resumes at SHOW. A gate that cannot be raised fails the stage.
+- **Comments** send the walk back to IMPLEMENT, with the comments leading its prompt,
+  then TEST and SHOW again. There is no cap on rounds.
+
+The daemon must be restarted to learn the SHOW stage.
+
+### Looking and deciding from the terminal (R605)
+
+A run stopped at SHOW is not a permission request, and `attach` does not ask for one.
+The window's title says `waiting for you` and its subtitle, in amber, reads
+`waiting for you — 3 screenshots, round 2 · a to look and decide`. The banner says
+` show ` and offers `a`, `/accept`, `/comments …` and `/open` instead of `y / s / n`.
+
+- **`a`** (or `/view`) opens one picker: the round's screenshots, numbered, with their
+  captions (control characters stripped — a caption comes from the session); *Open all*;
+  *Accept — open the pull request*; one row per earlier round, with the comments sent on
+  it; and *Send comments…*. Enter on a numbered screenshot opens that one.
+- **Commands** act on the focused session and say `is not waiting at SHOW` and do
+  nothing when it is not at SHOW: `/shots` (the round listed), `/shots 2`, `/shots all`,
+  `/shots round 1` (an earlier round and its comments), `/shots round 1 all`,
+  `/accept`, and `/comments <text>`. In comments a line starting `#2` is a note on
+  screenshot 2 and every other line is the round's note; on the one-line command, a `#2`
+  anywhere starts the note on screenshot 2, which runs to the next `#n` or the end. An
+  unknown `#n` or an empty comment is refused before anything is sent. In the picker's
+  *Send comments…* an empty line sends; Esc goes back to the picker and keeps the lines.
+- **`y`, `s`, `Y`, `M` and `n` do nothing at SHOW** and say to use `a`, `/accept` or
+  `/comments`: `s` would otherwise have accepted the round, and opened the pull request,
+  without anybody looking.
+- **`--show` / `--no-show`** on `/new dev` and `/develop` override the card's switch for
+  one run (on a plan or a question they are refused in words); `/card <idea> --show`
+  writes a card with the switch on.
+- **Only the screenshots the platform sealed are shown.** A gate's list is the session's
+  own claim, so the picker joins it to `GET …/attachments` for that round; a gate that
+  names an id that was never sealed offers no Accept.
+
+**The cache.** Images open in the OS viewer (`open` with every path on macOS, so Preview
+pages through them in one window; `xdg-open` once per file elsewhere) from
+`~/.cawdev/shots/<runId>/<round>/` (directories 0700, files 0600; `CAWDEV_SHOTS_DIR`
+moves it). Each file is named by its SHA-256 and an extension taken from the platform's
+content type, is downloaded the first time and not again while its bytes still match, and
+is checked against the checksum the list carries. **The terminal is the only writer** —
+the daemon deletes the checkout's `.cawdev/shots/` once a round is sealed and never
+writes the cache, because a session could plant a link there. A link at any level is
+refused.
+
+**HTML is never opened from disk.** It opens at its sandboxed URL on the platform in the
+browser (which must be signed in to cawdev), because a `file://` page is a trusted page.
+
+**Thumbnails.** In iTerm2, WezTerm and kitty, `/shots` also prints each image small into
+the scrollback — not in advanced mode, not when `plain`, and never to any other terminal.
 
 ## What a project's rules can ask of it (R40)
 
