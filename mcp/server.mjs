@@ -301,10 +301,14 @@ function renderRounds(where) {
  * by counting is an agent one skipped question away from acting on the wrong
  * one.
  */
+/** R612: the platform closes a question with no person behind it; it reaches us as this. */
+const THE_PLATFORM = '(the platform)';
+const bySomeone = (email) => Boolean(email) && email !== THE_PLATFORM;
+
 function renderRound(asked, answered) {
   const title = asked?.title ?? 'The round';
   const lines = answered.map((question, at) => {
-    const said = question.answeredByEmail
+    const said = bySomeone(question.answeredByEmail)
       ? `${question.answeredByEmail}: ${question.answer}`
       : question.answer;
     const opinions = (question.opinions ?? [])
@@ -329,7 +333,10 @@ function renderAnswer(answered) {
     .map((opinion) => `  ${opinion.authorEmail}: ${opinion.body}`)
     .join('\n');
 
-  const answer = `${answered.answeredByEmail} answered:\n\n${answered.answer}`;
+  // R612: no answeredByEmail means the platform closed it, not a person.
+  const answer = bySomeone(answered.answeredByEmail)
+    ? `${answered.answeredByEmail} answered:\n\n${answered.answer}`
+    : `Nobody answered — the question was closed:\n\n${answered.answer}`;
   return said ? `${answer}\n\nWhat people said before deciding:\n${said}` : answer;
 }
 
@@ -1693,7 +1700,7 @@ const TOOLS = [
       if (answered) {
         return renderRound(null, answered);
       }
-      return `Still unfinished. Call await_group again with group_id ${args.group_id}.`;
+      return `Still unfinished. Call await_group again with group_id ${args.group_id} to keep waiting. If you carry on instead, the round stays in their inbox — and the run reads as waiting on them — until this stage ends; then it is closed, and an answer given after that is refused.`;
     },
   },
 
@@ -1774,7 +1781,7 @@ const TOOLS = [
       if (answered) {
         return renderAnswer(answered);
       }
-      return `Still nothing. Call await_answer again with question_id ${args.question_id}.`;
+      return `Still nothing. Call await_answer again with question_id ${args.question_id} to keep waiting. If you carry on instead, the question stays in their inbox — and the run reads as waiting on them — until this stage ends; then it is closed, and an answer given after that is refused.`;
     },
   },
 

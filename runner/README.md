@@ -358,6 +358,33 @@ having none.
 
 ### Advanced mode: one card per session
 
+**Advanced mode is the default terminal (R624).** `cawdev` opens in it wherever
+the terminal can draw it — a TTY, not `TERM=dumb`, at least 80×24. Below that,
+or through a pipe (`--watch-only | …`), it is the scrollback, with one line
+saying why. `cawdev --simple` and `/simple` are the scrollback terminal;
+`/advanced-mode` is the way back; the choice is remembered per platform in
+`prefs.mjs` (`mode: simple|advanced`) beside `/agent` and `/matrix`. This does
+not reopen R81 — it weighs it again: with several sessions and a roadmap on one
+machine, R81's reason (a full-screen repaint eats the scrollback) no longer
+wins, and the scrollback is one key away. `/export` (or `/export 3`,
+`/export R29`) lays a session's log into the normal screen so the terminal's own
+search and copy reach it; quitting and `/simple` lay in what the focused
+session said.
+
+**The motion is a spinner and a robot, not rain.** The rain is **off by
+default** (`/matrix on` brings it back exactly as it was, remembered). A
+running card's status mark, and the mark on the current stage of its walk,
+turn: `◴ ◵ ◶ ◷` for a stage that writes (plan, code, merge, release, roadmap,
+interview), `◜ ◝ ◞ ◟` for one that only reads (test, ask, audit, scope), a
+frame every two ticks of the 120 ms clock. A waiting card holds `◆`, a queued
+one rests on the spinner's first frame. A status that changes is drawn
+reversed for four ticks. The robots (a finished plan, a finished development
+docked at `▶ review`, nothing built, a landing at `▶ main`, a merge in flight)
+move whether the rain is on or off. `n`/`N` move to the next/previous card
+that needs you (`n` still refuses when the focused card holds a permission
+request); `/close 3`, `/close all` and `w` close ended cards. A running card is
+refused with `that session is still running · x x cancels it`.
+
 `/advanced-mode` gives **one card per session** this machine is running, or
 has run since you attached. The cards sit above **the prompt, which stays at
 the bottom** the way a shell's does. A session's log scrolling past in a corner was neither readable
@@ -1116,7 +1143,13 @@ files at all. R47 removes the need for this by giving each run a workspace.
    and leaves the run exactly as the platform has it; if it is QUEUED, the next
    poll offers it again and it is claimed properly. Only 400, 404, 409 and 410
    count as a refusal; any other status (401, 403, 408, 429), a network error or
-   a 5xx still fails the run.
+   a 5xx still fails the run. For a MERGE run (R621), the merge the daemon
+   prepared is undone before it lets go, on a refusal and on a failure alike
+   (`git merge --abort`, or a `reset --keep` past its own merge commit), so the
+   checkout is offered again as it was; the FAILED summary says so. A checkout
+   found mid-merge that the daemon did not start is refused with a sentence
+   naming `git commit` and `git merge --abort`, and is not touched; a MERGE run
+   carrying on its own branch is the exception.
 3. **Spawns the agent** in that directory, in its own process group, with the
    run token in its environment and an `.mcp.json` pointing at cawdev's MCP
    server. **Your own token never reaches the child.**

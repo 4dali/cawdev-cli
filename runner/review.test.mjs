@@ -239,8 +239,13 @@ test('a confirmed merge greys its card out as merging, refuses acts on it, and c
     assert.ok(ui.windows().some((meta) => meta.id === 'run-dev'));
 
     card.status = 'MERGED';
-    await until(() => !ui.windows().some((meta) => meta.id === 'run-dev'));
-    assert.equal(ui.windows().length, 0, 'landed: its card is gone');
+    await until(() => ui.sessions.get('run-dev').merging?.state === 'landed');
+    ui.flush();
+    frame = frameOf(ui);
+    assert.match(frame, /✓ merged · closes in \ds/, 'landed: the robot waves and the card counts down');
+    assert.match(frame, /\[\^_\^\]/);
+    await ui.runCommand('/close now');
+    assert.equal(ui.windows().length, 0, '/close now closes it without waiting');
     frame = frameOf(ui);
     assert.doesNotMatch(frame, /merging/);
     ui.leaveSplit();

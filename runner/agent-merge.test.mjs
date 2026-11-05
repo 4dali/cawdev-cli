@@ -154,10 +154,10 @@ async function aRepositoryWhoseBranchIsOnlyOnOrigin() {
 }
 
 async function daemonWith(t, { path, name, rules = null, offers = [MERGE_RUN],
-    workspaceRequests = [], env = {} }) {
+    workspaceRequests = [], env = {}, refuseTransition = null }) {
   // The session has to stay up long enough for its spawn line to be read: a
   // reaped child is indistinguishable from one that was never spawned.
-  const platform = await fakePlatform({ offers, rules, workspaceRequests, runLive: true });
+  const platform = await fakePlatform({ offers, rules, workspaceRequests, runLive: true, refuseTransition });
   const home = await mkdtemp(join(tmpdir(), 'cawdev-agent-merge-cfg-'));
   const config = join(home, 'config.json');
   await writeFile(config, JSON.stringify({
@@ -528,4 +528,108 @@ test('a pull request the host has not judged yet is OTHER, never "no conflict"',
   assert.equal(done.failure, 'OTHER');
   // The wait gave up rather than waited for ever, and said so.
   assert.match(said(), /still has not computed mergeability/);
+});
+
+// --- R621: a MERGE run that never starts puts its checkout back ----------------
+
+const refuseRunning = (status, message) =>
+  (transition) => (transition.state === 'RUNNING' ? { status, message } : null);
+
+const headOf = async (path) => (await run('git', ['rev-parse', 'HEAD'], { cwd: path })).stdout.trim();
+const statusOf = async (path) => (await run('git', ['status', '--porcelain'], { cwd: path })).stdout.trim();
+const midMerge = (path) => run('git', ['rev-parse', '-q', '--verify', 'MERGE_HEAD'], { cwd: path })
+  .then(() => true, () => false);
+
+test('R621: a refused RUNNING after a conflicting merge leaves no merge behind', async (t) => {
+  const path = await aRepositoryThatConflicts();
+  const tip = await headOf(path);
+  const { platform, said } = await daemonWith(t, {
+    path, name: 'agent-merge-undo-conflict', refuseTransition: refuseRunning(400, 'cancelled while preparing'),
+  });
+
+  assert.ok(await until(said, /leaving it as the platform has it/), said());
+  assert.ok(await until(said, /was undone/), said());
+  assert.equal(await midMerge(path), false, said());
+  assert.equal(await statusOf(path), '', said());
+  assert.equal(await headOf(path), tip);
+  assert.match(said(), /was undone \(git merge --abort\)/);
+  assert.deepEqual(platform.transitions.filter((each) => each.state === 'FAILED'), []);
+  assert.ok(!said().includes('spawning:'), said());
+});
+
+test('R621: a refused RUNNING after a clean merge drops the local merge commit', async (t) => {
+  const path = await aRepositoryThatMergesCleanly();
+  const tip = await headOf(path);
+  const { said } = await daemonWith(t, {
+    path, name: 'agent-merge-undo-clean', refuseTransition: refuseRunning(400, 'cancelled while preparing'),
+  });
+
+  assert.ok(await until(said, /leaving it as the platform has it/), said());
+  assert.ok(await until(said, /was undone/), said());
+  assert.equal(await headOf(path), tip, said());
+  assert.equal(await statusOf(path), '');
+  assert.match(said(), /merge commit prepared on r155-work was undone/);
+});
+
+test('R621: a RUNNING post that fails with a 500 undoes the merge before posting FAILED', async (t) => {
+  const path = await aRepositoryThatConflicts();
+  const tip = await headOf(path);
+  const { platform, said } = await daemonWith(t, {
+    path, name: 'agent-merge-undo-500', refuseTransition: refuseRunning(500, 'the platform fell over'),
+  });
+
+  assert.ok(await platform.until((transitions) => transitions.some((each) => each.state === 'FAILED')), said());
+  const failed = platform.transitions.find((each) => each.state === 'FAILED');
+  assert.match(failed.summary, /the platform fell over/);
+  assert.match(failed.summary, /was undone/);
+  assert.equal(await midMerge(path), false);
+  assert.equal(await headOf(path), tip);
+  const stash = await run('git', ['stash', 'list'], { cwd: path });
+  assert.equal(stash.stdout.trim(), '');
+});
+
+test('R621: a merge git refuses through a hook is undone too', async (t) => {
+  const path = await aRepositoryThatMergesCleanly();
+  const tip = await headOf(path);
+  const hook = join(path, '.git', 'hooks', 'pre-merge-commit');
+  await writeFile(hook, '#!/bin/sh\nexit 1\n');
+  await chmod(hook, 0o755);
+  const { platform, said } = await daemonWith(t, { path, name: 'agent-merge-undo-hook' });
+
+  assert.ok(await platform.until((transitions) => transitions.some((each) => each.state === 'FAILED')), said());
+  const failed = platform.transitions.find((each) => each.state === 'FAILED');
+  assert.match(failed.summary, /could not be merged/);
+  assert.equal(await midMerge(path), false, said());
+  assert.equal(await headOf(path), tip);
+  assert.equal(await statusOf(path), '');
+});
+
+test('R621: a checkout somebody left mid-merge is refused with a sentence of its own, and not touched', async (t) => {
+  const path = await aRepositoryThatConflicts();
+  await run('git', ['merge', 'origin/main'], { cwd: path }).catch(() => undefined);
+  assert.equal(await midMerge(path), true, 'the fixture should be mid-merge');
+  const other = { id: 'run-other', projectSlug: 'board', label: 'another', branch: 'r2-other', profile: 'CODE' };
+  const { platform, said } = await daemonWith(t, { path, name: 'agent-merge-midmerge', offers: [other] });
+
+  assert.ok(await platform.until((transitions) => transitions.some((each) => each.state === 'FAILED')), said());
+  const failed = platform.transitions.find((each) => each.state === 'FAILED');
+  assert.match(failed.summary, /is in the middle of a merge/);
+  assert.match(failed.summary, /merge --abort/);
+  assert.match(failed.summary, /commit/);
+  assert.equal(await midMerge(path), true, 'the daemon must not touch a merge it did not start');
+});
+
+test('R621: a refused RUNNING after a fast-forward merge moves the branch back', async (t) => {
+  const path = await aRepositoryThatMergesCleanly();
+  const git = (args) => run('git', args, { cwd: path });
+  // Branch strictly behind main: reset it to the fork point, so the merge fast-forwards.
+  await git(['reset', '-q', '--hard', 'main~1']);
+  const tip = await headOf(path);
+  const { said } = await daemonWith(t, {
+    path, name: 'agent-merge-undo-ff', refuseTransition: refuseRunning(400, 'cancelled while preparing'),
+  });
+
+  assert.ok(await until(said, /leaving it as the platform has it/), said());
+  assert.ok(await until(said, /was undone/), said());
+  assert.equal(await headOf(path), tip, said());
 });

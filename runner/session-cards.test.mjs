@@ -8,8 +8,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { painter, stripAnsi, visibleWidth } from '../lib/ansi.mjs';
 import {
-  CARD_MAX_HEIGHT, CARD_MIN_HEIGHT, ROBOT_SIGN, cardGrid, cardStatus, elapsed, mergingRobotLines, nowLine, rainLines, robotLines,
-  seedOf, sessionCardLines, stageWalk,
+  CARD_MAX_HEIGHT, CARD_MIN_HEIGHT, ROBOT_SIGN, WALK_IN_TICKS, badgeOf, beating, cardGrid, cardStatus, devDoneRobotLines, elapsed,
+  landingRobotLines, mergingRobotLines, nothingBuiltRobotLines, nowLine, planWalkInLines, rainLines, robotLines,
+  seedOf, sessionCardLines, spinnerFor, spinnerFrame, stageWalk,
 } from './session-cards.mjs';
 
 const ink = painter(0);
@@ -60,7 +61,7 @@ test('the title gives way before the status does, and says it was cut', () => {
 test('where a session stands: waiting on you first, then queued, running, and how it ended', () => {
   const now = Date.parse('2026-10-30T12:00:00Z');
   const running = { state: 'running', startedAt: '2026-10-30T11:48:00Z' };
-  assert.deepEqual(cardStatus(running, null, now), { key: 'running', mark: '●', word: 'running · 12m' });
+  assert.deepEqual(cardStatus(running, null, now), { key: 'running', mark: '◴', word: 'running · 12m' });
   assert.equal(cardStatus(running, 'waiting on you', now).key, 'waiting', 'waiting beats running');
   assert.equal(cardStatus({ state: 'queued' }).key, 'queued');
   assert.equal(cardStatus({ ended: true, view: { state: 'FINISHED', profile: 'CODE' } }).key, 'done');
@@ -143,7 +144,7 @@ test('a planned card has a robot instead of rain: it paces, waves and holds up t
   }, ink).map(stripAnsi).join('\n');
   assert.match(card, /✓ planned/);
   assert.match(card, /\[o_o\] ✓ plan done/, 'with the rain off the robot stays, standing');
-  assert.doesNotMatch(card, /[ｱ-ﾝ]/, 'no rain on a planned card');
+  assert.doesNotMatch(card, /[ZXJ*<>]/, 'no rain on a planned card');
 });
 
 test('a merging card has its own robot: it carries the branch to the base, and stands still with the rain off', () => {
@@ -160,4 +161,98 @@ test('a merging card has its own robot: it carries the branch to the base, and s
   assert.match(arms, /^ \/\[_\]=\[■\] +▶ main$/, 'the base stays at the right edge');
   assert.ok(at(20)[1].indexOf('[') > at(0)[1].indexOf('['), 'it walks to the base');
   assert.deepEqual(at(0, 4, true), at(31, 4, true), '/matrix off: it stands still');
+});
+
+const read = (rows) => rows.map(stripAnsi).join('\n');
+
+test('the spinner: write scope is the solid quadrant counter-clockwise, read scope the thin arc clockwise, one frame every two ticks', () => {
+  assert.deepEqual([0, 2, 4, 6, 8].map((tick) => spinnerFrame(spinnerFor('CODE', 'implement'), tick)), ['◴', '◵', '◶', '◷', '◴']);
+  assert.deepEqual([0, 1, 2, 4, 6].map((tick) => spinnerFrame(spinnerFor('CODE', 'test'), tick)), ['◜', '◜', '◝', '◞', '◟']);
+  for (const stage of ['plan', 'code', 'merge', 'release', 'roadmap', 'interview']) assert.equal(spinnerFor(null, stage)[0], '◴', stage);
+  for (const stage of ['test', 'ask', 'audit', 'scope']) assert.equal(spinnerFor(null, stage)[0], '◜', stage);
+  const running = { state: 'running', stage: 'test' };
+  assert.equal(cardStatus(running, null, 0, 4).mark, '◞', 'a running card turns');
+  assert.equal(cardStatus({ state: 'queued', stage: 'test' }, null, 0, 4).mark, '◜', 'a queued card holds the resting frame');
+  assert.equal(cardStatus(running, 'waiting on you', 0, 4).mark, '◆', 'a waiting card holds the diamond');
+  assert.equal(stageWalk(['plan', 'implement', 'test'], 'implement', 80, ink, 2), 'plan ✓ ─ implement ◵ ─ test ○');
+  assert.equal(stageWalk(['plan', 'implement', 'test'], 'test', 80, ink, 2), 'plan ✓ ─ implement ✓ ─ test ◝');
+});
+
+test('the badge set follows the actions: PLAN violet, DEV terracotta, TEST/MERGE/RELEASE light, anything else grey; no review', () => {
+  const paint = painter(3);
+  assert.equal(stripAnsi(badgeOf('TEST', paint)), ' TEST ');
+  assert.equal(stripAnsi(badgeOf('REVIEW', paint)), ' REVIEW ', 'a profile with no badge is its own word');
+  assert.equal(badgeOf('TEST', paint), badgeOf('MERGE', paint).replace('MERGE', 'TEST'), 'TEST is as light as MERGE');
+  assert.notEqual(badgeOf('REVIEW', paint), badgeOf('MERGE', paint).replace('MERGE', 'REVIEW'), 'REVIEW is grey now');
+});
+
+test('a changed status beats reversed for four ticks, then settles', () => {
+  const paint = painter(3);
+  const at = (tick) => sessionCardLines({ width: 50, height: 6 }, {
+    n: 1, profile: 'CODE', title: 'R1', status: { key: 'done', mark: '✓', word: 'finished' }, changedAt: 10, tick, rain: false,
+  }, paint)[0];
+  assert.deepEqual([9, 10, 13, 14].map((tick) => beating(10, tick)), [false, true, true, false]);
+  assert.match(at(11), /\x1b\[7m/, 'bright while it beats');
+  assert.equal(at(14).split('\x1b[7m').length, 2, 'only the badge is reversed once it settles');
+});
+
+test('the moment a plan finishes: the robot walks in from x = -6, a column every two ticks, then paces', () => {
+  const at = (since) => read(planWalkInLines(30, 3, { since }, ink));
+  assert.equal(at(0).split('\n')[1].trimEnd(), '', 'at x = -6 the body is not in yet');
+  assert.match(at(8).split('\n')[1], /^_\]\//, 'the arms reach the card at x = -2, cut at the edge');
+  assert.match(at(12), /^\[o_o\] ✓ plan done/, 'at x = 0 the head and sign are in');
+  assert.equal(at(WALK_IN_TICKS), read(robotLines(30, 3, { tick: 0 }, ink)), 'then the pacing robot, as shipped');
+  for (let since = 0; since < WALK_IN_TICKS; since++) {
+    planWalkInLines(30, 3, { since }, ink).forEach((row) => assert.equal(visibleWidth(row), 30));
+  }
+});
+
+test('the moment a development finishes: the robot carries the branch to ▶ review, sets it down, steps back and waits', () => {
+  const at = (since, width = 40, rows = 3) => devDoneRobotLines(width, rows, { since }, ink);
+  at(0).forEach((row) => assert.equal(visibleWidth(row), 40));
+  assert.match(read(at(16)), /\[>_>\] *\n *\/\[_\]=\[■\]/, 'carrying it, looking ahead');
+  assert.match(read(at(16)).split('\n')[1], /▶ review$/);
+  // x_end = 40 − 9 − 4 − 5 = 22, so it arrives at tick 60 and sets it down.
+  const set = read(at(61)).split('\n');
+  assert.match(set[1], /\/\[_\]\\.*\[■\] +▶ review$/, 'the branch stays by the dock');
+  const waits = read(at(200, 40)).split('\n');
+  assert.match(waits[0], /^ ✓ built · \/pr +\[o_o\]/, 'the sign, and the robot three columns back from where it stood');
+  assert.equal(waits[0].indexOf('[o_o]'), 19);
+  assert.match(read(at(60 + 4 + 22)).split('\n')[0], /\[-_-\]/, 'blinks every 23 ticks');
+  assert.match(read(at(60 + 4 + 38)).split('\n')[0], /\[>_>\]/, 'looks at the branch three ticks in every forty');
+  assert.match(read(at(60 + 4 + 5)).split('\n')[0], /\[o_o\]/);
+  assert.equal(devDoneRobotLines(40, 3, { still: true }, ink).length, 3);
+});
+
+test('nothing built: the robot walks in empty-handed, amber, shrugs six ticks in every thirty, and the sign says how to go on', () => {
+  const paint = painter(3);
+  const at = (since) => nothingBuiltRobotLines(50, 3, { since, ref: 'R598' }, ink);
+  assert.match(read(at(14)), /^ \[o_o\] ✗ nothing built · \/new plan R598/m);
+  assert.match(read(at(14 + 24)).split('\n')[1], /¯\[_\]¯/, 'the shrug');
+  assert.match(read(at(14 + 5)).split('\n')[1], /\/\[_\]\\/);
+  assert.match(read(at(14 + 22)).split('\n')[0], /\[-_-\]/, 'blinking');
+  assert.match(nothingBuiltRobotLines(50, 3, { since: 30 }, paint)[1], /\x1b\[33m|\x1b\[38/, 'amber, not green');
+  assert.match(read(nothingBuiltRobotLines(30, 3, { since: 30, ref: 'R598' }, ink)), /✗ nothing built(?! ·)/, 'the sign shortens when it must');
+});
+
+test('the landing: the branch is down at ▶ main, the robot waves twelve ticks, then walks off the right edge', () => {
+  const at = (since) => read(landingRobotLines(40, 3, { since }, ink)).split('\n');
+  assert.match(at(0)[0], /\[\^_\^\]/);
+  assert.match(at(0)[1], /\[■\] +▶ main$/);
+  assert.notEqual(at(0)[1], at(2)[1], 'the arms alternate');
+  assert.match(at(11)[0], /\[\^_\^\]/, 'waving for twelve ticks');
+  assert.doesNotMatch(at(12)[0], /\^/);
+  assert.doesNotMatch(at(80)[0], /\[/, 'gone off the edge');
+  assert.match(at(80)[1], /\[■\] +▶ main$/, 'the branch stays where it was set down');
+});
+
+test('a card draws its robot with the rain off, and no robot and no rain when failed or running', () => {
+  const card = (key, extra = {}) => sessionCardLines({ width: 44, height: 9 }, {
+    n: 1, profile: 'CODE', title: 'R1', status: { key, mark: '✓', word: key }, lines: ['a', 'b', 'c'], footer: '/close', tick: 5, rain: false, ...extra,
+  }, ink).map(stripAnsi).join('\n');
+  assert.match(card('done'), /\[>_>\]|\[o_o\]/);
+  assert.match(card('idle', { ref: 'R9' }), /nothing built/);
+  assert.match(card('landed', { base: 'main' }), /▶ main/);
+  assert.doesNotMatch(card('stopped'), /[ZXJ*<>0-9]{2}[^│]*\[/, 'a stopped card is empty with the rain off');
+  assert.doesNotMatch(card('failed', { rain: true }), /\[o_o\]|\[>_>\]/, 'no robot for a failed card');
 });

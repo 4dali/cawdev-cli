@@ -17,7 +17,7 @@ import { loadPrefs } from './prefs.mjs';
 import {
   MIN_ZONE_WIDTH, PROMPT_ROWS, actionsFor, batchStartedLines, boardPreviewLines, branchForTask, carriesOnHere, composeFrame, moveInStrip, parseNew,
   roadmapStrip, builtNothing, commandWords, wordsText, stripColumns, subtitleFor, cardTitleFor, modelLabel, agentModelFor, sessionTag, splitLayout, tabsLine, tailOf, titleFor, toneFor, visibleSessions, windowLines,
-  readerFrame, wordsIn,
+  readerFrame, wordsIn, advancedBlocker,
 } from './split.mjs';
 
 process.env.CAWDEV_HISTORY_FILE = join(mkdtempSync(join(tmpdir(), 'cawdev-history-')), 'h.json');
@@ -81,7 +81,7 @@ test('a window is exactly its rectangle, at every width', () => {
     const lines = windowLines(rect, {
       title: '1 cawdev · R3 Push notifications on the mobile app · plan · running',
       body: ['a line', 'a very long line '.repeat(20), `${ESC}[32mgreen${ESC}[0m`],
-      footer: '/develop starts R3 · /close',
+      footer: '/develop starts R3 · w closes',
     }, ink);
     assert.equal(lines.length, 7, `height at ${width}`);
     for (const line of lines) {
@@ -166,14 +166,14 @@ test('a session is named by its window number, kind, card and project', () => {
 test('an ended plan offers its development; an ended dev offers the pull request until there is one', () => {
   assert.equal(actionsFor({ ended: false, view: { profile: 'PLAN', state: 'RUNNING' } }), '');
   assert.equal(actionsFor({ ended: true, view: { profile: 'PLAN', state: 'FINISHED', entryRef: 'R3' } }),
-    'd develops R3 here, in place of this plan · /open reads the plan on cawdev · /close');
+    'd develops R3 here, in place of this plan · /open reads the plan on cawdev · w closes');
   const dev = { ended: true, view: { profile: 'CODE', state: 'FINISHED', branch: 'r3-x', prUrl: null } };
-  assert.equal(actionsFor(dev), '/pr opens the pull request · /close');
+  assert.equal(actionsFor(dev), '/pr opens the pull request · w closes');
   dev.view.prUrl = 'https://github.com/x/y/compare/main...r3-x';
-  assert.equal(actionsFor(dev), '/pr opens the pull request · /close', 'a compare link is not a pull request');
+  assert.equal(actionsFor(dev), '/pr opens the pull request · w closes', 'a compare link is not a pull request');
   dev.view.prUrl = 'https://github.com/x/y/pull/9';
-  assert.equal(actionsFor(dev), 'PR https://github.com/x/y/pull/9 · /open · /close');
-  assert.equal(actionsFor({ ended: true, view: { profile: 'CODE', state: 'FAILED', branch: 'r3-x' } }), '/close');
+  assert.equal(actionsFor(dev), 'PR https://github.com/x/y/pull/9 · /open · w closes');
+  assert.equal(actionsFor({ ended: true, view: { profile: 'CODE', state: 'FAILED', branch: 'r3-x' } }), 'w closes');
 });
 
 test('a finished development on a card offers /review, and /drop is the command alone', () => {
@@ -185,9 +185,9 @@ test('a finished development on a card offers /review, and /drop is the command 
       prUrl: 'https://github.com/benmoez/saasng/pull/369', workspace: '/home/ben/dev/cawdev-workspaces/saasng-auto-2',
     },
   };
-  assert.equal(actionsFor(dev), 'PR https://github.com/benmoez/saasng/pull/369 · /open · /review · /drop · /close');
+  assert.equal(actionsFor(dev), 'PR https://github.com/benmoez/saasng/pull/369 · /open · /review · /drop · w closes');
   assert.equal(actionsFor({ ...dev, view: { ...dev.view, entryRef: null } }),
-    'PR https://github.com/benmoez/saasng/pull/369 · /open · /drop · /close', 'no card, nothing to review');
+    'PR https://github.com/benmoez/saasng/pull/369 · /open · /drop · w closes', 'no card, nothing to review');
   assert.doesNotMatch(actionsFor({ ...dev, commits: 0 }), /\/review/, 'nothing built, nothing to review');
 });
 
@@ -422,7 +422,7 @@ test('advanced mode takes the alternate screen and gives it back', async () => {
     'no auto-wrap and the wheel sent to the program — the screen holds still, as in nano');
   ui.flush();
   const frame = ui.split.screen.last.map(stripAnsi).join('\n');
-  assert.match(frame, /━ 1  PLAN  Push notifications ━+ ● running ━┓/, 'a card: its number, kind, card and status');
+  assert.match(frame, /━ 1  PLAN  Push notifications ━+ ◴ running ━┓/, 'a card: its number, kind, card and status');
   assert.match(frame, /┃ ▸ saasng +┃/, 'the project on a line of its own, under the title');
   assert.match(frame, /cawdev ▸ laptop · ben@cawdev\.test/);
 
@@ -467,11 +467,13 @@ test('an ended plan stays in its window, and /develop starts its card on this ma
   await ui.runCommand('/advanced-mode');
   ui.onEvent({ type: 'runs', runs: [] });
   await settle();
+  ui.rainTick = 100;
+  for (const meta of ui.sessions.values()) meta.changedTick = 0;
   ui.flush();
   const frame = ui.split.screen.last.map(stripAnsi).join('\n');
   assert.match(frame, /1  PLAN  R2 Push notifications [─━]+ ✓ planned [─━]/);
   assert.match(frame, /\[o_o\] ✓ plan done/, 'a planned card has its robot, not the rain');
-  assert.match(frame, /d develops R2 here, in place of this plan · \/open reads the plan on cawdev · \/close/);
+  assert.match(frame, /d develops R2 here, in place of this plan · \/open reads the plan on cawdev · w closes/);
 
   await ui.runCommand('/develop');
   const post = calls.find((call) => call.method === 'POST');
@@ -827,7 +829,7 @@ test('/open opens the pull request; /drop deletes a finished on-demand checkout,
   ui.onEvent({ type: 'runs', runs: [] });
   await settle();
   ui.flush();
-  assert.match(ui.split.screen.last.map(stripAnsi).join('\n'), /· \/drop · \/close/);
+  assert.match(ui.split.screen.last.map(stripAnsi).join('\n'), /· \/drop · w closes/);
 
   await ui.openInBrowser();
   assert.deepEqual(opened, ['https://github.com/x/y/pull/12']);
@@ -878,10 +880,10 @@ test('a live session\'s window cannot be closed; an ended one can', async () => 
 
 test('a stopped session offers /carry-on, and says so once it is asked for', () => {
   const failed = { ended: true, view: { profile: 'CODE', state: 'FAILED', branch: 'r3-x', canCarryOn: true } };
-  assert.equal(actionsFor(failed), '/continue picks it back up here · /close');
+  assert.equal(actionsFor(failed), '/continue picks it back up here · w closes');
   assert.equal(actionsFor({ ...failed, carryAsked: true }),
-    'continue asked for — back when this machine takes it · /close');
-  assert.equal(actionsFor({ ended: true, view: { ...failed.view, canCarryOn: false } }), '/close',
+    'continue asked for — back when this machine takes it · w closes');
+  assert.equal(actionsFor({ ended: true, view: { ...failed.view, canCarryOn: false } }), 'w closes',
     'discarded, or nothing to go on from: nothing offered');
 });
 
@@ -892,10 +894,10 @@ test('a session stopped on a stale git lock offers /clean beside /continue', asy
     view: { profile: 'CODE', state: 'FAILED', branch: 'r104-x', canCarryOn: true, workspace: '/work/saasng', exitSummary },
   };
   assert.equal(actionsFor(failed),
-    '/clean removes the stale git lock · /continue picks it back up here · /close');
-  assert.equal(actionsFor({ ...failed, lockCleaned: true }), '/continue picks it back up here · /close');
+    '/clean removes the stale git lock · /continue picks it back up here · w closes');
+  assert.equal(actionsFor({ ...failed, lockCleaned: true }), '/continue picks it back up here · w closes');
   assert.equal(actionsFor({ ended: true, view: { ...failed.view, workspace: '/work/other' } }),
-    '/continue picks it back up here · /close', 'a lock outside its checkout is not offered');
+    '/continue picks it back up here · w closes', 'a lock outside its checkout is not offered');
 
   const run = {
     id: 'run-locked', profile: 'CODE', state: 'FAILED', live: false, label: 'Compose button',
@@ -1202,8 +1204,8 @@ test('the focused card is heavy, every other one thin', async () => {
   const frame = ui.split.screen.last.map(stripAnsi);
   const top = frame.find((line) => line.includes('Push notifications') && line.includes('Payments'));
   assert.ok(top, frame.join('\n'));
-  assert.match(top, /┏━ 1  PLAN  Push notifications ━+ ● running ━┓/, 'focused: heavy');
-  assert.match(top, /┌─ 2  DEV  Payments ─+ ● running ─┐/, 'not focused: thin');
+  assert.match(top, /┏━ 1  PLAN  Push notifications ━+ ◴ running ━┓/, 'focused: heavy');
+  assert.match(top, /┌─ 2  DEV  Payments ─+ ◴ running ─┐/, 'not focused: thin');
   assert.match(frame.join('\n'), /┌─ cawdev ▸ laptop/, 'the prompt keeps its solid line');
   ui.onKey('\t');
   ui.flush();
@@ -1420,22 +1422,30 @@ test('/view 2, /view R12 and v open that session\'s log; tab steps to the next w
   clearInterval(ui.split.plannedTimer);
 });
 
-test('/matrix off stills the cards and is remembered; on brings the rain back', async () => {
+test('the rain is off by default; /matrix on brings it, remembered; the spinner turns either way', async () => {
   const { ui } = client();
   ui.onEvent({ type: 'runs', runs: [PLAN] });
   await ui.runCommand('/advanced-mode');
+  const rain = (frame) => frame.some((line) => /[ZXJ*<>]/.test(line));
+  const marks = new Set();
+  for (const tick of [3, 5, 7, 9]) {
+    ui.rainTick = tick;
+    ui.flush();
+    const frame = ui.split.screen.last.map(stripAnsi);
+    assert.ok(!rain(frame), 'no rain unless asked for');
+    marks.add(frame.join('\n').match(/[◴◵◶◷] running/)?.[0]);
+  }
+  assert.equal(marks.size, 4, 'the running card turns through every frame');
+  await ui.runCommand('/matrix on');
   ui.rainTick = 3;
   ui.flush();
-  const rain = (frame) => frame.some((line) => /[ｱ-ﾝ]/.test(line));
   assert.ok(rain(ui.split.screen.last.map(stripAnsi)), 'a running card rains');
+  await until(async () => (await loadPrefs(ui.session.url)).matrix === true);
   await ui.runCommand('/matrix off');
   ui.flush();
   assert.ok(!rain(ui.split.screen.last.map(stripAnsi)));
-  await until(async () => (await loadPrefs(ui.session.url)).matrix === false);
-  assert.equal((await loadPrefs(ui.session.url)).matrix, false);
-  await ui.runCommand('/matrix on');
   await until(async () => (await loadPrefs(ui.session.url)).matrix === undefined);
-  assert.equal((await loadPrefs(ui.session.url)).matrix, undefined, 'on is the default, so nothing is kept');
+  assert.equal((await loadPrefs(ui.session.url)).matrix, undefined, 'off is the default, so nothing is kept');
   clearInterval(ui.split.plannedTimer);
 });
 
@@ -1695,7 +1705,7 @@ test('a dev session that finished with no commit is "nothing built", amber, and 
   assert.equal(builtNothing(meta), true);
   assert.equal(titleFor(meta), 'dev · finished · nothing built · R24 Signature');
   assert.equal(toneFor(meta), 'stopped', 'amber, not the green of work done');
-  assert.equal(actionsFor(meta), 'nothing was committed — /new plan R24 to re-plan it · /close');
+  assert.equal(actionsFor(meta), 'nothing was committed — /new plan R24 to re-plan it · w closes');
 
   const built = { ...meta, commits: 2 };
   assert.equal(builtNothing(built), false);
@@ -2225,3 +2235,150 @@ test('b in advanced mode focuses the roadmap strip, arrows browse cards and show
   await ui.runCommand('/advanced-mode off');
 });
 
+
+// --- R624: the default, /simple, closing, needs-you, export, the landing ---------
+
+test('advanced mode is the default wherever the terminal can draw it, and says why when it cannot', () => {
+  const fits = { tty: true, term: 'xterm-256color', columns: 80, rows: 24 };
+  assert.equal(advancedBlocker(fits), null);
+  assert.match(advancedBlocker({ ...fits, tty: false }), /pipe/);
+  assert.match(advancedBlocker({ ...fits, term: 'dumb' }), /TERM=dumb/);
+  assert.match(advancedBlocker({ ...fits, columns: 79 }), /79×24, advanced mode needs 80×24/);
+  assert.match(advancedBlocker({ ...fits, rows: 23 }), /80×23/);
+});
+
+test('a fresh launch opens advanced mode; --simple and a remembered /simple do not, and /advanced-mode is the way back', async () => {
+  const fresh = client();
+  fresh.ui.screenMode = 'advanced';
+  Object.defineProperty(fresh.ui, 'plain', { get: () => false });
+  const tty = process.stdin.isTTY;
+  process.stdin.isTTY = true;
+  try {
+    fresh.ui.openByDefault();
+    assert.ok(fresh.ui.split, 'opened in advanced mode');
+    clearInterval(fresh.ui.split.plannedTimer);
+
+    const simple = client();
+    Object.defineProperty(simple.ui, 'plain', { get: () => false });
+    simple.ui.screenMode = 'simple';
+    simple.ui.openByDefault();
+    assert.equal(simple.ui.split, null, '--simple stays in the scrollback');
+
+    const small = client();
+    Object.defineProperty(small.ui, 'plain', { get: () => false });
+    small.ui.screenMode = 'advanced';
+    small.ui.options.out.columns = 60;
+    small.ui.openByDefault();
+    assert.equal(small.ui.split, null);
+    assert.match(small.ui.pending.map(stripAnsi).join('\n'), /the scrollback, not advanced mode: the terminal is 60×30/);
+
+    await fresh.ui.runCommand('/simple');
+    assert.equal(fresh.ui.split, null, '/simple is the scrollback');
+    await until(async () => (await loadPrefs(fresh.ui.session.url)).mode === 'simple');
+    await fresh.ui.runCommand('/advanced-mode @saasng');
+    assert.ok(fresh.ui.split, '/advanced-mode is the way back');
+    await until(async () => (await loadPrefs(fresh.ui.session.url)).mode === undefined);
+    clearInterval(fresh.ui.split.plannedTimer);
+  } finally {
+    process.stdin.isTTY = tty;
+  }
+});
+
+const ENDED = (id, label) => ({ id, projectSlug: 'saasng', label, profile: 'CODE', state: 'running' });
+
+test('/close closes the focused ended card, /close 3 card 3, /close all every ended one; a running one is refused', async () => {
+  const { ui } = client();
+  ui.onEvent({ type: 'runs', runs: [ENDED('a', 'One'), ENDED('b', 'Two'), ENDED('c', 'Three')] });
+  await ui.runCommand('/advanced-mode');
+  ui.sessions.get('a').ended = true;
+  ui.sessions.get('b').ended = true;
+  await ui.runCommand('/close 3');
+  assert.match(ui.status, /still running · x x cancels it/);
+  assert.equal(ui.windows().length, 3);
+  await ui.runCommand('/close 2');
+  assert.deepEqual(ui.windows().map((meta) => meta.id), ['a', 'c']);
+  ui.sessions.get('c').ended = true;
+  await ui.runCommand('/close all');
+  assert.deepEqual(ui.windows(), []);
+  clearInterval(ui.split.plannedTimer);
+});
+
+test('w closes the focused ended card; n and N walk to the cards that need you, and the prompt title counts them', async () => {
+  const { ui } = client();
+  ui.onEvent({ type: 'runs', runs: [ENDED('a', 'One'), ENDED('b', 'Two'), ENDED('c', 'Three')] });
+  await ui.runCommand('/advanced-mode');
+  ui.approvals.set('a', { runId: 'a', approval: { id: 'x', toolName: 'Bash', summary: 'ls', askedAt: '2026-10-11T10:00:00Z' } });
+  ui.sessions.get('c').ended = true;
+  ui.flush();
+  assert.match(ui.split.screen.last.map(stripAnsi).join('\n'), /1 need you/);
+  ui.focusWindow('b');
+  ui.onKey('n');
+  assert.equal(ui.split.focus, 'a', 'n: the next card that needs you');
+  ui.focusWindow('b');
+  ui.onKey('N');
+  assert.equal(ui.split.focus, 'a');
+  ui.focusWindow('c');
+  ui.onKey('w');
+  assert.deepEqual(ui.windows().map((meta) => meta.id), ['a', 'b'], 'w is /close');
+  ui.focusWindow('b');
+  ui.onKey('w');
+  assert.equal(ui.windows().length, 2, 'a running card is not closed by w');
+  clearInterval(ui.split.plannedTimer);
+});
+
+test('/export lays a session\'s log into the scrollback, /export 2 the second one\'s', async () => {
+  const { ui, writes } = client();
+  ui.onEvent({ type: 'runs', runs: [ENDED('a', 'One'), ENDED('b', 'Two')] });
+  ui.lines.set('a', [{ kind: 'ASSISTANT', body: 'first said' }]);
+  ui.lines.set('b', [{ kind: 'ASSISTANT', body: 'second said' }]);
+  await ui.runCommand('/advanced-mode');
+  await ui.runCommand('/export 2');
+  assert.equal(ui.split, null, 'the normal screen, where the terminal\'s own search reaches it');
+  assert.ok(writes.join('').includes(`${ESC}[?1049l`));
+  const said = ui.pending.map(stripAnsi).join('\n');
+  assert.match(said, /second said/);
+  assert.doesNotMatch(said, /first said/);
+});
+
+test('a landed merge: the robot waves, the status counts down, and the card closes itself', async () => {
+  const { ui } = client();
+  ui.onEvent({ type: 'runs', runs: [ENDED('a', 'One')] });
+  await ui.runCommand('/advanced-mode');
+  const meta = ui.sessions.get('a');
+  meta.ended = true;
+  meta.merging = { state: 'landed', ref: 'R9', branch: 'r9-x', base: 'main', sha: 'abc1234', landedTick: 100 };
+  ui.rainTick = 100;
+  ui.flush();
+  let frame = ui.split.screen.last.map(stripAnsi).join('\n');
+  assert.match(frame, /✓ merged · closes in 3s/);
+  assert.match(frame, /landed on main as abc1234 · the card is MERGED/);
+  assert.match(frame, /\[\^_\^\]/);
+  assert.match(frame, /\/open the merge · \/close now/);
+  ui.rainTick = 112;
+  ui.flush();
+  assert.match(ui.split.screen.last.map(stripAnsi).join('\n'), /closes in 2s/);
+  assert.equal(ui.windows().length, 1);
+  clearInterval(ui.split.plannedTimer);
+});
+
+test('? opens the key table over the whole screen and esc closes it; the key line names ? and wraps instead of cutting', async () => {
+  const { ui } = client();
+  ui.onEvent({ type: 'runs', runs: [ENDED('a', 'One')] });
+  await ui.runCommand('/advanced-mode');
+  ui.flush();
+  const screen = () => ui.split.screen.last.map(stripAnsi).join('\n');
+  assert.match(screen(), /\? help/, 'the key line names the help key');
+  ui.onKey('?');
+  ui.flush();
+  assert.match(screen(), /keys\s+commands/);
+  assert.match(screen(), /this is all of it/);
+  ui.onKey('\x1b');
+  ui.flush();
+  assert.doesNotMatch(screen(), /this is all of it/);
+  clearInterval(ui.split.plannedTimer);
+});
+
+test('a window footer given as rows draws every row', () => {
+  const lines = windowLines({ top: 0, left: 0, width: 20, height: 6 }, { body: ['x'], footer: ['aaa', 'bbb'] }, painter(0)).map(stripAnsi);
+  assert.ok(lines.some((l) => l.includes('aaa')) && lines.some((l) => l.includes('bbb')));
+});

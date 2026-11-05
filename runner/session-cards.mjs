@@ -87,7 +87,7 @@ function spread(width, n) {
 const BADGES = {
   PLAN: ['PLAN', 'violetLight'],
   CODE: ['DEV', 'accent'],
-  REVIEW: ['REVIEW', 'text'],
+  TEST: ['TEST', 'text'],
   MERGE: ['MERGE', 'text'],
   RELEASE: ['RELEASE', 'text'],
 };
@@ -109,17 +109,19 @@ export function badgeOf(profile, ink) {
  * @param waiting a word when it waits on you (`waiting for an answer`), else null
  * @param now ms, for how long a live session has run
  */
-export function cardStatus(meta, waiting = null, now = Date.now()) {
+export function cardStatus(meta, waiting = null, now = Date.now(), tick = 0) {
   if (waiting) {
     return { key: 'waiting', mark: '◆', word: waiting };
   }
   if (!meta.ended) {
+    const shape = spinnerFor(meta.view?.profile ?? meta.profile, meta.stage);
     if (meta.state === 'queued' || meta.state === 'claiming') {
-      return { key: 'queued', mark: '◌', word: meta.state };
+      // Nothing moves while queued: the spinner rests on its first frame, grey.
+      return { key: 'queued', mark: shape[0], word: meta.state };
     }
     const since = Date.parse(meta.startedAt ?? '');
     const ran = Number.isFinite(since) ? ` · ${elapsed(now - since)}` : '';
-    return { key: 'running', mark: '●', word: `${meta.state ?? 'running'}${ran}` };
+    return { key: 'running', mark: spinnerFrame(shape, tick), word: `${meta.state ?? 'running'}${ran}` };
   }
   const state = meta.view?.state;
   if (!state || meta.view?.live) {
@@ -137,6 +139,36 @@ export function cardStatus(meta, waiting = null, now = Date.now()) {
   return { key: 'stopped', mark: '✕', word: String(state).toLowerCase().replace(/_/g, ' ') };
 }
 
+// --- the spinner ---------------------------------------------------------------
+
+/** A stage that writes turns the solid quadrant counter-clockwise: the rule `cawdev-actions.js` draws. */
+export const SPINNER_WRITES = ['◴', '◵', '◶', '◷'];
+/** A stage that only reads turns the thin arc clockwise. */
+export const SPINNER_READS = ['◜', '◝', '◞', '◟'];
+/** Stages that only read; every other action — plan, code, merge, release, roadmap, interview — writes. */
+const READING_STAGES = new Set(['test', 'ask', 'audit', 'scope', 'show']);
+const READING_PROFILES = new Set(['TEST', 'ASK', 'AUDIT', 'SCOPE']);
+
+/** The frames a session turns through: by its stage when it walks stages, else by its profile. */
+export function spinnerFor(profile, stage = null) {
+  const word = String(stage ?? '').toLowerCase();
+  if (word) return READING_STAGES.has(word) ? SPINNER_READS : SPINNER_WRITES;
+  return READING_PROFILES.has(String(profile ?? '').toUpperCase()) ? SPINNER_READS : SPINNER_WRITES;
+}
+
+/** One frame every two ticks, so every spinner on the screen is in phase. */
+export function spinnerFrame(shape, tick = 0) {
+  return shape[Math.floor(Math.max(0, tick) / 2) % shape.length];
+}
+
+/** How many ticks a changed value is drawn bright before it settles. */
+export const BEAT_TICKS = 4;
+
+/** Whether a value that changed at `changedAt` is still in its beat at `tick`. */
+export function beating(changedAt, tick) {
+  return Number.isFinite(changedAt) && tick - changedAt >= 0 && tick - changedAt < BEAT_TICKS;
+}
+
 /** `42s`, `12m`, `2h05`. */
 export function elapsed(ms) {
   const seconds = Math.max(0, Math.floor(ms / 1000));
@@ -149,7 +181,7 @@ export function elapsed(ms) {
 /** The colour of each status — the frame's, the mark's and the rain's. */
 const STATUS_PAINT = {
   running: 'success', waiting: 'warn', queued: 'muted', done: 'success', planned: 'success', merging: 'muted',
-  idle: 'warn', stopped: 'danger', ended: 'muted',
+  idle: 'warn', stopped: 'danger', ended: 'muted', landed: 'success',
 };
 
 export function statusPaint(key, ink) {
@@ -161,13 +193,15 @@ export function statusPaint(key, ink) {
  * one it is on. Too long for `width`, it says the count and the stage instead,
  * which still answers "how far has it got".
  */
-export function stageWalk(stages, current, width, ink) {
+export function stageWalk(stages, current, width, ink, tick = null) {
   if (!Array.isArray(stages) || !stages.length || !current) return '';
   const at = stages.indexOf(current);
+  // The mark on the current stage turns when a tick is given, as the status's does.
+  const mark = tick === null ? '●' : spinnerFrame(spinnerFor(null, current), tick);
   const words = stages.map((name, i) => {
     const word = String(name).toLowerCase();
     if (at < 0 || i > at) return ink.muted(`${word} ○`);
-    return i === at ? ink.bold(`${word} ●`) : ink.muted(`${word} ✓`);
+    return i === at ? ink.bold(`${word} ${mark}`) : ink.muted(`${word} ✓`);
   });
   const line = words.join(ink.muted(' ─ '));
   if (visibleWidth(line) <= width) return line;
@@ -227,8 +261,12 @@ export const RAIN = {
   ended: { speed: 0, density: 0.12, trail: 1 },
 };
 
-/** Half-width katakana and digits: one column each, which is what the rain is measured in. */
-const GLYPHS = 'ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ0123456789';
+/**
+ * Plain ASCII: one column in every terminal and every font. Half-width
+ * katakana are East Asian "halfwidth" — a terminal or font that draws them two
+ * columns wide pushed every rain row past the card's right border.
+ */
+export const GLYPHS = '0123456789=+*<>:ZXJ';
 
 /** A small integer hash — the same inputs, the same drop. */
 function mix(...values) {
@@ -384,6 +422,168 @@ export function mergingRobotLines(width, rows, { tick = 0, still = false, base =
   return [...new Array(Math.max(0, rows - drawn.length)).fill(' '.repeat(width)), ...drawn].slice(-rows);
 }
 
+// --- the robots' moments ----------------------------------------------------------
+//
+// Each is a pure function of `since`, the ticks since the card's status changed
+// (attach.mjs records the tick when it marks a session ended), so a test can
+// name the frame it wants. The pacing and merging robots above are unchanged.
+
+/** The tick the walk-in of a finished plan takes: from x = -6, a column every two ticks, in by x = 0. */
+export const WALK_IN_TICKS = 14;
+
+/** `text` placed at column `x` of a row `width` wide; a negative `x` cuts the text's front off. */
+function placed(text, x, width) {
+  const cut = x < 0 ? text.slice(Math.min(text.length, -x)) : text;
+  const left = Math.max(0, x);
+  return (' '.repeat(left) + cut).slice(0, width).padEnd(width);
+}
+
+/** Overlays plain `text` on the plain row `base` at `x`; spaces in `text` leave `base` alone. */
+function overlay(base, text, x) {
+  const chars = [...base];
+  [...text].forEach((ch, i) => {
+    const at = x + i;
+    if (at >= 0 && at < chars.length && ch !== ' ') chars[at] = ch;
+  });
+  return chars.join('');
+}
+
+/** Three plain rows → exactly `rows` painted ones, bottom-aligned, as the other robots are. */
+function stand(rowsOf, width, rows, paintRow) {
+  const drawn = (rows >= 3 ? rowsOf : rows === 2 ? [rowsOf[0], rowsOf[2]] : [rowsOf[0]])
+    .map((row, i, all) => paintRow(row, i, all.length));
+  return [...new Array(Math.max(0, rows - drawn.length)).fill(' '.repeat(width)), ...drawn].slice(-rows);
+}
+
+/** A finished plan, the moment it finishes: the robot walks in from the left carrying `✓ plan done`, then paces. */
+export function planWalkInLines(width, rows, { since = 0, tick = 0, still = false } = {}, ink) {
+  if (still || since >= WALK_IN_TICKS) {
+    return robotLines(width, rows, { tick: still ? 0 : Math.max(0, since - WALK_IN_TICKS), still }, ink);
+  }
+  const x = -6 + Math.floor(since / 2);
+  const sign = ` ${ROBOT_SIGN}`;
+  const legs = since % 2 ? ' / \\ ' : ' | | ';
+  const rowsOf = [`[o_o]${sign}`, '\\[_]/', legs];
+  return stand(rowsOf, width, rows, (row, i) => {
+    const plain = placed(row, x, width);
+    return i === 0 && row.length > 5
+      ? ink.bold(ink.success(plain.slice(0, Math.max(0, x + 5)))) + ink.success(plain.slice(Math.max(0, x + 5)))
+      : ink.bold(ink.success(plain));
+  });
+}
+
+/** Where a development's robot sets the branch down: just left of the dock's sign. */
+function dockOf(width, word) {
+  const dock = ` ▶ ${word}`;
+  return { dock, dockAt: Math.max(0, width - dock.length), branchX: Math.max(8, width - dock.length - 4) };
+}
+
+/** A plain row painted in `[from, to, paint]` segments, the rest in `base`. */
+function segments(plain, spans, base) {
+  let out = '';
+  let at = 0;
+  for (const [from, to, paint] of [...spans].sort((a, b) => a[0] - b[0])) {
+    if (from > at) out += base(plain.slice(at, from));
+    out += paint(plain.slice(from, to));
+    at = to;
+  }
+  return out + (at < plain.length ? base(plain.slice(at)) : '');
+}
+
+/** The dock's sign set on the row the branch sits on (the middle one, or the last when there is no room for three). */
+function withDock(rowsOf, rows, dock, width) {
+  const at = rows >= 3 ? 1 : rowsOf.length - 1;
+  return rowsOf.map((row, i) => (i === at && width > dock.length
+    ? row.slice(0, width - dock.length) + dock : row));
+}
+
+/**
+ * A finished development, the moment it finishes: the robot walks in carrying
+ * the branch (`[>_>]`, `/[_]=[■]`) to `▶ review`, sets it down (the `[■]` stays
+ * by the dock), steps back three columns and waits beside it — `[o_o]`, a blink
+ * every 23 ticks, a look at the branch (`[>_>]`) three ticks in every forty —
+ * under the sign `✓ built · /pr`.
+ */
+export function devDoneRobotLines(width, rows, { since = 0, still = false } = {}, ink) {
+  const { dock, dockAt, branchX } = dockOf(width, 'review');
+  const endX = Math.max(0, branchX - 5);
+  const walk = 2 * (endX + 8);
+  const t = still ? walk + 4 : since;
+  const carrying = t < walk + 1;
+  const back = carrying ? 0 : Math.min(3, t - walk - 1);
+  const x = carrying ? Math.min(endX, -8 + Math.floor(t / 2)) : Math.max(0, endX - back);
+  const waited = t - walk - 4;
+  const blink = !still && waited >= 0 && waited % 23 === 22;
+  const looking = !still && waited >= 0 && waited % 40 >= 37;
+  const head = carrying || looking ? '[>_>]' : blink ? '[-_-]' : '[o_o]';
+  const legs = !carrying || still ? ' | | ' : Math.floor(t / 2) % 2 ? ' / \\ ' : ' | | ';
+  const sign = '✓ built · /pr';
+  const signed = !carrying && x >= sign.length + 2;
+  let top = placed(head, x, width);
+  if (signed) top = overlay(top, sign, 1);
+  const plain = withDock([
+    top,
+    carrying ? placed('/[_]=[■]', x, width) : overlay(placed('/[_]\\', x, width), '[■]', branchX),
+    placed(legs, x, width),
+  ], rows, dock, width);
+  return stand(plain, width, rows, (row, i, n) => {
+    const onDock = (n >= 3 ? i === 1 : i === n - 1);
+    const spans = [];
+    if (onDock) spans.push([dockAt, width, ink.muted]);
+    if (signed && (n >= 3 ? i === 0 : i === 0)) spans.push([1, 1 + sign.length, ink.success]);
+    return segments(row, spans, (text) => ink.bold(ink.accent(text)));
+  });
+}
+
+/** Nothing built: the robot walks in empty-handed, amber, stands at the left and shrugs. */
+export function nothingBuiltRobotLines(width, rows, { since = 0, still = false, ref = null } = {}, ink) {
+  const paint = (text) => ink.bold(ink.warn(text));
+  const x = still ? 1 : Math.min(1, -6 + Math.floor(since / 2));
+  const waited = still ? 0 : since - 14;
+  const shrug = waited >= 0 && waited % 30 >= 24;
+  const blink = waited >= 0 && waited % 23 === 22;
+  const head = blink ? '[-_-]' : '[o_o]';
+  const arms = shrug ? '¯[_]¯' : '/[_]\\';
+  const sign = ` ✗ nothing built · /new plan ${ref ?? '<card>'}`;
+  const shown = width - 6 - 1 >= sign.length ? sign : ' ✗ nothing built';
+  const rowsOf = [head + (x >= 0 ? shown : ''), arms, ' | | '];
+  return stand(rowsOf, width, rows, (row, i) => {
+    const plain = placed(row, x, width);
+    return i === 0 && x >= 0
+      ? paint(plain.slice(0, x + 5)) + ink.warn(plain.slice(x + 5))
+      : paint(plain);
+  });
+}
+
+/** Ticks the robot waves for after a landing, and ticks it then takes to walk off a card `width` wide. */
+export const WAVE_TICKS = 12;
+/** A landed card closes itself this many ticks after it lands (3 s at 120 ms). */
+export const CLOSE_AFTER_TICKS = 25;
+
+/**
+ * The landing: the branch is set down at `▶ main`, the robot waves (`[^_^]`,
+ * arms alternating) for twelve ticks and walks off the right edge.
+ */
+export function landingRobotLines(width, rows, { since = 0, still = false, base = 'main' } = {}, ink) {
+  const { dock, dockAt, branchX } = dockOf(width, base);
+  const stands = Math.max(0, branchX - 8);
+  const t = still ? 0 : since;
+  const waving = t < WAVE_TICKS;
+  // Off the edge before the card closes itself, however wide the card is.
+  const pace = Math.max(1, Math.ceil((width - stands) / (CLOSE_AFTER_TICKS - WAVE_TICKS - 1)));
+  const x = stands + Math.max(0, t - WAVE_TICKS) * pace;
+  const arms = !waving ? '/[_]\\' : Math.floor(t / 2) % 2 ? '\\[_]/' : '/[_]\\';
+  const head = waving ? '[^_^]' : '[>_>]';
+  const legs = !waving && Math.floor(t / 2) % 2 ? ' / \\ ' : ' | | ';
+  const plain = withDock([
+    placed(head, x, width),
+    overlay(placed(arms, x, width), '[■]', branchX),
+    placed(legs, x, width),
+  ], rows, dock, width);
+  return stand(plain, width, rows, (row, i, n) => segments(
+    row, (n >= 3 ? i === 1 : i === n - 1) ? [[dockAt, width, ink.muted]] : [], (text) => ink.bold(ink.accent(text))));
+}
+
 // --- a card --------------------------------------------------------------------
 
 /**
@@ -420,7 +620,10 @@ export function sessionCardLines(rect, card, ink) {
   const title = titleRoom >= 4 ? ` ${ellipsed(card.title ?? '', titleRoom - 1)} ` : ' ';
   const label = `${left}${badge}${title}`;
   const fill = Math.max(0, inner - 1 - visibleWidth(label) - visibleWidth(status) - 1);
-  const shownStatus = visibleWidth(label) + visibleWidth(status) + 2 <= inner ? paint(status) : '';
+  // A status that changed is drawn reversed for a few ticks, then settles.
+  const beat = card.changedAt !== undefined && beating(card.changedAt, card.tick ?? 0);
+  const shownStatus = visibleWidth(label) + visibleWidth(status) + 2 <= inner
+    ? (beat ? ink.reverse(paint(status)) : paint(status)) : '';
   const top = paint(tl + h) + (card.focused ? ink.bold(label) : label)
     + paint(h.repeat(shownStatus ? fill : Math.max(0, inner - 1 - visibleWidth(label)))) + shownStatus
     + paint((shownStatus ? h : '') + tr);
@@ -432,15 +635,24 @@ export function sessionCardLines(rect, card, ink) {
   const room = Math.max(0, height - 2 - footer);
   const words = (card.lines ?? []).filter((line) => line !== null && line !== undefined).slice(0, room);
   const spare = room - words.length;
+  // The robots move whether the rain is on or off: they are not the matrix.
+  const since = Number.isFinite(card.since) ? card.since : null;
   const rain = spare <= 0 ? []
-    // A planned card has its robot whatever `/matrix` says; off, it stands still.
     : card.status.key === 'planned'
-      ? robotLines(inner, spare, { tick: card.tick, still: card.rain === false }, ink)
+      ? (since === null ? robotLines(inner, spare, { tick: card.tick }, ink)
+        : planWalkInLines(inner, spare, { since }, ink))
       : card.status.key === 'merging'
-        ? mergingRobotLines(inner, spare, { tick: card.tick, still: card.rain === false, base: card.base }, ink)
-      : card.rain === false
-        ? new Array(spare).fill('')
-        : rainLines(inner, spare, { seed: card.seed, tick: card.tick, mood: card.status.key }, ink);
+        ? mergingRobotLines(inner, spare, { tick: card.tick, base: card.base }, ink)
+        : card.status.key === 'done'
+          ? devDoneRobotLines(inner, spare, { since: since ?? 1e6 }, ink)
+          : card.status.key === 'idle'
+            ? nothingBuiltRobotLines(inner, spare, { since: since ?? 1e6, ref: card.ref }, ink)
+            : card.status.key === 'landed'
+              ? landingRobotLines(inner, spare, { since: since ?? 1e6, base: card.base }, ink)
+              // Failed, running, waiting, queued, stopped: no robot. The rain only when asked for.
+              : card.rain !== true || card.status.key === 'failed'
+                ? new Array(spare).fill('')
+                : rainLines(inner, spare, { seed: card.seed, tick: card.tick, mood: card.status.key }, ink);
   const lines = [top, ...words.map(said), ...rain.map(row)];
   if (footer) lines.push(said(ink.muted(card.footer)));
   lines.push(paint(bl + h.repeat(inner) + br));

@@ -118,6 +118,9 @@ async function aSonarQube(answer = () => null) {
     response.setHeader('content-type', 'application/json');
     // R318: a test's own answer to the finding checks comes first.
     const own = answer(new URL(request.url, 'http://x'));
+    if (own?.hang) {
+      return; // R622: accepted, never answered
+    }
     if (own) {
       response.statusCode = own.status ?? 200;
       return response.end(JSON.stringify(own.body ?? {}));
@@ -167,7 +170,7 @@ async function aSonarQube(answer = () => null) {
   return {
     url: `http://127.0.0.1:${server.address().port}`,
     asked,
-    close: () => server.close(),
+    close: () => { server.closeAllConnections(); server.close(); },
   };
 }
 
@@ -326,6 +329,22 @@ test('a machine with no scanner reports an error reading, and the run goes on to
 
   // A failed scan never fails a run.
   assert.ok(await platform.until((all) => all.some((each) => each.state === 'FINISHED')), said());
+  assert.ok(!platform.transitions.some((each) => each.state === 'FAILED'), said());
+});
+
+test('R622: a SonarQube that never answers the task poll is an error reading within the block\'s timeout', async (t) => {
+  // 2s, not 1: the deadline starts before the version lookup and the scanner run,
+  // so 1s could expire before the first poll and pass against the old code too.
+  const { platform, said, sonar } = await daemonWith(t, {
+    name: 'test-quality-hang',
+    quality: { timeoutSeconds: 2 },
+    sonarAnswer: (url) => (url.pathname === '/api/ce/task' ? { hang: true } : null),
+  });
+
+  assert.ok(await untilStageBegan(platform, 'MEMORY'), said());
+  assert.equal(platform.qualityReports.length, 1, said());
+  assert.match(platform.qualityReports[0].error, /not finished analysing after 2s/);
+  assert.ok(sonar.asked.some((each) => each.url.startsWith('/api/ce/task')), 'the poll was never made');
   assert.ok(!platform.transitions.some((each) => each.state === 'FAILED'), said());
 });
 

@@ -64,10 +64,10 @@ import { restartNeededFor } from '../lib/runner-config.mjs';
 import {
   BOARD_COLUMNS, PROMPT_ROWS, SplitScreen, boardPreviewLines, moveInStrip, readerFrame, stripColumns, tabsLine, visibleSessions, actionsFor, composeFrame,
   batchStartedLines, carriesOnHere, builtNothing, cardLines, columnOf, cardTitleFor, commandWords, wordsText, subtitleFor, agentModelFor, wordWrap, isAutoCheckout, isPullRequest, parseNew, roadmapStrip, sessionTag, titleFor,
-  windowLines, showWaitingLine,
+  windowLines, showWaitingLine, advancedBlocker,
 } from './split.mjs';
 import {
-  CARD_MIN_HEIGHT, cardGrid, cardStatus, nowLine, seedOf, sessionCardLines, stageWalk,
+  CARD_MIN_HEIGHT, CLOSE_AFTER_TICKS, cardGrid, cardStatus, nowLine, seedOf, sessionCardLines, stageWalk,
 } from './session-cards.mjs';
 import { KNOWN_AGENTS, agentOfCommand } from '../lib/agents.mjs';
 import { loadPrefs, savePrefs } from './prefs.mjs';
@@ -93,6 +93,19 @@ import {
 // the rest of the input and the rest of the layout. The tests that pin the
 // arithmetic import them here.
 export { clip, keyList, keysIn, stripAnsi, visibleWidth, wrap };
+
+/** Colored key parts packed into rows of `width`, between keys — none is cut off. */
+function packKeys(parts, width, ink) {
+  const sep = ink.muted(' · ');
+  const rows = [];
+  let row = '';
+  for (const part of parts) {
+    const next = row ? row + sep + part : part;
+    if (row && visibleWidth(next) > width) { rows.push(row); row = part; } else row = next;
+  }
+  if (row) rows.push(row);
+  return rows;
+}
 
 const ESC = '\x1b';
 
@@ -663,7 +676,7 @@ export async function attach(argv, { url, ...options } = {}) {
   // Spread second so `--attach`'s own wiring wins: there the daemon IS this
   // process and quitting has always stopped it.
   const ui = new Attached(socket, session,
-    { leaveRunning: argv.includes('--leave-running'), ...options });
+    { leaveRunning: argv.includes('--leave-running'), simple: argv.includes('--simple'), ...options });
   await ui.start();
 }
 
@@ -904,6 +917,8 @@ function refOf(word) {
 const SPLIT_COMPLETIONS = 6;
 /** How often the cards' rain moves a step (session-cards.mjs `RAIN`): eight a second. */
 const RAIN_STEP_MS = 120;
+/** The cards' clock, from the wall: a tick stamped while the reader was up is still the right tick. */
+const clockTick = () => Math.floor(Date.now() / RAIN_STEP_MS);
 
 /** The slash commands, and the one place they are described. */
 const COMMANDS = [
@@ -929,7 +944,9 @@ const COMMANDS = [
   ['/refresh', "read the cards and their statuses from cawdev again — advanced mode's roadmap"],
   ['/open', "open the session's pull request in your browser — on a finished plan, its card and plan; on one waiting for you or at SHOW, its page on cawdev"],
   ['/view', "in advanced mode, a session's log over the whole screen: /view for the focused one, /view 2 for card 2, /view R29 for the session on R29 (v too); a card here in the terminal: /view R29 with no session on it, /view <words of its title> (@project), /view card for the session's; /view alone reads what a session waits on in full (at SHOW, looks and decides), or, outside advanced mode, opens it on cawdev"],
-  ['/matrix', 'the rain on advanced mode\'s cards, on or off: /matrix on|off, remembered'],
+  ['/matrix', 'the rain on advanced mode\'s cards, off by default: /matrix on|off, remembered; the spinner and the robots move either way'],
+  ['/simple', 'the scrollback terminal (cawdev --simple starts in it); /advanced-mode is the way back; remembered'],
+  ['/export', "lay the focused session's log into the scrollback so the terminal's own search and copy reach it: /export, /export 3, /export R29"],
   ['/shots', 'the screenshots a session waiting at SHOW took: /shots, /shots 2, /shots all, /shots round 1'],
   ['/accept', 'accept the screenshots — the pull request opens'],
   ['/comments', 'send comments on the screenshots: /comments <text>, #2 for one screenshot'],
@@ -1153,7 +1170,12 @@ export class Attached {
     // `/agent`'s choice, from last time — see prefs.mjs.
     const prefs = await loadPrefs(this.session.url).catch(() => ({}));
     this.agent = prefs.agent ?? null;
-    this.matrix = prefs.matrix !== false;
+    // The rain is off unless asked for (`/matrix on`); the spinner and the
+    // robots move either way.
+    this.matrix = prefs.matrix === true;
+    // Advanced mode is the default where the terminal can draw it; the choice
+    // `/simple` and `/advanced-mode` made last time is remembered.
+    this.screenMode = this.options.simple ? 'simple' : prefs.mode === 'simple' ? 'simple' : 'advanced';
     // Raw mode only where there is a terminal to put in it. Through a pipe
     // there are no keys, the transcript is the whole output, and that is the
     // honest degradation rather than a broken one.
@@ -1203,7 +1225,13 @@ export class Attached {
     // `/reload`'s other half: the state the terminal was in before it
     // restarted — advanced mode, the focus, the windows of sessions that had
     // ended — so a reload changes the code and nothing else.
-    this.restore(this.options.restore ?? readReloadState());
+    const restored = this.options.restore ?? readReloadState();
+    this.restore(restored);
+    // A fresh launch opens in advanced mode wherever the terminal can draw it;
+    // a reload keeps the mode it was in.
+    if (!this.split && !(restored && typeof restored === 'object' && 'advanced' in restored)) {
+      this.openByDefault();
+    }
 
     // One write per tick at most, carrying everything that happened in it. A
     // busy session emits hundreds of lines a second, and a write per line means
@@ -1211,11 +1239,18 @@ export class Attached {
     const tick = setInterval(() => {
       // The cards' rain moves one step every RAIN_STEP_MS, and only while
       // somebody can see it: not under the reader, not with `/matrix off`.
-      if (this.split && !this.reader && this.matrix !== false) {
-        const step = Math.floor(Date.now() / RAIN_STEP_MS);
+      if (this.split && !this.reader) {
+        const step = clockTick();
         if (step !== this.rainTick) {
           this.rainTick = step;
           this.dirty = true;
+          // A landed card closes itself three seconds after the robot waves.
+          for (const meta of this.windows()) {
+            if (meta.merging?.state === 'landed' && step - meta.merging.landedTick >= CLOSE_AFTER_TICKS) {
+              meta.merging = null;
+              this.closeWindowOf(meta);
+            }
+          }
         }
       }
       if (this.dirty || this.pending.length) {
@@ -1756,8 +1791,18 @@ export class Attached {
     }
     this.interrupting = false;
 
+    if (this.help && this.mode === 'keys') {
+      // The key table is one window: any of these closes it, nothing else acts.
+      if (key === ESC || key === '?' || key === 'q' || key === '\r') { this.help = false; this.dirty = true; }
+      return undefined;
+    }
     if (this.reader && this.mode === 'keys') {
       return this.onReaderKey(key);
+    }
+    if (this.split && key === '?' && this.mode === 'keys' && !this.select) {
+      this.help = true;
+      this.dirty = true;
+      return undefined;
     }
     if (this.mode === 'typing') {
       return this.onTyping(key);
@@ -1782,6 +1827,14 @@ export class Attached {
     }
     if (['\r', '\n', 'i', 'd', 'x'].includes(key) && this.refuseWhileMerging()) {
       return undefined;
+    }
+    // `n` still refuses a permission request the focused card holds: that act came first.
+    if (this.split && (key === 'n' || key === 'N') && this.mode === 'keys' && !this.split.boardFocus
+      && !this.pendingOn(this.current())) {
+      return this.focusNeedsYou(key === 'n' ? 1 : -1);
+    }
+    if (this.split && key === 'w') {
+      return this.closeWindow();
     }
     if (this.split && key === 'v') {
       // A card's log — `/view`'s, over the whole screen.
@@ -1915,6 +1968,7 @@ export class Attached {
   closeEverything() {
     const open = this.mode !== 'keys' || Boolean(this.reader) || Boolean(this.split?.boardFocus);
     this.reader = null;
+    this.help = false;
     if (this.split?.boardFocus) {
       this.split.lastBoardFocus = this.split.boardFocus;
       this.split.boardFocus = null;
@@ -3054,10 +3108,15 @@ export class Attached {
       case 'log':
         this.showLog = !this.showLog;
         return this.note(this.showLog ? "printing the daemon's log" : 'printing the session');
+      case 'simple':
+        return void this.chooseMode('simple');
+      case 'export':
+        return this.exportLog(rest[0]);
       case 'advanced-mode':
       case 'advanced': {
         const want = rest[0] === 'off' ? false : rest[0] === 'on' ? true : !this.split;
-        if (!want) return this.leaveSplit();
+        if (!want) return void this.chooseMode('simple');
+        void savePrefs(this.session.url, { mode: null }).catch(() => undefined);
         // `@slug` names the projects outright; otherwise they are asked.
         const named = rest.filter((word) => word.startsWith('@')).map((word) => word.slice(1));
         return named.length ? this.enterSplit(named) : this.askSplitProjects();
@@ -3109,7 +3168,7 @@ export class Attached {
       case 'drop':
         return void this.dropCheckout();
       case 'close':
-        return this.closeWindow();
+        return this.closeWindow(rest[0]);
       case 'reload':
         return void this.reload();
       case 'quit':
@@ -3239,6 +3298,7 @@ export class Attached {
     for (const meta of this.sessions.values()) {
       if (!meta.ended && !live.has(meta.id)) {
         meta.ended = true;
+        meta.changedTick = this.stamp();
         void this.readView(meta, 5);
       }
     }
@@ -3499,12 +3559,13 @@ export class Attached {
    * said meanwhile is laid into it now — or, if the focus moved, that
    * session's history, which is what switching sessions has always done.
    */
-  leaveSplit() {
+  leaveSplit({ quiet = false } = {}) {
     if (!this.split) return this.note('advanced mode is not on — /advanced-mode starts it');
     const { screen, enteredWatching, mark, plannedTimer } = this.split;
     clearInterval(plannedTimer);
     this.split = null;
     screen.leave();
+    if (quiet) return undefined;
     const watched = this.watching;
     const lines = this.lines.get(watched) ?? [];
     if (watched && watched === enteredWatching) {
@@ -3515,7 +3576,7 @@ export class Attached {
       this.printed.delete(watched);
       this.layHistoryIn(watched, lines);
     }
-    this.note('back to the scrollback');
+    this.note('back to the scrollback · /advanced-mode returns');
     return undefined;
   }
 
@@ -3527,6 +3588,32 @@ export class Attached {
       this.watching = id;
     }
     this.note('');
+  }
+
+  /** The tick to stamp a change with: the wall clock's once the cards' clock runs (tests, which never start it, stay at 0). */
+  stamp() {
+    return this.rainTick === undefined ? 0 : clockTick();
+  }
+
+  /** The sessions whose card waits on a person, in card order. */
+  needYou() {
+    return this.windows().filter((meta) => {
+      const run = this.runs.find((each) => each.id === meta.id);
+      return Boolean(run && (this.showOn(run) || this.pendingOn(run) || this.askingOn(run)));
+    });
+  }
+
+  /** `n` / `N`: focus moves to the next / previous card that needs you. */
+  focusNeedsYou(step) {
+    const waiting = this.needYou();
+    if (!waiting.length) return this.note('nothing needs you');
+    const windows = this.windows();
+    const from = windows.findIndex((meta) => meta.id === this.split.focus);
+    for (let i = 1; i <= windows.length; i++) {
+      const meta = windows[(from + step * i + windows.length * i) % windows.length];
+      if (waiting.includes(meta)) return this.focusWindow(meta.id);
+    }
+    return undefined;
   }
 
   cycleFocus(step) {
@@ -3704,8 +3791,13 @@ export class Attached {
     const subtitle = gate
       ? ink.warn(showWaitingLine(gate, gate.ids.length))
       : (who ? `${ink.strong(who)} ` : '') + ink.muted(subtitleFor(meta, room - (who ? who.length + 1 : 0)));
+    const tick = this.rainTick ?? 0;
+    const status = cardStatus(meta, waiting, now, tick);
+    // A status that changes is drawn bright for a few ticks: when its key moves.
+    if (meta.lastKey !== undefined && meta.lastKey !== status.key) meta.changedTick = tick;
+    meta.lastKey = status.key;
     const progress = !meta.ended
-      ? stageWalk(meta.stages, meta.stage, room, ink)
+      ? stageWalk(meta.stages, meta.stage, room, ink, tick)
       : meta.commits !== undefined && (view.profile ?? 'CODE') === 'CODE' && view.state === 'FINISHED'
         ? ink.muted(`${meta.commits} commit${meta.commits === 1 ? '' : 's'}${view.branch ? ` on ${view.branch}` : ''}`)
         : '';
@@ -3718,6 +3810,26 @@ export class Attached {
       : asking?.yours ? 'a answers · /view reads it whole'
         : shownGate ? 'a to look and decide' : actionsFor(meta);
     const merging = meta.merging;
+    if (merging?.state === 'landed') {
+      const left = Math.max(0, Math.ceil((CLOSE_AFTER_TICKS - (tick - merging.landedTick)) * RAIN_STEP_MS / 1000));
+      return {
+        n,
+        profile: view.profile ?? meta.profile ?? null,
+        title: `${merging.ref} ${view.entryTitle ?? view.label ?? meta.label ?? ''}`.trim(),
+        status: { key: 'landed', mark: '✓', word: `merged · closes in ${left}s` },
+        lines: [
+          ink.muted(`landed on ${merging.base}${merging.sha ? ` as ${merging.sha}` : ''} · the card is MERGED`),
+        ],
+        footer: '/open the merge · /close now',
+        focused: meta.id === this.split.focus,
+        seed: seedOf(meta.id),
+        tick,
+        since: tick - merging.landedTick,
+        changedAt: merging.landedTick,
+        rain: false,
+        base: merging.base,
+      };
+    }
     if (merging) {
       const failed = merging.state === 'failed';
       const resolving = merging.state === 'resolving';
@@ -3738,8 +3850,8 @@ export class Attached {
           : resolving ? `its development starts again here to resolve it` : '',
         focused: meta.id === this.split.focus,
         seed: seedOf(meta.id),
-        tick: this.rainTick ?? 0,
-        rain: this.matrix !== false,
+        tick,
+        rain: this.matrix === true,
         base: merging.base,
       };
     }
@@ -3749,20 +3861,59 @@ export class Attached {
       title: view.entryRef
         ? `${view.entryRef} ${view.entryTitle ?? view.label ?? meta.label ?? ''}`.trim()
         : (view.label ?? meta.label ?? 'a session'),
-      status: cardStatus(meta, waiting, now),
+      status,
       lines: [subtitle, progress || null, doing ? (pending || asking ? doing : ink.text(doing)) : null],
       footer: keys,
       focused: !this.split.boardFocus && meta.id === this.split.focus,
       seed: seedOf(meta.id),
-      tick: this.rainTick ?? 0,
-      rain: this.matrix !== false,
+      tick,
+      since: meta.ended && Number.isFinite(meta.changedTick) ? tick - meta.changedTick : undefined,
+      changedAt: meta.changedTick,
+      ref: view.entryRef ?? null,
+      rain: this.matrix === true,
     };
+  }
+
+  /** `?` — every key and command in one window, two columns. */
+  helpScreen(width, height) {
+    const ink = this.ink;
+    const keys = [
+      ['enter', 'prompt the focused card'], ['tab ⇧tab 1–9', 'next / previous / pick a card'],
+      ['n N', 'next / previous card needing you'], ['v', 'its log'],
+      ['b', 'the board: ←→ ↑↓ p d esc'], ['↑↓ PgUp PgDn G', 'scroll the log, G follows the end'],
+      ['ctrl+f', 'find in the log'], ['r', 'fold the roadmap'], ['d', 'develop a planned card'],
+      ['a y s Y', 'answer · permission'], ['x x', 'cancel the running session'],
+      ['w', 'close the ended card'], ['c', 'config'], ['L', 'runs'], ['?', 'this window'], ['q', 'quit'],
+    ];
+    const commands = [
+      ['/new', 'plan · dev · ask'], ['/view  v', 'read a session'], ['/board  b', 'the roadmap'],
+      ['/continue /pr', 'carry on · open the PR'], ['/open', 'on cawdev'], ['/export', 'log to scrollback'],
+      ['/simple', 'the scrollback terminal'], ['/matrix', 'the rain, off by default'],
+      ['/projects /refresh', 'the roadmap'], ['/agent', 'which agent'], ['/quit  q', 'leave'],
+      ['/close N|all', 'close ended cards'],
+    ];
+    const half = Math.max(20, Math.floor((width - 4) / 2));
+    const cell = (pair, w) => {
+      if (!pair) return ' '.repeat(w);
+      const key = ink.accent(pair[0]);
+      const gap = Math.max(1, 16 - visibleWidth(pair[0]));
+      return padVisible(clip(`${key}${' '.repeat(gap)}${ink.muted(pair[1])}`, w), w);
+    };
+    const body = [ink.bold(padVisible(' keys', half)) + ink.bold(' commands')];
+    for (let i = 0; i < Math.max(keys.length, commands.length); i++) {
+      body.push(` ${cell(keys[i], half - 1)}${cell(commands[i], half - 1)}`);
+    }
+    body.push('', ink.muted(' the key line at the bottom shows what fits · this is all of it · esc closes'));
+    return windowLines({ width, height }, { title: 'cawdev ▸ keys', body, focused: true }, ink);
   }
 
   /** The whole alternate screen, as rows — see split.mjs. */
   splitFrame() {
     const { width, height } = this.split.screen;
     const ink = this.ink;
+    if (this.help && this.mode === 'keys') {
+      return composeFrame(width, height, [{ rect: { top: 0, left: 0, width, height }, lines: this.helpScreen(width, height) }]);
+    }
     if (this.reader) {
       return composeFrame(width, height, [{ rect: { top: 0, left: 0, width, height }, lines: this.readerScreen(width, height) }]);
     }
@@ -3781,8 +3932,8 @@ export class Attached {
     const input = this.mode === 'typing'
       ? `${tag}${this.input.label} ${this.input.line.render(
         Math.max(8, inner - visibleWidth(tag) - visibleWidth(this.input.label) - 1), ink)}`
-      : tag + ink.muted(`enter prompts ${current ? `“${current.label}”` : 'the focused session'}`
-        + ' · / commands · b board · tab next card · v its log');
+      // Only what enter acts on: the keys live once, in the window's footer.
+      : [`${tag}${ink.muted(`enter prompts ${current ? `“${current.label}”` : 'the focused session'}`)}`];
     // A question or a request on screen says which window it came from.
     const from = banner.length ? [ink.bold(ink.warn(` from ${this.tagOf(current)}`))] : [];
     // Under the banner and right above the line, so a long one never pushes
@@ -3799,8 +3950,12 @@ export class Attached {
     const completing = completionLines(
       matches.rows.slice(first, first + SPLIT_COMPLETIONS), matches.at - first, inner, ink,
     );
-    const fixed = [...from, ...banner, ...whole, ...overlay, ...completing, input];
-    const promptRows = Math.max(PROMPT_ROWS, fixed.length + 5);
+    const fixed = [...from, ...banner, ...whole, ...overlay, ...completing, ...[input].flat()];
+    // The window's key footer wraps between keys, so the prompt grows with it.
+    const footerRows = this.status
+      ? [ink.warn(`${this.statusWindow ? `[${this.statusWindow}] ` : ''}${this.status}`)]
+      : packKeys(this.keys(), inner, ink);
+    const promptRows = Math.max(PROMPT_ROWS, fixed.length + 4 + footerRows.length);
     // The roadmap across the top: as tall as its fullest column needs, never
     // more than a third of the screen, and never so tall that no window fits
     // under it — a short terminal drops it before it drops the sessions.
@@ -3893,7 +4048,8 @@ export class Attached {
     });
     const promptTitle = `cawdev ▸ ${this.runner?.name ?? 'runner'}`
       + `${this.session.email ? ` · ${this.session.email}` : ' · not signed in'}`
-      + `${this.agent ? ` · ${this.agent}` : ''}${unseen}`;
+      + `${this.agent ? ` · ${this.agent}` : ''}${unseen}`
+      + (this.needYou().length ? ` · ${ink.warn(`${this.needYou().length} need you`)}` : '');
     pieces.push({
       rect: layout.prompt,
       lines: windowLines(layout.prompt, {
@@ -3906,9 +4062,7 @@ export class Attached {
           ...messages,
           ...fixed,
         ],
-        footer: this.status
-          ? ink.warn(`${this.statusWindow ? `[${this.statusWindow}] ` : ''}${this.status}`)
-          : keyList(this.keys(), '', inner, ink),
+        footer: footerRows,
       }, ink),
     });
     if (strip) {
@@ -5139,8 +5293,14 @@ export class Attached {
     const merge = card?.workItem?.merge;
     if (card?.status === 'MERGED' || card?.status === 'SHIPPED' || merge?.state === 'DONE') {
       this.say(this.ink.success(`  ${review.ref} landed: ${review.branch} is in ${review.base}${merge?.result ? ` (${printable(merge.result)})` : ''}`));
-      // Landed: the card's work is over, and so are its cards here.
+      // Landed: the card's work is over, and so are its cards here. In
+      // advanced mode the robot waves first and the card closes itself.
+      const sha = /\b[0-9a-f]{7,40}\b/.exec(String(merge?.result ?? ''))?.[0]?.slice(0, 7) ?? null;
       for (const meta of this.mergingCards(review)) {
+        if (this.split && meta.ended) {
+          meta.merging = { state: 'landed', ref: review.ref, branch: review.branch, base: review.base, sha, landedTick: this.stamp() };
+          continue;
+        }
         meta.merging = null;
         if (meta.ended) this.closeWindowOf(meta);
       }
@@ -5219,12 +5379,12 @@ export class Attached {
   async chooseMatrix(word) {
     const wanted = String(word ?? '').toLowerCase();
     if (!['on', 'off'].includes(wanted)) {
-      return this.note(`the rain is ${this.matrix === false ? 'off' : 'on'} — /matrix on|off`);
+      return this.note(`the rain is ${this.matrix ? 'on' : 'off'} — /matrix on|off`);
     }
     this.matrix = wanted === 'on';
     this.dirty = true;
-    await savePrefs(this.session.url, { matrix: this.matrix ? null : false }).catch(() => undefined);
-    return this.note(this.matrix ? 'the cards rain again' : 'the cards are still');
+    await savePrefs(this.session.url, { matrix: this.matrix ? true : null }).catch(() => undefined);
+    return this.note(this.matrix ? 'the cards rain' : 'no rain — the spinners and the robots still move');
   }
 
   openReader() {
@@ -5552,12 +5712,62 @@ export class Attached {
   }
 
   /** `/close` — an ended session's window goes; a live one's stays. */
-  closeWindow() {
-    const meta = this.commandTarget();
+  closeWindow(which = null) {
+    // `/close now` is the landed card's own footer: the focused card, without the countdown.
+    const word = String(which ?? '').toLowerCase().replace(/^now$/, '');
+    if (word === 'all') {
+      const ended = this.windows().filter((meta) => meta.ended);
+      for (const meta of ended) this.closeWindowOf(meta);
+      return this.note(ended.length ? `closed ${ended.length} ended card${ended.length === 1 ? '' : 's'}` : 'no ended card to close');
+    }
+    const meta = word && this.split ? this.windowNamed([word]) : this.commandTarget();
+    if (word && this.split && !meta) return this.note(`no card ${word} — /close, /close 3 or /close all`);
     if (!meta) return this.note('no window to close');
-    if (!meta.ended) return this.note('that session is still running — /cancel stops it');
+    if (!meta.ended) return this.note('that session is still running · x x cancels it');
     this.closeWindowOf(meta);
     return this.note('closed');
+  }
+
+  /** `/simple` and `/advanced-mode off`: the scrollback, remembered for next time. */
+  async chooseMode(mode) {
+    this.screenMode = mode;
+    // Left first and remembered after: the next command must find it left.
+    const left = this.split ? this.leaveSplit() : this.note('already the scrollback — /advanced-mode is the way back');
+    await savePrefs(this.session.url, { mode: 'simple' }).catch(() => undefined);
+    return left;
+  }
+
+  /**
+   * A fresh launch: advanced mode where this terminal can draw it, else the
+   * scrollback with one line saying why. `--simple` and a remembered `/simple`
+   * are the person's own choice and need no line.
+   */
+  openByDefault() {
+    if (this.screenMode === 'simple' || this.stopped) return;
+    const out = this.options.out ?? process.stdout;
+    const why = advancedBlocker({
+      tty: !this.plain && Boolean(process.stdin.isTTY), term: process.env.TERM, columns: out.columns, rows: out.rows,
+    });
+    if (why) {
+      this.say(this.ink.muted(`  the scrollback, not advanced mode: ${why}`));
+      return;
+    }
+    this.enterSplit(null);
+  }
+
+  /**
+   * `/export`: a session's log laid into the normal screen's scrollback, so
+   * the terminal's own search and copy reach it. Leaves advanced mode's screen
+   * for the scrollback and says how to come back.
+   */
+  exportLog(which = null) {
+    const meta = which && this.split ? this.windowNamed([which]) : this.commandTarget();
+    if (!meta) return this.note(which ? `no session ${which} here` : 'no session to export');
+    const lines = this.lines.get(meta.id) ?? [];
+    if (this.split) this.leaveSplit({ quiet: true });
+    this.printed.delete(meta.id);
+    this.layHistoryIn(meta.id, lines);
+    return this.note('exported — /advanced-mode is the way back');
   }
 
   /** An ended session's window goes; focus moves to the first one left. */
@@ -6185,8 +6395,17 @@ export class Attached {
     // lands on a buffer that vanishes the moment the program exits.
     if (this.split) {
       clearInterval(this.split.plannedTimer);
+      const { enteredWatching, mark } = this.split;
       this.split.screen.release();
       this.split = null;
+      // What the watched session said while the screen was up goes into the
+      // scrollback, as `leaveSplit` does: the terminal's own search reaches it.
+      const watched = this.watching;
+      if (watched && watched === enteredWatching) {
+        for (const line of (this.lines.get(watched) ?? []).slice(mark.get(watched) ?? 0)) {
+          this.say(this.render(line));
+        }
+      }
     }
     try {
       this.client?.destroy();
@@ -6505,6 +6724,7 @@ export class Attached {
     const parts = [
       `${ink.text('enter')} ${ink.muted('prompt')}`,
       `${ink.text('/')} ${ink.muted('commands')}`,
+      ...(this.split ? [`${ink.text('?')} ${ink.muted('help')}`] : []),
       `${ink.text('L')} ${ink.muted('runs')}`,
     ];
     if (this.askingOn(this.current())?.yours) {
@@ -6521,6 +6741,8 @@ export class Attached {
       parts.push(`${ink.text('b')} ${ink.muted('board')}`);
       parts.push(`${ink.text('tab')} ${ink.muted('next card')}`);
       parts.push(`${ink.text('v')} ${ink.muted('its log')}`);
+      if (this.needYou().length) parts.push(`${ink.warn('n')} ${ink.muted('next needing you')}`);
+      if (this.commandTarget()?.ended) parts.push(`${ink.text('w')} ${ink.muted('close card')}`);
       parts.push(`${ink.text('d')} ${ink.muted(this.finishedPlan(this.commandTarget())
         ? `develop ${this.commandTarget().view.entryRef}` : 'develop a planned card')}`);
     }

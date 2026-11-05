@@ -1750,10 +1750,21 @@ async function readingCopy(source, defaultBranch) {
   }
 }
 
-async function prepareWorkingCopy(path, branch, defaultBranch, allowDirty, baseBranch = null) {
+async function prepareWorkingCopy(path, branch, defaultBranch, allowDirty, baseBranch = null, { resumingMerge = false } = {}) {
   await access(join(path, '.git')).catch(() => {
     throw new Error(`${path} is not a git repository.`);
   });
+
+  // R621. A checkout mid-merge was left by something the daemon did not see (a
+  // daemon killed between the merge and the RUNNING post, or a person). Whose
+  // merge it is cannot be known, so it is said and not touched. A MERGE run
+  // carrying on its own branch is the one run that is meant to find it so.
+  if (!resumingMerge && await git(path, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']).then(() => true, () => false)) {
+    throw new Error(
+      `${path} is in the middle of a merge (MERGE_HEAD is set): from a merge run on its branch that did not finish, ` +
+        `or one started by hand. Finish it (resolve and \`git -C ${path} commit\`) or abandon it ` +
+        `(\`git -C ${path} merge --abort\`), then start the run again.`);
+  }
 
   const dirty = await git(path, ['status', '--porcelain']);
   if (dirty && !allowDirty) {
@@ -1869,7 +1880,7 @@ async function prepareWorkingCopy(path, branch, defaultBranch, allowDirty, baseB
  * — an older runner that did not say why — and it is the property that makes
  * being wrong there cost a fetch rather than a model.
  */
-async function prepareMerge(cwd, branch, defaultBranch) {
+async function prepareMerge(cwd, branch, defaultBranch, from = null) {
   const base = defaultBranch || 'main';
   await git(cwd, ['fetch', '--prune', 'origin']).catch((failure) => {
     log(`  fetch skipped: ${failure.message.split('\n')[0]}`);
@@ -1881,6 +1892,10 @@ async function prepareMerge(cwd, branch, defaultBranch) {
   const into = await git(cwd, ['rev-parse', '--verify', `origin/${base}`])
     .then(() => `origin/${base}`)
     .catch(() => base);
+  // R621. Told to the caller BEFORE the merge runs, so a throw below still leaves it known.
+  if (from) {
+    from.into = into;
+  }
 
   let clean = true;
   try {
@@ -1913,6 +1928,55 @@ async function prepareMerge(cwd, branch, defaultBranch) {
     into,
     head: await git(cwd, ['rev-parse', 'HEAD']).catch(() => null),
   };
+}
+
+/**
+ * R621. Puts a checkout back as `prepareMerge` found it, when the run it was
+ * prepared for never started. `from` is `{ before, into, branch }`: HEAD before
+ * `git merge` ran, and the ref merged in (null when not known).
+ *
+ * Never throws. Returns one sentence, or null when there was nothing to undo.
+ * `reset --keep`, never `--hard`: an allowDirty tree's own work must survive,
+ * and git had already refused any dirty file the merge touches.
+ */
+async function undoPreparedMerge(cwd, from) {
+  const couldNot = (why) => {
+    const said = `!! could not undo the prepared merge in ${cwd}: ${String(why).split('\n')[0]}`;
+    log(said);
+    return said;
+  };
+  try {
+    const midMerge = await git(cwd, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']).then(() => true, () => false);
+    if (midMerge) {
+      await git(cwd, ['merge', '--abort']);
+      return `the merge prepared in ${cwd} was undone (git merge --abort), because the run did not start`;
+    }
+    const before = from?.before;
+    if (!before) {
+      return null;
+    }
+    const head = await git(cwd, ['rev-parse', 'HEAD']);
+    if (head === before) {
+      return null;
+    }
+    const merged = from.into ? await git(cwd, ['rev-parse', from.into]) : null;
+    // A fast-forward (the branch was strictly behind) moves HEAD onto `into` with no
+    // merge commit; anything else must be a merge commit of `before` and `into`.
+    const fastForward = merged !== null && head === merged
+      && await git(cwd, ['merge-base', '--is-ancestor', before, head]).then(() => true, () => false);
+    if (!fastForward) {
+      if ((await git(cwd, ['rev-parse', 'HEAD^1'])) !== before) {
+        return couldNot('HEAD is not a merge commit on top of the pre-merge head');
+      }
+      if (merged && (await git(cwd, ['rev-parse', 'HEAD^2'])) !== merged) {
+        return couldNot(`HEAD's second parent is not ${from.into}`);
+      }
+    }
+    await git(cwd, ['reset', '--keep', before]);
+    return `the merge commit prepared on ${from.branch} was undone (reset to ${before.slice(0, 7)}), because the run did not start`;
+  } catch (failure) {
+    return couldNot(failure.message);
+  }
 }
 
 /**
@@ -2750,10 +2814,10 @@ async function scanQuality(config, run, cwd, branch) {
         return report({ headSha, error: ran.said.split('\n')[0] || 'the scanner failed and said nothing' });
       }
       const reportTask = parseProperties(await readFile(join(workDir, 'report-task.txt'), 'utf8'));
-      const askServer = sonarAsker((reportTask.serverUrl ?? url).replace(/\/$/, ''), token);
-      const settled = await waitForAnalysis(askServer, reportTask.ceTaskId, deadline, quality.timeoutSeconds);
+      const serverUrl = (reportTask.serverUrl ?? url).replace(/\/$/, '');
+      const settled = await waitForAnalysis(sonarAsker(serverUrl, token), reportTask.ceTaskId, deadline, quality.timeoutSeconds);
       return await reportBranchReading({
-        ask: askServer, reportTask, settled, key, branch, analysedAs: 'MAIN',
+        ask: sonarReadAsker(serverUrl, token), reportTask, settled, key, branch, analysedAs: 'MAIN',
         warning: "This server does not analyse branches; the branch was analysed as the project's main analysis.",
         headSha, report, findings: run.findingsToProve,
       });
@@ -2797,10 +2861,10 @@ async function scanQuality(config, run, cwd, branch) {
 
     // What the scanner left behind: where the server queued the analysis.
     const reportTask = parseProperties(await readFile(join(workDir, 'report-task.txt'), 'utf8'));
-    const askServer = sonarAsker((reportTask.serverUrl ?? url).replace(/\/$/, ''), token);
-    const settled = await waitForAnalysis(askServer, reportTask.ceTaskId, deadline, quality.timeoutSeconds);
+    const serverUrl = (reportTask.serverUrl ?? url).replace(/\/$/, '');
+    const settled = await waitForAnalysis(sonarAsker(serverUrl, token), reportTask.ceTaskId, deadline, quality.timeoutSeconds);
     await reportBranchReading({
-      ask: askServer, reportTask, settled, key, branch, analysedAs, warning, headSha, report,
+      ask: sonarReadAsker(serverUrl, token), reportTask, settled, key, branch, analysedAs, warning, headSha, report,
       findings: run.findingsToProve,
     });
   } catch (failure) {
@@ -2816,6 +2880,11 @@ async function scanQuality(config, run, cwd, branch) {
 function trimSlash(url) {
   return url.replace(/\/$/, '');
 }
+
+// Once the analysis has settled, the gate, measures, issue and hotspot pages and finding proofs
+// together get two minutes: not killed because the wait used up the scan's budget, not unbounded either (R622).
+const SONAR_READ_BUDGET_MS = 120_000;
+const sonarReadAsker = (serverUrl, token) => sonarAsker(serverUrl, token, { deadline: Date.now() + SONAR_READ_BUDGET_MS });
 
 /** The gate and the new-code measures, for a BRANCH or MAIN reading — never for PROJECT, which has neither. */
 async function reportBranchReading({ ask, reportTask, settled, key, branch, analysedAs, warning, headSha, report, findings }) {
@@ -2989,8 +3058,9 @@ async function scanAsScratchProject({ quality, run, cwd, branch, key, url, token
   }
 
   const reportTask = parseProperties(await readFile(join(workDir, 'report-task.txt'), 'utf8'));
-  const ask = sonarAsker((reportTask.serverUrl ?? url).replace(/\/$/, ''), token);
-  await waitForAnalysis(ask, reportTask.ceTaskId, deadline, quality.timeoutSeconds);
+  const serverUrl = (reportTask.serverUrl ?? url).replace(/\/$/, '');
+  await waitForAnalysis(sonarAsker(serverUrl, token), reportTask.ceTaskId, deadline, quality.timeoutSeconds);
+  const ask = sonarReadAsker(serverUrl, token);
 
   const changed = await changedLines(cwd, mergeBase);
   const counted = (component, line) => {
@@ -6935,6 +7005,9 @@ async function startRun(config, offered, workspace, source = null) {
   let shield = null;
   // R155. What `git merge` did before anything was spawned, on a MERGE run.
   let merge = null;
+  // R621. What `undoPreparedMerge` needs, and whether RUNNING was accepted.
+  let mergeFrom = null;
+  let started = false;
 
   try {
     log(`claiming ${run.projectSlug} ${run.label} on ${run.branch}`);
@@ -7107,8 +7180,10 @@ async function startRun(config, offered, workspace, source = null) {
       if (!allowDirty) {
         await resetWorkspace(resolve(path));
       }
+      const resumingMerge = run.profile === 'MERGE'
+        && await git(resolve(path), ['rev-parse', '--abbrev-ref', 'HEAD']).then((now) => now === run.branch, () => false);
       const prepared = await prepareWorkingCopy(
-        resolve(path), run.branch, defaultBranch, allowDirty, run.baseBranch);
+        resolve(path), run.branch, defaultBranch, allowDirty, run.baseBranch, { resumingMerge });
       branch = prepared.branch;
       baseCommit = prepared.base;
       if (handoff) {
@@ -7157,7 +7232,19 @@ async function startRun(config, offered, workspace, source = null) {
         // R155. The daemon does the merge, BEFORE anything is spawned, and what
         // git conflicts on becomes the session's whole write scope. A clean
         // merge needs no session at all and gets none.
-        merge = await prepareMerge(resolve(path), branch, run.baseBranch ?? defaultBranch);
+        // R621. Recorded here and not inside `prepareMerge`, so that a throw after
+        // `git merge` ran still has it. A null `before` is kept: there is nothing
+        // safe to reset to, but `git merge --abort` still covers MERGE_HEAD.
+        // Not set at all when the checkout is ALREADY mid-merge (a Carry-on): that
+        // merge is not this attempt's to abort.
+        const alreadyMerging = await git(resolve(path), ['rev-parse', '-q', '--verify', 'MERGE_HEAD'])
+          .then(() => true, () => false);
+        mergeFrom = alreadyMerging ? null : {
+          before: await git(resolve(path), ['rev-parse', 'HEAD']).catch(() => null),
+          into: null,
+          branch,
+        };
+        merge = await prepareMerge(resolve(path), branch, run.baseBranch ?? defaultBranch, mergeFrom ?? undefined);
         run.conflictedFiles = merge.conflicted;
         log(merge.clean
           ? `  ${merge.into} merged into ${branch} with no conflict — nothing to resolve`
@@ -7193,9 +7280,16 @@ async function startRun(config, offered, workspace, source = null) {
         // run's path is worse than one showing nothing.
         body: { state: 'RUNNING', workspace: workspace ?? null },
       });
+      started = true;
     } catch (refused) {
       if (PLATFORM_REFUSALS.has(refused.status)) {
         log(`  the platform did not let this run start (${refused.message}); leaving it as the platform has it`);
+        if (mergeFrom) {
+          const undone = await undoPreparedMerge(resolve(path), mergeFrom);
+          if (undone) {
+            log(`  ${undone}`);
+          }
+        }
         protectedGuards.delete(run.id);
         return;
       }
@@ -7226,9 +7320,16 @@ async function startRun(config, offered, workspace, source = null) {
     // Anything that goes wrong before or during the spawn is the run's failure,
     // and the reason belongs on the run where someone will see it.
     log(`  failed: ${failure.message}`);
+    let summary = failure.message;
+    if (mergeFrom && !started) {
+      const undone = await undoPreparedMerge(resolve(path), mergeFrom);
+      if (undone) {
+        summary = `${summary}\n\n${undone}`;
+      }
+    }
     await api(config, `/api/projects/${run.projectSlug}/runs/${run.id}/transition`, {
       method: 'POST',
-      body: { state: 'FAILED', summary: failure.message },
+      body: { state: 'FAILED', summary },
     }).catch((second) => log(`  could not record the failure: ${second.message}`));
   } finally {
     reader?.release();
@@ -7663,7 +7764,8 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
     // the tree the tests just ran against, by the daemon and not the session.
     // AWAITED: the workspace is released in `perform`'s finally, and a
     // scanner still reading files when the next run's reset runs is the
-    // hazard; the block's `timeoutSeconds` bounds the wait. It never throws.
+    // hazard; the block's `timeoutSeconds` bounds the wait and
+    // SONAR_READ_BUDGET_MS the reads after it (R622). It never throws.
     if (stage.stage === 'TEST' && run.branch && writesAnythingProfile(run)) {
       await scanQuality(config, run, cwd, run.branch);
     }

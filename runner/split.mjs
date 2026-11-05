@@ -1,15 +1,19 @@
 // Advanced mode — the attached terminal split into one window per session,
 // emacs-style, with the client's own prompt at the bottom.
 //
-// **R81 decided against a pane manager, and this does not reopen that.** The
-// reason there was that a full-screen repaint EATS THE SCROLLBACK: the wheel,
-// search and copy stop working and the transcript above the fold is gone. So
-// the default is still `scrollback.mjs`, untouched. This is a mode somebody
-// ASKS for with `/advanced-mode`, and it is drawn on the terminal's ALTERNATE
+// **R81 chose the scrollback as the default, and R624 changes the default.**
+// R81's reason was that a full-screen repaint EATS THE SCROLLBACK: the wheel,
+// search and copy stop working and the transcript above the fold is gone. With
+// several sessions and a roadmap on one machine that reason no longer wins, so
+// `cawdev` opens HERE wherever the terminal can draw it (`advancedBlocker`: a
+// TTY, not TERM=dumb, 80×24 at least); `cawdev --simple` and `/simple` are the
+// scrollback terminal (`scrollback.mjs`, untouched), one command away, and the
+// choice is remembered in prefs.mjs. It is drawn on the terminal's ALTERNATE
 // screen — the buffer vim and emacs use — which leaves the normal screen and
 // its scrollback exactly as they were. Leaving the mode puts them back, and
 // what was said on the watched session meanwhile is laid into the scrollback
-// then, so nothing is lost by having looked at it this way.
+// then (`/export` does it on demand), so nothing is lost by having looked at it
+// this way.
 //
 // Everything that decides a picture is a pure function — the layout, one
 // window, the whole frame — so it can be rendered at four sizes and READ,
@@ -133,7 +137,10 @@ export function windowLines(rect, {
   const label = title ? ` ${clip(title, Math.max(0, inner - 3))} ` : '';
   const top = paint(tl + h) + label + paint(h.repeat(Math.max(0, inner - 1 - visibleWidth(label))) + tr);
 
-  const footerRows = footer ? 1 : 0;
+  // A footer is a row, or several: keys that do not fit one wrap onto the next
+  // rather than being cut off.
+  const footers = (Array.isArray(footer) ? footer : [footer]).filter(Boolean);
+  const footerRows = footers.length;
   const subtitleRows = subtitle ? 1 : 0;
   const rows = Math.max(0, height - 2 - footerRows - subtitleRows);
   const tail = tailOf(body, inner, rows);
@@ -146,8 +153,8 @@ export function windowLines(rect, {
   for (let i = 0; i < rows; i++) {
     lines.push(paint(v) + padVisible(clip(tail[i] ?? '', inner), inner) + RESET + paint(v));
   }
-  if (footer) {
-    lines.push(paint(v) + padVisible(clip(footer, inner), inner) + RESET + paint(v));
+  for (const row of footers) {
+    lines.push(paint(v) + padVisible(clip(row, inner), inner) + RESET + paint(v));
   }
   lines.push(paint(bl + h.repeat(inner) + br));
   return lines.slice(0, height);
@@ -486,7 +493,7 @@ export function actionsFor(meta) {
   } else if (isAutoCheckout(view?.workspace) && view?.state !== 'RUNNING' && !view?.live) {
     parts.push('/drop');
   }
-  parts.push('/close');
+  parts.push('w closes');
   return parts.join(' · ');
 }
 
@@ -1200,4 +1207,22 @@ export function cardLines(card, ink, url = null) {
     }
   }
   return lines;
+}
+
+/** Advanced mode's smallest terminal. */
+export const ADVANCED_MIN_COLUMNS = 80;
+export const ADVANCED_MIN_ROWS = 24;
+
+/**
+ * Why a terminal cannot draw advanced mode, in a few words — or null when it
+ * can: a TTY, not `TERM=dumb`, at least 80×24. Pure, so the default is a
+ * test and not a guess.
+ */
+export function advancedBlocker({ tty, term, columns, rows }) {
+  if (!tty) return 'no terminal to draw on (a pipe) · /advanced-mode needs a TTY';
+  if (term === 'dumb') return 'TERM=dumb cannot draw it';
+  if ((columns ?? 0) < ADVANCED_MIN_COLUMNS || (rows ?? 0) < ADVANCED_MIN_ROWS) {
+    return `the terminal is ${columns ?? '?'}×${rows ?? '?'}, advanced mode needs ${ADVANCED_MIN_COLUMNS}×${ADVANCED_MIN_ROWS}`;
+  }
+  return null;
 }
