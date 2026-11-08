@@ -1636,6 +1636,29 @@ the machine:
   and add swap (`fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap
   /swapfile && swapon /swapfile`, plus its `/etc/fstab` line).
 
+## What a run takes from the machine (R643)
+
+Every few seconds (`"resourceSeconds": 5`, zero switches it off) the daemon
+reads what each live run takes: CPU time, memory now and at peak, and how many
+processes it has. The reading rides on the next heartbeat; the run page's
+Details show it as *Machine use*, with its age (`tools/lib/run-resources.mjs`).
+The platform keeps the last reading per run (`run_resources`), so a finished
+run still says its peak and its CPU total.
+
+- **What is measured** is the stage's process group: every stage is spawned
+  detached, so it leads a group of its own. CPU adds up across stages; the
+  peak is the highest seen over the whole run, and neither goes down.
+- **Under `sessionMemoryMax`** on Linux the stage runs in a systemd scope and
+  the reading is the scope's cgroup: exact, with the kernel's own peak, and
+  counting processes that have left the group. The run page says *cgroup*.
+- **Everywhere else** it is one `ps -A` per reading, summed per group: it
+  misses a spike between two readings, loses the CPU of children that have
+  already exited, and counts shared pages twice. The run page says *sampled*.
+- **Neither sees containers.** What a run asks Docker for (Testcontainers'
+  Postgres, `docker build`) runs under dockerd, not under the run, and is not
+  in the reading. A build daemon that `setsid`s out of the group is lost to
+  `ps` too.
+
 ## When the usage limit hits (R73)
 
 Claude Code stops with a message naming the window — the five-hour one or the

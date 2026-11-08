@@ -34,6 +34,7 @@ import { workspaceVersion } from '../lib/version-files.mjs';
 import { usageLimitOf } from '../lib/usage-limit.mjs';
 import { TranscriptBatch } from '../lib/transcript-batch.mjs';
 import { parseUsage } from '../lib/usage-report.mjs';
+import { RunTracker, sample as sampleResources } from '../lib/run-resources.mjs';
 import {
   ANTIGRAVITY_EXPERTS_PLUGIN, qualified, writeAntigravityExpertsPlugin, writeRunPlugin,
 } from '../lib/run-plugin.mjs';
@@ -376,6 +377,16 @@ const DEFAULTS = {
    * last refusal, and nothing between refusals.
    */
   usageSeconds: 600,
+  /**
+   * How often to read what each live run takes from this machine — R643: CPU
+   * time, memory now and at peak, processes (`lib/run-resources.mjs`). More
+   * often than the heartbeat that carries it, because a peak between two
+   * `ps` samples is a peak nobody saw; under a systemd scope the kernel keeps
+   * the peak itself and the interval matters less. One `ps -A` per reading,
+   * whatever the number of runs. Zero switches it off and the console shows
+   * no reading.
+   */
+  resourceSeconds: 5,
 };
 
 /** The `--config` path this process was started with, or the default. */
@@ -466,6 +477,7 @@ async function readConfig() {
     skillPrepareSeconds: file.skillPrepareSeconds ?? DEFAULTS.skillPrepareSeconds,
     idleSeconds: file.idleSeconds ?? DEFAULTS.idleSeconds,
     usageSeconds: file.usageSeconds ?? DEFAULTS.usageSeconds,
+    resourceSeconds: file.resourceSeconds ?? DEFAULTS.resourceSeconds,
     sessionExitSeconds: file.sessionExitSeconds ?? DEFAULTS.sessionExitSeconds,
     /**
      * The FILE this daemon booted from, absolute, or null when everything
@@ -6710,6 +6722,51 @@ function deliverPrompts(config, run, child) {
 const running = new Map();
 
 /**
+ * R643. What each live run has taken from this machine, by run id: a
+ * {@link RunTracker} (CPU across stages, the peak) and the last reading it
+ * gave. Kept beside `running` rather than in it, and pruned to it on every
+ * reading, so no exit path has to remember a second map.
+ */
+const resourceTrackers = new Map();
+const resourceReadings = new Map();
+
+async function readResources() {
+  for (const runId of resourceTrackers.keys()) {
+    if (!running.has(runId)) {
+      resourceTrackers.delete(runId);
+      resourceReadings.delete(runId);
+    }
+  }
+  const groups = new Map();
+  for (const [runId, child] of running) {
+    if (child?.pid) {
+      groups.set(runId, child.pid);
+    }
+  }
+  const readings = await sampleResources([...new Set(groups.values())]);
+  const at = new Date();
+  for (const [runId, pgid] of groups) {
+    const reading = readings.get(pgid);
+    if (!reading) {
+      continue;
+    }
+    let tracker = resourceTrackers.get(runId);
+    if (!tracker) {
+      tracker = new RunTracker();
+      resourceTrackers.set(runId, tracker);
+    }
+    resourceReadings.set(runId, tracker.observe(pgid, reading, at));
+  }
+}
+
+/** The heartbeat's half: the last reading of every run still driven. */
+function resourcesForHeartbeat() {
+  return [...resourceReadings]
+    .filter(([runId]) => running.has(runId))
+    .map(([runId, reading]) => ({ runId, ...reading }));
+}
+
+/**
  * What the platform said about this machine on the last heartbeat — R73, R80.
  *
  * `paused` is "claim nothing new": a person's switch in the console. What is
@@ -10999,6 +11056,9 @@ async function main() {
         // `acceptsConsoleRules`' own reason: a daemon reconfigured or
         // reinstalled reports what is true NOW.
         cliVersion: myVersion,
+        // R643. What each driven run takes from this machine, as last read.
+        // Absent from an older daemon, which the platform shows as no reading.
+        resources: resourcesForHeartbeat(),
       },
     }).then((me) => {
       // R73/R80. The heartbeat's answer is what the platform decided about
@@ -11040,6 +11100,22 @@ async function main() {
     }).catch((failure) => log(`heartbeat failed: ${failure.message}`));
     await Promise.all([workspacesReported, heartbeatAnswered, noticeConfigEdits()]);
   };
+
+  // R643. Read before the first beat would be pointless (nothing is running
+  // yet), so the timer simply starts; a failed reading is logged once a beat
+  // at most, never fatal.
+  let resourcesFailed = false;
+  const resourceTimer = config.resourceSeconds > 0
+    ? setInterval(() => {
+      readResources().then(() => { resourcesFailed = false; }).catch((failure) => {
+        if (!resourcesFailed) {
+          log(`could not read what the runs take from this machine: ${failure.message}`);
+        }
+        resourcesFailed = true;
+      });
+    }, config.resourceSeconds * 1000)
+    : null;
+  resourceTimer?.unref?.();
 
   await beat();
   const heartbeat = setInterval(beat, config.heartbeatSeconds * 1000);
@@ -11095,6 +11171,7 @@ async function main() {
         { ...snapshotOf(process.pid, running), stopped: signal })
         .catch(() => undefined);
       clearInterval(heartbeat);
+      clearInterval(resourceTimer);
       clearInterval(gitSurvey);
       clearInterval(workspaceRequests);
       clearInterval(publishRuns);
