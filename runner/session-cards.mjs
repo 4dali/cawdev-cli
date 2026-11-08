@@ -136,7 +136,7 @@ export function cardStatus(meta, waiting = null, now = Date.now(), tick = 0) {
       ? { key: 'idle', mark: '✓', word: 'finished · nothing built' }
       : { key: 'done', mark: '✓', word: 'finished' };
   }
-  return { key: 'stopped', mark: '✕', word: String(state).toLowerCase().replace(/_/g, ' ') };
+  return { key: 'stopped', mark: '✕', word: String(state).toLowerCase().replaceAll('_', ' ') };
 }
 
 // --- the spinner ---------------------------------------------------------------
@@ -205,9 +205,10 @@ export function stageWalk(stages, current, width, ink, tick = null) {
   });
   const line = words.join(ink.muted(' ─ '));
   if (visibleWidth(line) <= width) return line;
-  return at < 0
-    ? ink.bold(String(current).toLowerCase())
-    : `${ink.muted(`stage ${at + 1} of ${stages.length} ·`)} ${ink.bold(String(current).toLowerCase())}`;
+  const name = ink.bold(String(current).toLowerCase());
+  if (at < 0) return name;
+  const place = ink.muted(`stage ${at + 1} of ${stages.length} ·`);
+  return `${place} ${name}`;
 }
 
 /**
@@ -268,11 +269,23 @@ export const RAIN = {
  */
 export const GLYPHS = '0123456789=+*<>:ZXJ';
 
+/** How far down the trail a cell is: the head, the body, or the tail. */
+function toneOf(behind, trail) {
+  if (behind === 0) return 'head';
+  return behind <= trail / 2 ? 'body' : 'tail';
+}
+
+/** The drawing for `rows` rows tall: three and more, two, or one. */
+function byRows(rows, three, two, one) {
+  if (rows >= 3) return three;
+  return rows === 2 ? two : one;
+}
+
 /** A small integer hash — the same inputs, the same drop. */
 function mix(...values) {
   let h = 0x811c9dc5;
   for (const value of values) {
-    h ^= value | 0;
+    h ^= Math.trunc(value);
     h = Math.imul(h, 0x01000193);
     h ^= h >>> 15;
   }
@@ -312,7 +325,7 @@ export function rainLines(width, rows, { seed = 0, tick = 0, mood = 'running' } 
       const behind = head - y;
       if (behind < 0 || behind > trail) continue;
       const glyph = GLYPHS[mix(seed, x, y, fallen) % GLYPHS.length];
-      grid[y][x] = { glyph, tone: behind === 0 ? 'head' : behind <= trail / 2 ? 'body' : 'tail' };
+      grid[y][x] = { glyph, tone: toneOf(behind, trail) };
     }
   }
   const styles = {
@@ -374,19 +387,19 @@ export function robotLines(width, rows, { tick = 0, still = false } = {}, ink) {
   const body = 5;
   const room = Math.max(0, width - body - sign.length - 2);
   const step = still ? 0 : Math.floor(tick / 4);
-  const x = 1 + (room ? (Math.floor(step / room) % 2 ? room - (step % room) : step % room) : 0);
+  let along = 0;
+  if (room) along = Math.floor(step / room) % 2 ? room - (step % room) : step % room;
+  const x = 1 + along;
   const blink = !still && tick % 23 === 22;
   const head = blink ? '[-_-]' : '[o_o]';
-  const arms = still || Math.floor(tick / 3) % 2 ? '\\[_]/' : '/[_]\\';
-  const legs = still || step % 2 ? ' / \\ ' : ' | | ';
+  const arms = still || Math.floor(tick / 3) % 2 ? String.raw`\[_]/` : '/[_]\\';
+  const legs = still || step % 2 ? String.raw` / \ ` : ' | | ';
   const at = (text, extra = '') => {
     const line = `${' '.repeat(x)}${paint(text)}${extra}`;
     return padVisible(clip(line, width), width);
   };
   const withSign = (text) => at(text, width >= body + sign.length + 1 ? ink.success(sign) : '');
-  const drawn = rows >= 3 ? [withSign(head), at(arms), at(legs)]
-    : rows === 2 ? [withSign(head), at(legs)]
-      : [withSign(head)];
+  const drawn = byRows(rows, [withSign(head), at(arms), at(legs)], [withSign(head), at(legs)], [withSign(head)]);
   return [...new Array(Math.max(0, rows - drawn.length)).fill(' '.repeat(width)), ...drawn].slice(-rows);
 }
 
@@ -409,16 +422,14 @@ export function mergingRobotLines(width, rows, { tick = 0, still = false, base =
   const body = 8;
   const room = Math.max(0, width - body - dock.length - 2);
   const x = 1 + (still || !room ? 0 : Math.floor(tick / 2) % (room + 1));
-  const legs = still || Math.floor(tick / 2) % 2 ? ' / \\ ' : ' | | ';
+  const legs = still || Math.floor(tick / 2) % 2 ? String.raw` / \ ` : ' | | ';
   const at = (text, extra = '') => padVisible(clip(`${' '.repeat(x)}${paint(text)}${extra}`, width), width);
   // The base stays where it is while the robot walks to it.
   const toDock = (text) => {
     const gap = width - x - visibleWidth(text) - dock.length;
     return gap >= 1 ? at(text, `${' '.repeat(gap)}${ink.muted(dock)}`) : at(text);
   };
-  const drawn = rows >= 3 ? [at('[>_>]'), toDock('/[_]=[■]'), at(legs)]
-    : rows === 2 ? [at('[>_>]'), toDock('/[_]=[■]')]
-      : [toDock('[>_>]=[■]')];
+  const drawn = byRows(rows, [at('[>_>]'), toDock('/[_]=[■]'), at(legs)], [at('[>_>]'), toDock('/[_]=[■]')], [toDock('[>_>]=[■]')]);
   return [...new Array(Math.max(0, rows - drawn.length)).fill(' '.repeat(width)), ...drawn].slice(-rows);
 }
 
@@ -450,7 +461,7 @@ function overlay(base, text, x) {
 
 /** Three plain rows → exactly `rows` painted ones, bottom-aligned, as the other robots are. */
 function stand(rowsOf, width, rows, paintRow) {
-  const drawn = (rows >= 3 ? rowsOf : rows === 2 ? [rowsOf[0], rowsOf[2]] : [rowsOf[0]])
+  const drawn = byRows(rows, rowsOf, [rowsOf[0], rowsOf[2]], [rowsOf[0]])
     .map((row, i, all) => paintRow(row, i, all.length));
   return [...new Array(Math.max(0, rows - drawn.length)).fill(' '.repeat(width)), ...drawn].slice(-rows);
 }
@@ -462,8 +473,8 @@ export function planWalkInLines(width, rows, { since = 0, tick = 0, still = fals
   }
   const x = -6 + Math.floor(since / 2);
   const sign = ` ${ROBOT_SIGN}`;
-  const legs = since % 2 ? ' / \\ ' : ' | | ';
-  const rowsOf = [`[o_o]${sign}`, '\\[_]/', legs];
+  const legs = since % 2 ? String.raw` / \ ` : ' | | ';
+  const rowsOf = [`[o_o]${sign}`, String.raw`\[_]/`, legs];
   return stand(rowsOf, width, rows, (row, i) => {
     const plain = placed(row, x, width);
     return i === 0 && row.length > 5
@@ -515,8 +526,11 @@ export function devDoneRobotLines(width, rows, { since = 0, still = false } = {}
   const waited = t - walk - 4;
   const blink = !still && waited >= 0 && waited % 23 === 22;
   const looking = !still && waited >= 0 && waited % 40 >= 37;
-  const head = carrying || looking ? '[>_>]' : blink ? '[-_-]' : '[o_o]';
-  const legs = !carrying || still ? ' | | ' : Math.floor(t / 2) % 2 ? ' / \\ ' : ' | | ';
+  let head = '[o_o]';
+  if (carrying || looking) head = '[>_>]';
+  else if (blink) head = '[-_-]';
+  const striding = carrying && !still && Math.floor(t / 2) % 2;
+  const legs = striding ? String.raw` / \ ` : ' | | ';
   const sign = '✓ built · /pr';
   const signed = !carrying && x >= sign.length + 2;
   let top = placed(head, x, width);
@@ -530,7 +544,7 @@ export function devDoneRobotLines(width, rows, { since = 0, still = false } = {}
     const onDock = (n >= 3 ? i === 1 : i === n - 1);
     const spans = [];
     if (onDock) spans.push([dockAt, width, ink.muted]);
-    if (signed && (n >= 3 ? i === 0 : i === 0)) spans.push([1, 1 + sign.length, ink.success]);
+    if (signed && i === 0) spans.push([1, 1 + sign.length, ink.success]); // the sign is on the top row, which stand() always draws first
     return segments(row, spans, (text) => ink.bold(ink.accent(text)));
   });
 }
@@ -572,19 +586,62 @@ export function landingRobotLines(width, rows, { since = 0, still = false, base 
   // Off the edge before the card closes itself, however wide the card is.
   const pace = Math.max(1, Math.ceil((width - stands) / (CLOSE_AFTER_TICKS - WAVE_TICKS - 1)));
   const x = stands + Math.max(0, t - WAVE_TICKS) * pace;
-  const arms = !waving ? '/[_]\\' : Math.floor(t / 2) % 2 ? '\\[_]/' : '/[_]\\';
+  const arms = waving && Math.floor(t / 2) % 2 ? String.raw`\[_]/` : '/[_]\\';
   const head = waving ? '[^_^]' : '[>_>]';
-  const legs = !waving && Math.floor(t / 2) % 2 ? ' / \\ ' : ' | | ';
+  const legs = !waving && Math.floor(t / 2) % 2 ? String.raw` / \ ` : ' | | ';
   const plain = withDock([
     placed(head, x, width),
     overlay(placed(arms, x, width), '[■]', branchX),
     placed(legs, x, width),
   ], rows, dock, width);
-  return stand(plain, width, rows, (row, i, n) => segments(
-    row, (n >= 3 ? i === 1 : i === n - 1) ? [[dockAt, width, ink.muted]] : [], (text) => ink.bold(ink.accent(text))));
+  return stand(plain, width, rows, (row, i, n) => {
+    const onDock = n >= 3 ? i === 1 : i === n - 1;
+    const spans = onDock ? [[dockAt, width, ink.muted]] : [];
+    return segments(row, spans, (text) => ink.bold(ink.accent(text)));
+  });
 }
 
 // --- a card --------------------------------------------------------------------
+
+/** A card's top edge: the corner, the label, the status (reversed while it is new), the other corner. */
+function cardTop(card, inner, paint, ink, [h, tl, tr]) {
+  const status = ` ${card.status.mark} ${card.status.word} `;
+  const number = card.n ? `${card.n} ` : '';
+  const left = ` ${number}`;
+  const badge = badgeOf(card.profile, ink);
+  const titleRoom = Math.max(0, inner - 1 - visibleWidth(left) - visibleWidth(badge) - 1
+    - visibleWidth(status) - 2);
+  const title = titleRoom >= 4 ? ` ${ellipsed(card.title ?? '', titleRoom - 1)} ` : ' ';
+  const label = `${left}${badge}${title}`;
+  const fill = Math.max(0, inner - 1 - visibleWidth(label) - visibleWidth(status) - 1);
+  // A status that changed is drawn reversed for a few ticks, then settles.
+  const beat = card.changedAt !== undefined && beating(card.changedAt, card.tick ?? 0);
+  const fits = visibleWidth(label) + visibleWidth(status) + 2 <= inner;
+  let shownStatus = '';
+  if (fits) shownStatus = beat ? ink.reverse(paint(status)) : paint(status);
+  return paint(tl + h) + (card.focused ? ink.bold(label) : label)
+    + paint(h.repeat(shownStatus ? fill : Math.max(0, inner - 1 - visibleWidth(label)))) + shownStatus
+    + paint((shownStatus ? h : '') + tr);
+}
+
+/** The `spare` rows under a card's words: the status's robot, the rain, or nothing. */
+function cardRain(card, inner, spare, ink) {
+  if (spare <= 0) return [];
+  // The robots move whether the rain is on or off: they are not the matrix.
+  const since = Number.isFinite(card.since) ? card.since : null;
+  const key = card.status.key;
+  if (key === 'planned') {
+    return since === null ? robotLines(inner, spare, { tick: card.tick }, ink)
+      : planWalkInLines(inner, spare, { since }, ink);
+  }
+  if (key === 'merging') return mergingRobotLines(inner, spare, { tick: card.tick, base: card.base }, ink);
+  if (key === 'done') return devDoneRobotLines(inner, spare, { since: since ?? 1e6 }, ink);
+  if (key === 'idle') return nothingBuiltRobotLines(inner, spare, { since: since ?? 1e6, ref: card.ref }, ink);
+  if (key === 'landed') return landingRobotLines(inner, spare, { since: since ?? 1e6, base: card.base }, ink);
+  // Failed, running, waiting, queued, stopped: no robot. The rain only when asked for.
+  if (card.rain !== true || key === 'failed') return new Array(spare).fill('');
+  return rainLines(inner, spare, { seed: card.seed, tick: card.tick, mood: key }, ink);
+}
 
 /**
  * One card, as exactly `rect.height` strings of exactly `rect.width` columns.
@@ -612,21 +669,7 @@ export function sessionCardLines(rect, card, ink) {
     : ['─', '│', '┌', '┐', '└', '┘'];
   const paint = statusPaint(card.status.key, ink);
 
-  const status = ` ${card.status.mark} ${card.status.word} `;
-  const left = ` ${card.n ? `${card.n} ` : ''}`;
-  const badge = badgeOf(card.profile, ink);
-  const titleRoom = Math.max(0, inner - 1 - visibleWidth(left) - visibleWidth(badge) - 1
-    - visibleWidth(status) - 2);
-  const title = titleRoom >= 4 ? ` ${ellipsed(card.title ?? '', titleRoom - 1)} ` : ' ';
-  const label = `${left}${badge}${title}`;
-  const fill = Math.max(0, inner - 1 - visibleWidth(label) - visibleWidth(status) - 1);
-  // A status that changed is drawn reversed for a few ticks, then settles.
-  const beat = card.changedAt !== undefined && beating(card.changedAt, card.tick ?? 0);
-  const shownStatus = visibleWidth(label) + visibleWidth(status) + 2 <= inner
-    ? (beat ? ink.reverse(paint(status)) : paint(status)) : '';
-  const top = paint(tl + h) + (card.focused ? ink.bold(label) : label)
-    + paint(h.repeat(shownStatus ? fill : Math.max(0, inner - 1 - visibleWidth(label)))) + shownStatus
-    + paint((shownStatus ? h : '') + tr);
+  const top = cardTop(card, inner, paint, ink, [h, tl, tr]);
 
   // A column of margin inside the border, for the words; the rain runs to it.
   const row = (text) => paint(v) + padVisible(clip(text, inner), inner) + RESET + paint(v);
@@ -635,24 +678,7 @@ export function sessionCardLines(rect, card, ink) {
   const room = Math.max(0, height - 2 - footer);
   const words = (card.lines ?? []).filter((line) => line !== null && line !== undefined).slice(0, room);
   const spare = room - words.length;
-  // The robots move whether the rain is on or off: they are not the matrix.
-  const since = Number.isFinite(card.since) ? card.since : null;
-  const rain = spare <= 0 ? []
-    : card.status.key === 'planned'
-      ? (since === null ? robotLines(inner, spare, { tick: card.tick }, ink)
-        : planWalkInLines(inner, spare, { since }, ink))
-      : card.status.key === 'merging'
-        ? mergingRobotLines(inner, spare, { tick: card.tick, base: card.base }, ink)
-        : card.status.key === 'done'
-          ? devDoneRobotLines(inner, spare, { since: since ?? 1e6 }, ink)
-          : card.status.key === 'idle'
-            ? nothingBuiltRobotLines(inner, spare, { since: since ?? 1e6, ref: card.ref }, ink)
-            : card.status.key === 'landed'
-              ? landingRobotLines(inner, spare, { since: since ?? 1e6, base: card.base }, ink)
-              // Failed, running, waiting, queued, stopped: no robot. The rain only when asked for.
-              : card.rain !== true || card.status.key === 'failed'
-                ? new Array(spare).fill('')
-                : rainLines(inner, spare, { seed: card.seed, tick: card.tick, mood: card.status.key }, ink);
+  const rain = cardRain(card, inner, spare, ink);
   const lines = [top, ...words.map(said), ...rain.map(row)];
   if (footer) lines.push(said(ink.muted(card.footer)));
   lines.push(paint(bl + h.repeat(inner) + br));

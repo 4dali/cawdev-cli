@@ -51,11 +51,11 @@ export async function removeStaleLock(path, { now = Date.now(), minAgeMs = MIN_A
   let info;
   try {
     info = await stat(path);
-  } catch (failure) {
-    if (failure.code === 'ENOENT') {
+  } catch (error_) {
+    if (error_.code === 'ENOENT') {
       return { removed: false, said: `${path} is already gone — /continue picks it back up` };
     }
-    return { removed: false, said: `could not read ${path}: ${failure.message}` };
+    return { removed: false, said: `could not read ${path}: ${error_.message}` };
   }
   const age = now - info.mtimeMs;
   if (age < minAgeMs) {
@@ -66,8 +66,8 @@ export async function removeStaleLock(path, { now = Date.now(), minAgeMs = MIN_A
   }
   try {
     await rm(path);
-  } catch (failure) {
-    return { removed: false, said: `could not remove ${path}: ${failure.message}` };
+  } catch (error_) {
+    return { removed: false, said: `could not remove ${path}: ${error_.message}` };
   }
   return { removed: true, said: `removed ${path}` };
 }

@@ -142,7 +142,7 @@ const STATE_COLOUR = {
  * the caller wants to say nothing about.
  */
 export function questionState(questions, email) {
-  const open = (questions ?? []).find((question) => !question.answered);
+  const open = (questions ?? []).find((question) => !question.answered && !question.setAside);
   if (!open) {
     return null;
   }
@@ -252,15 +252,45 @@ export function permissionDecision(approval, key, machine = {}) {
 
 /** What the "started" line adds when `--show` or `--no-show` was given. */
 function shownWord(show) {
-  return show === true ? ', shown before its PR' : show === false ? ', not shown before its PR' : '';
+  if (show === true) return ', shown before its PR';
+  return show === false ? ', not shown before its PR' : '';
+}
+
+/** The keys a reader's footer offers, by what the session waits on. */
+function readerKeys(waiting) {
+  if (waiting?.kind === 'show') return 'a look and decide';
+  if (waiting?.kind === 'permission') return 'y once · s session · n refuse';
+  return waiting?.asking?.yours ? 'a answer' : '';
+}
+
+/** A reader's window title: the session's, and what it is stopped on. */
+function readerTitle(meta, waiting) {
+  return titleFor(meta, waiting ? waitingWord(waiting.kind) : null);
+}
+
+/** A screenshot's row in a picker: its number, name and caption. */
+function shotLabel(at, shot) {
+  const caption = shot.caption ? ` — ${printable(shot.caption)}` : '';
+  return `${at + 1}  ${printable(shot.name)}${caption}`;
+}
+
+/** "s" for anything but one: the plural of a count in a sentence. */
+function pluralS(count) {
+  return count === 1 ? '' : 's';
+}
+
+/** `on` and `off` as booleans; anything else is left to the caller. */
+function onOffWord(word) {
+  if (word === 'off') return false;
+  return word === 'on' ? true : undefined;
 }
 
 const A_SHOW_GATE = 'a SHOW gate is decided after looking — a, /accept or /comments';
 
 /** What a window's title says a session is stopped on. */
 function waitingWord(kind) {
-  return kind === 'show' ? 'waiting for you'
-    : kind === 'question' ? 'waiting for an answer' : 'waiting for permission';
+  if (kind === 'show') return 'waiting for you';
+  return kind === 'question' ? 'waiting for an answer' : 'waiting for permission';
 }
 
 /**
@@ -295,8 +325,9 @@ export function permissionBanner(pending, width, ink = painter(3), machine = {})
   const gate = showGate(approval);
   if (gate) {
     const count = gate.ids.length;
+    const waitingFor = `waiting for you — ${count} screenshot${pluralS(count)}, round ${gate.round}`;
     return [
-      `${ink.bold(ink.warn(' show '))} ${clip(`waiting for you — ${count} screenshot${count === 1 ? '' : 's'}, round ${gate.round}`, Math.max(8, width - 8))}`,
+      `${ink.bold(ink.warn(' show '))} ${clip(waitingFor, Math.max(8, width - 8))}`,
       ink.muted(` ${approval.toolName} · waiting since ${approval.askedAt?.slice(11, 19) ?? ''}`),
       ...wrapChoices([
         `${ink.success('a')} look and decide`,
@@ -1007,6 +1038,123 @@ function readReloadState() {
   }
 }
 
+/** The word on a card that waits: a SHOW gate, a permission, a question. */
+function cardWaitingWord(shownGate, pending, asking) {
+  if (shownGate) return 'waiting · screenshots';
+  if (pending) return 'waiting · permission';
+  if (!asking) return null;
+  return asking.yours ? 'waiting on you' : 'waiting · a question';
+}
+
+/** A card's first line: what the SHOW gate waits for, or the agent, model and path. */
+function subtitleLine(gate, who, meta, room, ink) {
+  if (gate) return ink.warn(showWaitingLine(gate, gate.ids.length));
+  const agent = who ? `${ink.strong(who)} ` : '';
+  return agent + ink.muted(subtitleFor(meta, room - (who ? who.length + 1 : 0)));
+}
+
+/** A running card draws its stage walk; a finished CODE one says its commits. */
+function progressLine(meta, view, room, ink, tick) {
+  if (!meta.ended) return stageWalk(meta.stages, meta.stage, room, ink, tick);
+  const finishedCode = meta.commits !== undefined && (view.profile ?? 'CODE') === 'CODE' && view.state === 'FINISHED';
+  if (!finishedCode) return '';
+  const plural = meta.commits === 1 ? '' : 's';
+  const onBranch = view.branch ? ` on ${view.branch}` : '';
+  return ink.muted(`${meta.commits} commit${plural}${onBranch}`);
+}
+
+/** The one line of a card that waits on a permission or a question. */
+function attentionLine(pending, asking, ink) {
+  if (pending) {
+    const tool = pending.approval?.toolName ?? 'a tool';
+    return ink.warn(`◆ ${tool}: ${String(pending.approval?.summary ?? '').split('\n')[0]}`);
+  }
+  return ink.warn(`◆ ${String(asking.question?.question ?? '').split('\n')[0]}`);
+}
+
+/** The key line of a card, by what it waits on. */
+function keysLine(pending, asking, shownGate, meta) {
+  if (pending) return 'y once · s session · n refuse · /view reads it';
+  if (asking?.yours) return 'a answers · /view reads it whole';
+  return shownGate ? 'a to look and decide' : actionsFor(meta);
+}
+
+/** A card's title: its ref and title, or its label. */
+function sessionTitle(view, meta) {
+  if (!view.entryRef) return view.label ?? meta.label ?? 'a session';
+  return `${view.entryRef} ${view.entryTitle ?? view.label ?? meta.label ?? ''}`.trim();
+}
+
+function mergeTitle(merging, view, meta) {
+  return `${merging.ref} ${view.entryTitle ?? view.label ?? meta.label ?? ''}`.trim();
+}
+
+/** A merge that landed: the card says so and closes after a few seconds. */
+function mergeLandedCard(merging, meta, view, frame) {
+  const { ink, tick } = frame;
+  const left = Math.max(0, Math.ceil((CLOSE_AFTER_TICKS - (tick - merging.landedTick)) * RAIN_STEP_MS / 1000));
+  const sha = merging.sha ? ` as ${merging.sha}` : '';
+  return {
+    n: frame.n,
+    profile: view.profile ?? meta.profile ?? null,
+    title: mergeTitle(merging, view, meta),
+    status: { key: 'landed', mark: '✓', word: `merged · closes in ${left}s` },
+    lines: [
+      ink.muted(`landed on ${merging.base}${sha} · the card is MERGED`),
+    ],
+    footer: '/open the merge · /close now',
+    focused: frame.focused,
+    seed: seedOf(meta.id),
+    tick,
+    since: tick - merging.landedTick,
+    changedAt: merging.landedTick,
+    rain: false,
+    base: merging.base,
+  };
+}
+
+/** What a merge that has not landed says: its status, why, and the footer. */
+function mergeProgress(merging, ink) {
+  if (merging.state === 'failed') {
+    return {
+      status: { key: 'stopped', mark: '✕', word: 'merge failed' },
+      why: ink.danger(`why: ${merging.why}`),
+      footer: '/review to look again',
+    };
+  }
+  if (merging.state === 'resolving') {
+    return {
+      status: { key: 'waiting', mark: '⟳', word: 'conflict · back to dev' },
+      why: ink.warn(`why: ${merging.why}`),
+      footer: 'its development starts again here to resolve it',
+    };
+  }
+  return {
+    status: { key: 'merging', mark: '⇢', word: 'merging' },
+    why: ink.muted('nothing to do here: it closes once it lands'),
+    footer: '',
+  };
+}
+
+/** A merge in flight, failed, or sent back to development. */
+function mergeOpenCard(merging, meta, view, frame) {
+  const { ink } = frame;
+  const { status, why, footer } = mergeProgress(merging, ink);
+  return {
+    n: frame.n,
+    profile: view.profile ?? meta.profile ?? null,
+    title: mergeTitle(merging, view, meta),
+    status,
+    lines: [ink.muted(`${merging.branch} → ${merging.base}`), why],
+    footer,
+    focused: frame.focused,
+    seed: seedOf(meta.id),
+    tick: frame.tick,
+    rain: frame.rain,
+    base: merging.base,
+  };
+}
+
 export class Attached {
   /**
    * @param options `out` is where to draw — `process.stdout` in the real thing,
@@ -1175,7 +1323,7 @@ export class Attached {
     this.matrix = prefs.matrix === true;
     // Advanced mode is the default where the terminal can draw it; the choice
     // `/simple` and `/advanced-mode` made last time is remembered.
-    this.screenMode = this.options.simple ? 'simple' : prefs.mode === 'simple' ? 'simple' : 'advanced';
+    this.screenMode = this.options.simple || prefs.mode === 'simple' ? 'simple' : 'advanced';
     // Raw mode only where there is a terminal to put in it. Through a pipe
     // there are no keys, the transcript is the whole output, and that is the
     // honest degradation rather than a broken one.
@@ -2618,38 +2766,52 @@ export class Attached {
     if (!run) return;
 
     const pending = this.pendingOn(run);
-    if (pending && !this.announced.has(pending.approval.id) && showGate(pending.approval)) {
-      // R605. Not a permission: nobody is shown three lengths of yes. It says
-      // what is waiting and, in a terminal that can draw a picker, opens the
-      // one that looks and decides.
-      this.announced.add(pending.approval.id);
-      const ink = this.ink;
-      const about = pending.approval.id;
-      const gate = showGate(pending.approval);
-      this.sayAbout(about, '');
-      this.sayAbout(about, `${ink.bold(ink.warn(' show '))} ${ink.muted('from')} ${ink.bold(this.tagOf(run))}`);
-      this.sayAbout(about, `  ${ink.text(`${gate.ids.length} screenshot${gate.ids.length === 1 ? '' : 's'}, round ${gate.round} — a looks and decides`)}`);
-      if (this.mode === 'keys' && this.session.signedIn) {
-        void this.lookAndDecide(run);
-      }
-      return;
-    }
     if (pending && !this.announced.has(pending.approval.id)) {
-      this.announced.add(pending.approval.id);
-      const ink = this.ink;
-      const about = pending.approval.id;
-      this.sayAbout(about, '');
-      this.sayAbout(about, `${ink.bold(ink.warn(' permission '))} ${ink.muted('from')} ${ink.bold(this.tagOf(run))}`);
-      this.sayAbout(about, `  ${ink.text(pending.approval.toolName)}`);
-      // Not clipped: this is the thing being decided about, and a command cut
-      // at the width is a command you have not read.
-      this.sayAbout(about, { prefix: '  ', body: pending.approval.summary, paint: ink.text });
-      if (this.mode === 'keys') {
-        this.askPermission(pending);
-      }
+      if (showGate(pending.approval)) this.announceShowGate(run, pending);
+      else this.announcePermission(run, pending);
       return;
     }
+    this.announceQuestion(run);
+  }
 
+  /**
+   * R605. Not a permission: nobody is shown three lengths of yes. It says
+   * what is waiting and, in a terminal that can draw a picker, opens the
+   * one that looks and decides.
+   */
+  announceShowGate(run, pending) {
+    this.announced.add(pending.approval.id);
+    const ink = this.ink;
+    const about = pending.approval.id;
+    const gate = showGate(pending.approval);
+    const count = gate.ids.length;
+    const shots = `${count} screenshot${pluralS(count)}, round ${gate.round} — a looks and decides`;
+    this.sayAbout(about, '');
+    this.sayAbout(about, `${ink.bold(ink.warn(' show '))} ${ink.muted('from')} ${ink.bold(this.tagOf(run))}`);
+    this.sayAbout(about, `  ${ink.text(shots)}`);
+    if (this.mode === 'keys' && this.session.signedIn) {
+      void this.lookAndDecide(run);
+    }
+  }
+
+  /** A permission request that has not been announced yet, said and asked. */
+  announcePermission(run, pending) {
+    this.announced.add(pending.approval.id);
+    const ink = this.ink;
+    const about = pending.approval.id;
+    this.sayAbout(about, '');
+    this.sayAbout(about, `${ink.bold(ink.warn(' permission '))} ${ink.muted('from')} ${ink.bold(this.tagOf(run))}`);
+    this.sayAbout(about, `  ${ink.text(pending.approval.toolName)}`);
+    // Not clipped: this is the thing being decided about, and a command cut
+    // at the width is a command you have not read.
+    this.sayAbout(about, { prefix: '  ', body: pending.approval.summary, paint: ink.text });
+    if (this.mode === 'keys') {
+      this.askPermission(pending);
+    }
+  }
+
+  /** A question of the current run that has not been announced yet. */
+  announceQuestion(run) {
     const asking = this.askingOn(run);
     if (!asking || this.announced.has(asking.question.id)) {
       return;
@@ -2739,11 +2901,11 @@ export class Attached {
     this.configuring = { answer: null, cancel: null };
     try {
       await this.configWalk(file);
-    } catch (failure) {
-      if (failure === CANCELLED) {
+    } catch (error_) {
+      if (error_ === CANCELLED) {
         this.note('nothing changed');
       } else {
-        this.say(`  ${this.ink.danger(failure.message)}`);
+        this.say(`  ${this.ink.danger(error_.message)}`);
         this.note('nothing changed');
       }
     } finally {
@@ -3124,7 +3286,7 @@ export class Attached {
       case 'projects':
         return this.askSplitProjects();
       case 'board': {
-        const want = rest[0] === 'off' ? false : rest[0] === 'on' ? true : undefined;
+        const want = onOffWord(rest[0]);
         return this.toggleBoard(want);
       }
       case 'refresh':
@@ -3781,96 +3943,46 @@ export class Attached {
     const asking = this.askingOn(run);
     const view = meta.view ?? {};
     const room = rect.width - 4;
-    const waiting = shownGate ? 'waiting · screenshots'
-      : pending ? 'waiting · permission'
-        : asking ? (asking.yours ? 'waiting on you' : 'waiting · a question') : null;
+    const waiting = cardWaitingWord(shownGate, pending, asking);
     const who = agentModelFor(meta);
     // R605. At SHOW the card says what it is waiting for, in amber; the agent,
     // model and path come back once the gate is settled.
     const gate = shownGate ? showGate(shownGate.approval) : null;
-    const subtitle = gate
-      ? ink.warn(showWaitingLine(gate, gate.ids.length))
-      : (who ? `${ink.strong(who)} ` : '') + ink.muted(subtitleFor(meta, room - (who ? who.length + 1 : 0)));
+    const subtitle = subtitleLine(gate, who, meta, room, ink);
     const tick = this.rainTick ?? 0;
     const status = cardStatus(meta, waiting, now, tick);
     // A status that changes is drawn bright for a few ticks: when its key moves.
     if (meta.lastKey !== undefined && meta.lastKey !== status.key) meta.changedTick = tick;
     meta.lastKey = status.key;
-    const progress = !meta.ended
-      ? stageWalk(meta.stages, meta.stage, room, ink, tick)
-      : meta.commits !== undefined && (view.profile ?? 'CODE') === 'CODE' && view.state === 'FINISHED'
-        ? ink.muted(`${meta.commits} commit${meta.commits === 1 ? '' : 's'}${view.branch ? ` on ${view.branch}` : ''}`)
-        : '';
-    const doing = pending
-      ? ink.warn(`◆ ${pending.approval?.toolName ?? 'a tool'}: ${String(pending.approval?.summary ?? '').split('\n')[0]}`)
-      : asking
-        ? ink.warn(`◆ ${String(asking.question?.question ?? '').split('\n')[0]}`)
-        : nowLine(meta, this.lines.get(meta.id) ?? []);
-    const keys = pending ? 'y once · s session · n refuse · /view reads it'
-      : asking?.yours ? 'a answers · /view reads it whole'
-        : shownGate ? 'a to look and decide' : actionsFor(meta);
+    const progress = progressLine(meta, view, room, ink, tick);
+    const doing = pending || asking
+      ? attentionLine(pending, asking, ink)
+      : nowLine(meta, this.lines.get(meta.id) ?? []);
+    const keys = keysLine(pending, asking, shownGate, meta);
     const merging = meta.merging;
-    if (merging?.state === 'landed') {
-      const left = Math.max(0, Math.ceil((CLOSE_AFTER_TICKS - (tick - merging.landedTick)) * RAIN_STEP_MS / 1000));
-      return {
-        n,
-        profile: view.profile ?? meta.profile ?? null,
-        title: `${merging.ref} ${view.entryTitle ?? view.label ?? meta.label ?? ''}`.trim(),
-        status: { key: 'landed', mark: '✓', word: `merged · closes in ${left}s` },
-        lines: [
-          ink.muted(`landed on ${merging.base}${merging.sha ? ` as ${merging.sha}` : ''} · the card is MERGED`),
-        ],
-        footer: '/open the merge · /close now',
-        focused: meta.id === this.split.focus,
-        seed: seedOf(meta.id),
-        tick,
-        since: tick - merging.landedTick,
-        changedAt: merging.landedTick,
-        rain: false,
-        base: merging.base,
-      };
-    }
-    if (merging) {
-      const failed = merging.state === 'failed';
-      const resolving = merging.state === 'resolving';
-      return {
-        n,
-        profile: view.profile ?? meta.profile ?? null,
-        title: `${merging.ref} ${view.entryTitle ?? view.label ?? meta.label ?? ''}`.trim(),
-        status: failed ? { key: 'stopped', mark: '✕', word: 'merge failed' }
-          : resolving ? { key: 'waiting', mark: '⟳', word: 'conflict · back to dev' }
-            : { key: 'merging', mark: '⇢', word: 'merging' },
-        lines: [
-          ink.muted(`${merging.branch} → ${merging.base}`),
-          failed ? ink.danger(`why: ${merging.why}`)
-            : resolving ? ink.warn(`why: ${merging.why}`)
-              : ink.muted('nothing to do here: it closes once it lands'),
-        ],
-        footer: failed ? '/review to look again'
-          : resolving ? `its development starts again here to resolve it` : '',
-        focused: meta.id === this.split.focus,
-        seed: seedOf(meta.id),
-        tick,
-        rain: this.matrix === true,
-        base: merging.base,
-      };
-    }
+    const frame = {
+      n,
+      ink,
+      tick,
+      focused: meta.id === this.split.focus,
+      rain: this.matrix === true,
+    };
+    if (merging?.state === 'landed') return mergeLandedCard(merging, meta, view, frame);
+    if (merging) return mergeOpenCard(merging, meta, view, frame);
     return {
       n,
       profile: view.profile ?? meta.profile ?? null,
-      title: view.entryRef
-        ? `${view.entryRef} ${view.entryTitle ?? view.label ?? meta.label ?? ''}`.trim()
-        : (view.label ?? meta.label ?? 'a session'),
+      title: sessionTitle(view, meta),
       status,
       lines: [subtitle, progress || null, doing ? (pending || asking ? doing : ink.text(doing)) : null],
       footer: keys,
-      focused: !this.split.boardFocus && meta.id === this.split.focus,
+      focused: !this.split.boardFocus && frame.focused,
       seed: seedOf(meta.id),
       tick,
       since: meta.ended && Number.isFinite(meta.changedTick) ? tick - meta.changedTick : undefined,
       changedAt: meta.changedTick,
       ref: view.entryRef ?? null,
-      rain: this.matrix === true,
+      rain: frame.rain,
     };
   }
 
@@ -3929,11 +4041,13 @@ export class Attached {
     // Which window a command or a prompt will act on, before it is sent.
     const target = this.windowNumberOf(this.split.focus);
     const tag = target ? ink.bold(ink.accent(`[${target}] `)) : '';
+    const focusLabel = current ? `“${current.label}”` : 'the focused session';
+    const enterHint = ink.muted(`enter prompts ${focusLabel}`);
     const input = this.mode === 'typing'
       ? `${tag}${this.input.label} ${this.input.line.render(
         Math.max(8, inner - visibleWidth(tag) - visibleWidth(this.input.label) - 1), ink)}`
       // Only what enter acts on: the keys live once, in the window's footer.
-      : [`${tag}${ink.muted(`enter prompts ${current ? `“${current.label}”` : 'the focused session'}`)}`];
+      : [`${tag}${enterHint}`];
     // A question or a request on screen says which window it came from.
     const from = banner.length ? [ink.bold(ink.warn(` from ${this.tagOf(current)}`))] : [];
     // Under the banner and right above the line, so a long one never pushes
@@ -3952,8 +4066,9 @@ export class Attached {
     );
     const fixed = [...from, ...banner, ...whole, ...overlay, ...completing, ...[input].flat()];
     // The window's key footer wraps between keys, so the prompt grows with it.
+    const statusTag = this.statusWindow ? `[${this.statusWindow}] ` : '';
     const footerRows = this.status
-      ? [ink.warn(`${this.statusWindow ? `[${this.statusWindow}] ` : ''}${this.status}`)]
+      ? [ink.warn(`${statusTag}${this.status}`)]
       : packKeys(this.keys(), inner, ink);
     const promptRows = Math.max(PROMPT_ROWS, fixed.length + 4 + footerRows.length);
     // The roadmap across the top: as tall as its fullest column needs, never
@@ -4046,10 +4161,12 @@ export class Attached {
       if (line.body === undefined) return [line.text];
       return wordWrap(line.body, inner - 2 - line.prefix.length).map((part) => `${line.prefix}${line.paint(part)}`);
     });
-    const promptTitle = `cawdev ▸ ${this.runner?.name ?? 'runner'}`
-      + `${this.session.email ? ` · ${this.session.email}` : ' · not signed in'}`
-      + `${this.agent ? ` · ${this.agent}` : ''}${unseen}`
-      + (this.needYou().length ? ` · ${ink.warn(`${this.needYou().length} need you`)}` : '');
+    const account = this.session.email ? ` · ${this.session.email}` : ' · not signed in';
+    const agentPart = this.agent ? ` · ${this.agent}` : '';
+    const needYou = this.needYou().length;
+    const needText = ink.warn(`${needYou} need you`);
+    const promptTitle = `cawdev ▸ ${this.runner?.name ?? 'runner'}${account}${agentPart}${unseen}`
+      + (needYou ? ` · ${needText}` : '');
     pieces.push({
       rect: layout.prompt,
       lines: windowLines(layout.prompt, {
@@ -4113,12 +4230,12 @@ export class Attached {
         }
         read.push(slug);
         this.gone.delete(slug);
-      } catch (failure) {
-        if (failure?.status === 404) {
+      } catch (error_) {
+        if (error_?.status === 404) {
           this.forgetGone(slug);
           continue;
         }
-        failed.push({ slug, message: failure?.message ?? String(failure) });
+        failed.push({ slug, message: error_?.message ?? String(error_) });
         all.push(...this.cards.filter((card) => card.slug === slug));
       }
     }
@@ -4230,7 +4347,7 @@ export class Attached {
       this.note('--show or --no-show, not both');
       return;
     }
-    const show = asked ? true : refused ? false : undefined;
+    const show = asked || (refused ? false : undefined);
     // `--codex`, `--claude`, `--agy`: this session's agent, over `/agent`'s.
     const flagged = words.find((word) => AGENT_FLAGS.has(word));
     let agent = flagged ? flagged.slice(2) : this.agent;
@@ -4341,10 +4458,10 @@ export class Attached {
         this.say(this.ink.warn(`  ${line}`));
       }
       this.note('');
-    } catch (failure) {
-      this.note(/usage|window/i.test(failure.message)
-        ? `${failure.message} — add --anyway to start them regardless`
-        : failure.message);
+    } catch (error_) {
+      this.note(/usage|window/i.test(error_.message)
+        ? `${error_.message} — add --anyway to start them regardless`
+        : error_.message);
     }
   }
 
@@ -4435,8 +4552,8 @@ export class Attached {
         method: 'POST',
         body: { title: cardTitleFor(text), body: text, status: 'CONSIDERING', ...(show ? { showBeforePr: true } : {}) },
       });
-    } catch (failure) {
-      this.note(`could not write the card: ${failure.message}`);
+    } catch (error_) {
+      this.note(`could not write the card: ${error_.message}`);
       return;
     }
     const ref = card?.ref ?? (card?.number ? `R${card.number}` : 'the card');
@@ -4478,15 +4595,15 @@ export class Attached {
     let cards;
     try {
       cards = cardsFrom(await readFile(absolute(path), 'utf8'));
-    } catch (failure) {
-      this.note(`could not import ${path}: ${failure.message}`);
+    } catch (error_) {
+      this.note(`could not import ${path}: ${error_.message}`);
       return;
     }
     let result;
     try {
       result = await importCards(this.session, slug, cards, { dryRun, status, allowDuplicates });
-    } catch (failure) {
-      this.note(`could not import ${path}: ${failure.message}`);
+    } catch (error_) {
+      this.note(`could not import ${path}: ${error_.message}`);
       return;
     }
     for (const line of resultLines(result, slug, this.ink)) this.say(line);
@@ -4507,8 +4624,8 @@ export class Attached {
         method: 'POST',
         body: { title: cardTitleFor(text), body: text },
       });
-    } catch (failure) {
-      this.note(`could not write the card: ${failure.message}`);
+    } catch (error_) {
+      this.note(`could not write the card: ${error_.message}`);
       return;
     }
     const ref = card?.ref ?? (card?.number ? `R${card.number}` : null);
@@ -4544,28 +4661,41 @@ export class Attached {
       const page = await this.session.request(`/api/projects/${slug}/runs?limit=50`)
         .catch(() => []);
       for (const view of Array.isArray(page) ? page : []) {
-        if (this.sessions.has(view.id) || this.closed.has(view.id)
-            || this.runs.some((run) => run.id === view.id)
-            || !carriesOnHere(view, this.runner.id, this.session.email)) {
+        if (this.alreadyKnown(view.id) || !carriesOnHere(view, this.runner.id, this.session.email)) {
           continue;
         }
-        const meta = {
-          id: view.id, projectSlug: slug, label: view.label, profile: view.profile,
-          state: view.state, ended: true, view, prAsked: null,
-        };
-        this.sessions.set(view.id, meta);
-        // Its window has no transcript to show — the daemon never streamed it
-        // to this terminal — so it opens on why it stopped.
-        if (!this.lines.has(view.id)) {
-          const why = view.exitSummary ?? view.failureReason ?? `${String(view.state).toLowerCase()}`;
-          // `seed`: it stands for a transcript this terminal never had, and
-          // leaves when the session comes back (`trackSessions`) — above live
-          // output it reads as the session failing again.
-          this.lines.set(view.id, [{ kind: 'ERROR', body: `stopped: ${why}`, seed: true }]);
-        }
-        found.push(meta);
+        found.push(this.adoptStopped(view, slug));
       }
     }
+    this.sayStopped(found);
+  }
+
+  /** Whether a run already has a window here, was closed, or is one this daemon drives. */
+  alreadyKnown(id) {
+    return this.sessions.has(id) || this.closed.has(id) || this.runs.some((run) => run.id === id);
+  }
+
+  /** A stopped run of this machine's, given its window. */
+  adoptStopped(view, slug) {
+    const meta = {
+      id: view.id, projectSlug: slug, label: view.label, profile: view.profile,
+      state: view.state, ended: true, view, prAsked: null,
+    };
+    this.sessions.set(view.id, meta);
+    // Its window has no transcript to show — the daemon never streamed it
+    // to this terminal — so it opens on why it stopped.
+    if (!this.lines.has(view.id)) {
+      const why = view.exitSummary ?? view.failureReason ?? String(view.state).toLowerCase();
+      // `seed`: it stands for a transcript this terminal never had, and
+      // leaves when the session comes back (`trackSessions`) — above live
+      // output it reads as the session failing again.
+      this.lines.set(view.id, [{ kind: 'ERROR', body: `stopped: ${why}`, seed: true }]);
+    }
+    return meta;
+  }
+
+  /** What `findStopped` says once it has found them. */
+  sayStopped(found) {
     if (!found.length) return;
     this.say(this.ink.warn(`  ${found.length} session(s) stopped here and can be carried on:`));
     for (const meta of found) {
@@ -4613,8 +4743,8 @@ export class Attached {
       meta.carryAsked = true;
       this.say(this.ink.success(`  carrying on ${view.label ?? meta.id} — its window comes back when this machine takes it`));
       this.note('');
-    } catch (failure) {
-      this.note(failure.message);
+    } catch (error_) {
+      this.note(error_.message);
     }
   }
 
@@ -4711,14 +4841,13 @@ export class Attached {
       this.say(this.ink.success(`  started ${what} on ${slug} — its window opens when this machine takes it`));
       this.note('');
       return true;
-    } catch (failure) {
+    } catch (error_) {
       // R369's sentence is checked first: it is the one that names a session,
       // and the usage test is loose enough to match words in other sentences.
-      this.note(/session that finished/.test(failure.message)
-        ? `${failure.message} — add --again to start it regardless`
-        : /usage|window/i.test(failure.message)
-          ? `${failure.message} — add --anyway to start it regardless`
-          : failure.message);
+      let advice = error_.message;
+      if (/session that finished/.test(error_.message)) advice = `${error_.message} — add --again to start it regardless`;
+      else if (/usage|window/i.test(error_.message)) advice = `${error_.message} — add --anyway to start it regardless`;
+      this.note(advice);
       return false;
     }
   }
@@ -4759,8 +4888,8 @@ export class Attached {
       void (asked?.id && asked?.runnerId && asked?.kind === 'OPEN_PR'
         ? this.followPullRequest(meta, asked, 60)
         : this.awaitPullRequest(meta, 60));
-    } catch (failure) {
-      this.note(failure.message);
+    } catch (error_) {
+      this.note(error_.message);
     }
   }
 
@@ -4917,31 +5046,45 @@ export class Attached {
   async reviewTarget(words) {
     const named = words.filter((word) => word.startsWith('@')).map((word) => word.slice(1));
     const bare = words.filter((word) => word && !word.startsWith('@'));
-    if (bare.length) {
-      if (bare.length > 1 || !/^[ri]?\d+$/i.test(bare[0])) {
-        this.note('/review which card? /review R42 (@project), or /review alone for the session\'s');
-        return null;
-      }
-      const ref = refOf(bare[0]);
-      const projects = named.length ? named
-        : this.shownProjects().length ? this.shownProjects() : this.servedProjects();
-      const reads = await Promise.all(projects.map((slug) => this.session
-        .request(`/api/projects/${slug}/roadmap/${ref}`)
-        .then((card) => (card ? { slug, card } : null))
-        .catch(() => null)));
-      const found = reads.filter(Boolean);
-      const building = found.filter((each) => each.card.workItem);
-      const pick = building.length ? building : found;
-      if (pick.length > 1) {
-        this.note(`${ref} is in ${pick.map((each) => each.slug).join(', ')} — name one: /review ${ref} @${pick[0].slug}`);
-        return null;
-      }
-      if (!pick.length) {
-        this.note(`no ${ref} in ${projects.join(', ') || 'any project here'}`);
-        return null;
-      }
-      return { ...pick[0], meta: null };
+    if (bare.length) return this.reviewNamedCard(bare, named);
+    return this.reviewFocusedCard();
+  }
+
+  /** The projects a named card is looked for in: the `@` ones, else those shown, else those served. */
+  projectsToSearch(named) {
+    if (named.length) return named;
+    const shown = this.shownProjects();
+    return shown.length ? shown : this.servedProjects();
+  }
+
+  /** `/review R42 (@project)`: the one project's card of that number that is being built, or null after saying why. */
+  async reviewNamedCard(bare, named) {
+    if (bare.length > 1 || !/^[ri]?\d+$/i.test(bare[0])) {
+      this.note('/review which card? /review R42 (@project), or /review alone for the session\'s');
+      return null;
     }
+    const ref = refOf(bare[0]);
+    const projects = this.projectsToSearch(named);
+    const reads = await Promise.all(projects.map((slug) => this.session
+      .request(`/api/projects/${slug}/roadmap/${ref}`)
+      .then((card) => (card ? { slug, card } : null))
+      .catch(() => null)));
+    const found = reads.filter(Boolean);
+    const building = found.filter((each) => each.card.workItem);
+    const pick = building.length ? building : found;
+    if (pick.length > 1) {
+      this.note(`${ref} is in ${pick.map((each) => each.slug).join(', ')} — name one: /review ${ref} @${pick[0].slug}`);
+      return null;
+    }
+    if (!pick.length) {
+      this.note(`no ${ref} in ${projects.join(', ') || 'any project here'}`);
+      return null;
+    }
+    return { ...pick[0], meta: null };
+  }
+
+  /** `/review` alone: the focused session's card, or null after saying why. */
+  async reviewFocusedCard() {
     const meta = this.commandTarget();
     const ref = meta?.view?.entryRef;
     const slug = meta?.projectSlug ?? meta?.view?.projectSlug;
@@ -4951,8 +5094,8 @@ export class Attached {
     }
     try {
       return { slug, card: await this.session.request(`/api/projects/${slug}/roadmap/${ref}`), meta };
-    } catch (failure) {
-      this.note(`could not read ${ref}: ${failure.message}`);
+    } catch (error_) {
+      this.note(`could not read ${ref}: ${error_.message}`);
       return null;
     }
   }
@@ -4975,7 +5118,8 @@ export class Attached {
     const ref = card.ref ?? '';
     const item = card.workItem;
     if (!item?.id || !item.branch) {
-      return this.note(`${ref} has no branch in development${card.status ? ` — it is ${card.status}` : ''}`);
+      const standing = card.status ? ` — it is ${card.status}` : '';
+      return this.note(`${ref} has no branch in development${standing}`);
     }
     const cwd = await this.checkoutFor(slug, meta);
     if (!cwd) {
@@ -4987,8 +5131,8 @@ export class Attached {
     let diff;
     try {
       diff = await branchDiff(cwd, { branch: item.branch, base });
-    } catch (failure) {
-      return this.note(`could not read the diff: ${failure.message}`);
+    } catch (error_) {
+      return this.note(`could not read the diff: ${error_.message}`);
     }
     const files = diff.files;
     this.reviewing = {
@@ -5042,7 +5186,7 @@ export class Attached {
     const review = this.reviewing;
     const ink = this.ink;
     const inner = Math.max(1, width - 2);
-    if (!review.layout || review.layout.width !== inner) {
+    if (review.layout?.width !== inner) {
       review.layout = { width: inner, ...layoutDiff(review, inner, ink) };
     }
     const item = review.item;
@@ -5152,8 +5296,8 @@ export class Attached {
         method: 'POST',
         body: { verdict, ...(note ? { note } : {}) },
       });
-    } catch (failure) {
-      return this.note(`could not decide ${review.ref}: ${failure.message}`);
+    } catch (error_) {
+      return this.note(`could not decide ${review.ref}: ${error_.message}`);
     }
     await this.rereadReview();
     return true;
@@ -5163,7 +5307,8 @@ export class Attached {
     if (await this.reviewVerdict('APPROVED') !== true) return undefined;
     const review = this.reviewing;
     this.say(this.ink.success(`  ${review.ref} ${review.branch}: Done`));
-    return this.note(review.mayMerge ? `Done — m merges it${this.split ? '' : ' (/review merge)'}` : 'Done');
+    const how = this.split ? '' : ' (/review merge)';
+    return this.note(review.mayMerge ? `Done — m merges it${how}` : 'Done');
   }
 
   async reviewChanges(note) {
@@ -5193,8 +5338,8 @@ export class Attached {
     review.confirmingMerge = false;
     try {
       await this.session.request(`/api/projects/${review.slug}/work-items/${review.item.id}/merge`, { method: 'POST' });
-    } catch (failure) {
-      return this.note(`could not merge ${review.ref}: ${failure.message}`);
+    } catch (error_) {
+      return this.note(`could not merge ${review.ref}: ${error_.message}`);
     }
     this.reader = null;
     this.markMerging(review, { state: 'merging' });
@@ -5234,8 +5379,8 @@ export class Attached {
         method: 'POST',
         body: { verdict: 'CHANGES_REQUESTED', note: conflictOrder(review, why) },
       });
-    } catch (failure) {
-      this.markMerging(review, { state: 'failed', why: `${why} — and it could not be sent back: ${failure.message}` });
+    } catch (error_) {
+      this.markMerging(review, { state: 'failed', why: `${why} — and it could not be sent back: ${error_.message}` });
       return this.note(`${review.ref} is not merged — /review to look again`);
     }
     const agent = sessions.map((meta) => meta.agent ?? meta.view?.agent).find(Boolean) ?? null;
@@ -5276,8 +5421,8 @@ export class Attached {
     if (!review) return this.note('/review a branch first');
     try {
       await this.session.request(`/api/projects/${review.slug}/work-items/${review.item.id}/agent-merge`, { method: 'POST' });
-    } catch (failure) {
-      return this.note(`could not start the agent merge: ${failure.message}`);
+    } catch (error_) {
+      return this.note(`could not start the agent merge: ${error_.message}`);
     }
     this.say(this.ink.accent(`  ${review.ref}: an agent merges ${review.base} into ${review.branch} and resolves the conflict`));
     return this.note('agent merge started — its session opens like any other');
@@ -5292,38 +5437,47 @@ export class Attached {
     const card = await this.session.request(`/api/projects/${review.slug}/roadmap/${review.ref}`).catch(() => null);
     const merge = card?.workItem?.merge;
     if (card?.status === 'MERGED' || card?.status === 'SHIPPED' || merge?.state === 'DONE') {
-      this.say(this.ink.success(`  ${review.ref} landed: ${review.branch} is in ${review.base}${merge?.result ? ` (${printable(merge.result)})` : ''}`));
-      // Landed: the card's work is over, and so are its cards here. In
-      // advanced mode the robot waves first and the card closes itself.
-      const sha = /\b[0-9a-f]{7,40}\b/.exec(String(merge?.result ?? ''))?.[0]?.slice(0, 7) ?? null;
-      for (const meta of this.mergingCards(review)) {
-        if (this.split && meta.ended) {
-          meta.merging = { state: 'landed', ref: review.ref, branch: review.branch, base: review.base, sha, landedTick: this.stamp() };
-          continue;
-        }
-        meta.merging = null;
-        if (meta.ended) this.closeWindowOf(meta);
-      }
-      this.dirty = true;
-      return this.note(`${review.ref} merged`);
+      return this.mergeLanded(review, merge);
     }
-    if (merge?.state === 'FAILED') {
-      // `failure` is the KIND (R155: CONFLICT, NO_PULL_REQUEST…); `result` the machine's words.
-      const why = printable(merge.result ?? merge.failure ?? 'no reason given');
-      // An older runner names no kind: its words are all there is to go on.
-      if (merge.failure === 'CONFLICT' || (!merge.failure && /conflict/i.test(merge.result ?? ''))) {
-        return this.resolveConflict(review, why);
-      }
-      this.say(this.ink.danger(`  ${review.ref}: the merge failed — ${why}`));
-      this.markMerging(review, { state: 'failed', why });
-      return this.note(`${review.ref} is not merged — /review to look again`);
-    }
+    if (merge?.state === 'FAILED') return this.mergeFailed(review, merge);
     if (tries <= 0) {
       return this.note(`${review.ref}: still merging — the board says when it lands`);
     }
     const again = setTimeout(() => void this.followMerge(review, tries - 1), this.options.reviewFollowMs ?? 5_000);
     again.unref?.();
     return undefined;
+  }
+
+  /** The merge landed: say so, and close or wave off the cards that were merging. */
+  mergeLanded(review, merge) {
+    const result = merge?.result ? ` (${printable(merge.result)})` : '';
+    this.say(this.ink.success(`  ${review.ref} landed: ${review.branch} is in ${review.base}${result}`));
+    // Landed: the card's work is over, and so are its cards here. In
+    // advanced mode the robot waves first and the card closes itself.
+    const sha = /\b[0-9a-f]{7,40}\b/.exec(String(merge?.result ?? ''))?.[0]?.slice(0, 7) ?? null;
+    for (const meta of this.mergingCards(review)) {
+      if (this.split && meta.ended) {
+        meta.merging = { state: 'landed', ref: review.ref, branch: review.branch, base: review.base, sha, landedTick: this.stamp() };
+        continue;
+      }
+      meta.merging = null;
+      if (meta.ended) this.closeWindowOf(meta);
+    }
+    this.dirty = true;
+    return this.note(`${review.ref} merged`);
+  }
+
+  /** The merge failed: a conflict offers the agent, anything else is said. */
+  mergeFailed(review, merge) {
+    // `failure` is the KIND (R155: CONFLICT, NO_PULL_REQUEST…); `result` the machine's words.
+    const why = printable(merge.result ?? merge.failure ?? 'no reason given');
+    // An older runner names no kind: its words are all there is to go on.
+    if (merge.failure === 'CONFLICT' || (!merge.failure && /conflict/i.test(merge.result ?? ''))) {
+      return this.resolveConflict(review, why);
+    }
+    this.say(this.ink.danger(`  ${review.ref}: the merge failed — ${why}`));
+    this.markMerging(review, { state: 'failed', why });
+    return this.note(`${review.ref} is not merged — /review to look again`);
   }
 
   /** What a session is stopped on — a question or a permission request — or null. */
@@ -5451,13 +5605,10 @@ export class Attached {
     // log alone, followed at the end as it grows.
     const request = waiting || !this.reader.session ? this.requestLines(waiting, width - 2) : [];
     const n = this.windowNumberOf(meta.id);
-    const keys = waiting?.kind === 'show'
-      ? 'a look and decide'
-      : waiting?.kind === 'permission'
-        ? 'y once · s session · n refuse'
-        : waiting?.asking?.yours ? 'a answer' : '';
+    const numbered = n ? `${n} ` : '';
+    const keys = readerKeys(waiting);
     const drawn = readerFrame(width, height, {
-      title: `${n ? `${n} ` : ''}${titleFor(meta, waiting ? waitingWord(waiting.kind) : null)}`,
+      title: `${numbered}${readerTitle(meta, waiting)}`,
       lines: [
         ...(output.length ? output : [ink.muted('  nothing said on this session here yet')]),
         ...(request.length ? [ink.muted('─'.repeat(Math.min(40, width - 2))), ...request] : []),
@@ -5612,8 +5763,8 @@ export class Attached {
     let card;
     try {
       card = await this.session.request(`/api/projects/${slug}/roadmap/${ref}`);
-    } catch (failure) {
-      return this.note(`could not read ${ref} on ${slug}: ${failure.message}`);
+    } catch (error_) {
+      return this.note(`could not read ${ref} on ${slug}: ${error_.message}`);
     }
     if (!card) {
       return this.note(`no ${ref} on ${slug}`);
@@ -5694,8 +5845,8 @@ export class Attached {
     }
     try {
       await (this.options.removeDir ?? ((dir) => rm(dir, { recursive: true, force: true })))(path);
-    } catch (failure) {
-      return this.note(`could not delete ${path}: ${failure.message}`);
+    } catch (error_) {
+      return this.note(`could not delete ${path}: ${error_.message}`);
     }
     meta.dropped = true;
     if (this.runner?.pid) {
@@ -5718,7 +5869,8 @@ export class Attached {
     if (word === 'all') {
       const ended = this.windows().filter((meta) => meta.ended);
       for (const meta of ended) this.closeWindowOf(meta);
-      return this.note(ended.length ? `closed ${ended.length} ended card${ended.length === 1 ? '' : 's'}` : 'no ended card to close');
+      if (!ended.length) return this.note('no ended card to close');
+      return this.note(`closed ${ended.length} ended card${pluralS(ended.length)}`);
     }
     const meta = word && this.split ? this.windowNamed([word]) : this.commandTarget();
     if (word && this.split && !meta) return this.note(`no card ${word} — /close, /close 3 or /close all`);
@@ -5790,8 +5942,8 @@ export class Attached {
         { method: 'POST', body: { prompt: text } },
       );
       this.note('sent');
-    } catch (failure) {
-      this.note(failure.message);
+    } catch (error_) {
+      this.note(error_.message);
     }
   }
 
@@ -5819,8 +5971,8 @@ export class Attached {
       this.questions.delete(run.id);
       this.answering = null;
       this.note('answered');
-    } catch (failure) {
-      this.note(failure.message);
+    } catch (error_) {
+      this.note(error_.message);
     }
     return undefined;
   }
@@ -5891,8 +6043,8 @@ export class Attached {
       this.approvals.delete(run.id);
       this.deciding = null;
       this.note(said);
-    } catch (failure) {
-      this.note(failure.message);
+    } catch (error_) {
+      this.note(error_.message);
     }
     return undefined;
   }
@@ -5966,9 +6118,9 @@ export class Attached {
     this.deciding = { runId: run.id, approvalId: pending.approval.id };
     try {
       await this.roundFor(run, pending);
-    } catch (failure) {
+    } catch (error_) {
       if (this.deciding?.approvalId === pending.approval.id) this.deciding = null;
-      return this.note(printable(failure.message));
+      return this.note(printable(error_.message));
     }
     // The gate may have been decided, or the person may have started typing,
     // while the round loaded: a picker for a settled gate is a lie.
@@ -5985,7 +6137,7 @@ export class Attached {
     const rows = [
       ...round.shots.map((shot, at) => ({
         id: `shot:${at}`,
-        label: `${at + 1}  ${printable(shot.name)}${shot.caption ? ` — ${printable(shot.caption)}` : ''}`,
+        label: shotLabel(at, shot),
         ...(isImage(shot) ? {} : { hint: 'html — opens on cawdev' }),
       })),
       ...(count ? [{ id: 'all', label: 'Open all', hint: 'images in the viewer, html on cawdev' }] : []),
@@ -6055,7 +6207,10 @@ export class Attached {
     if (!earlier) return this.note(`there is no round ${number} to show — ${round.rounds.map((each) => each.round).join(', ') || 'none earlier'}`);
     const ink = this.ink;
     this.say('');
-    this.say(`${ink.bold(ink.warn(` round ${number} `))} ${ink.muted(`${earlier.shots.length} screenshot${earlier.shots.length === 1 ? '' : 's'}${earlier.by ? ` · comments by ${earlier.by}` : ''}`)}`);
+    const by = earlier.by ? ` · comments by ${earlier.by}` : '';
+    const heading = ink.bold(ink.warn(` round ${number} `));
+    const counted = ink.muted(`${earlier.shots.length} screenshot${pluralS(earlier.shots.length)}${by}`);
+    this.say(`${heading} ${counted}`);
     for (const line of roundListing(earlier.shots, ink)) this.say(line);
     // The reason alone: it already holds each screenshot's note ("On `x` — caption:
     // note"), so printing the notes as well would say each one twice.
@@ -6068,7 +6223,7 @@ export class Attached {
       rows: [
         ...earlier.shots.map((shot, at) => ({
           id: `shot:${at}`,
-          label: `${at + 1}  ${printable(shot.name)}${shot.caption ? ` — ${printable(shot.caption)}` : ''}`,
+          label: shotLabel(at, shot),
         })),
         ...(earlier.shots.length ? [{ id: 'all', label: 'Open all' }] : []),
         { id: 'back', label: 'Back' },
@@ -6100,8 +6255,8 @@ export class Attached {
         paths.push(copy.path);
         if (copy.downloaded) downloaded++;
       }
-    } catch (failure) {
-      return printable(failure.message);
+    } catch (error_) {
+      return printable(error_.message);
     }
     if (paths.length) this.launch(paths);
     const pages = shots.filter((shot) => !isImage(shot));
@@ -6111,8 +6266,10 @@ export class Attached {
     const where = (dir.startsWith(home) ? `~${dir.slice(home.length)}` : dir);
     const said = [];
     if (paths.length) {
-      said.push(`opened ${paths.length} in the viewer (${downloaded
-        ? `downloaded ${downloaded} into ${where}/${round.runId}/${round.round}` : `from ${where}`})`);
+      const source = downloaded
+        ? `downloaded ${downloaded} into ${where}/${round.runId}/${round.round}`
+        : `from ${where}`;
+      said.push(`opened ${paths.length} in the viewer (${source})`);
     }
     if (pages.length) {
       said.push(`${pages.length === 1 ? 'the html one opens' : 'the html ones open'} on cawdev — sign in there in your browser if it asks`);
@@ -6187,8 +6344,8 @@ export class Attached {
     let round;
     try {
       round = await this.roundFor(run, pending);
-    } catch (failure) {
-      return this.note(printable(failure.message));
+    } catch (error_) {
+      return this.note(printable(error_.message));
     }
     const parsed = parseComments(text, round.shots);
     if (parsed.error) {
@@ -6203,9 +6360,9 @@ export class Attached {
         `/api/projects/${run.projectSlug}/runs/${run.id}/approvals/${pending.approval.id}/decision`,
         { method: 'POST', body: { allow: false, scope: 'ONCE', reason: parsed.reason, notes: parsed.notes } },
       );
-    } catch (failure) {
+    } catch (error_) {
       // A 409 for a round that was replaced says so in its own sentence.
-      return this.note(printable(failure.message));
+      return this.note(printable(error_.message));
     }
     this.settleGate(run, pending.approval.id);
     // The run is read again rather than assumed: with no stages to walk again
@@ -6226,8 +6383,8 @@ export class Attached {
     let round;
     try {
       round = await this.roundFor(run, pending);
-    } catch (failure) {
-      return this.note(printable(failure.message));
+    } catch (error_) {
+      return this.note(printable(error_.message));
     }
     if (!round.confirmed) {
       return this.note('this gate names screenshots that were never sealed — /open looks on cawdev');
@@ -6239,8 +6396,8 @@ export class Attached {
         `/api/projects/${run.projectSlug}/runs/${run.id}/approvals/${pending.approval.id}/decision`,
         { method: 'POST', body: { allow: true, scope: 'ONCE' } },
       );
-    } catch (failure) {
-      return this.note(printable(failure.message));
+    } catch (error_) {
+      return this.note(printable(error_.message));
     }
     this.settleGate(run, pending.approval.id);
     return this.note(`${dropped}accepted — the pull request opens when the run finishes`);
@@ -6266,18 +6423,22 @@ export class Attached {
     if (word === 'comments') {
       // `#2` anywhere starts a note on screenshot 2, which runs to the next
       // `#n` or the end; what comes before the first is the round's note.
-      const text = wordsText(rest).replace(/[ \t]+(#\d+)(?=[\s:—-]|$)/g, '\n$1');
+      const text = wordsText(rest).replaceAll(/(?<![ \t])[ \t]+(#\d+)(?=[\s:—-]|$)/g, '\n$1');
       return this.sendComments(run, text);
     }
+    return this.showShots(run, pending, rest);
+  }
+
+  /** `/shots` proper: the round's listing, or the screenshots it names opened. */
+  async showShots(run, pending, rest) {
     if (!this.requireSignIn('look at the screenshots')) return undefined;
     let round;
     try {
       round = await this.roundFor(run, pending);
-    } catch (failure) {
-      return this.note(printable(failure.message));
+    } catch (error_) {
+      return this.note(printable(error_.message));
     }
     const usage = '/shots · /shots 2 · /shots all · /shots round 1 (all | 2)';
-    let from = round;
     let shots = round.shots;
     let words = rest;
     if (words[0] === 'round') {
@@ -6287,24 +6448,30 @@ export class Attached {
       if (words.length === 2) return this.showRound(wanted, round, false);
       shots = earlier.shots;
       words = words.slice(2);
-      from = round;
     }
+    return this.showShotsNamed(run, round, shots, words, usage);
+  }
+
+  /** What `/shots` was asked for once its round is settled: the listing, all of them, or one. */
+  async showShotsNamed(run, round, shots, words, usage) {
     if (!words.length) {
       const ink = this.ink;
+      const heading = ink.bold(ink.warn(' shots '));
+      const counted = ink.muted(`round ${round.round} · ${shots.length} screenshot${pluralS(shots.length)}`);
       this.say('');
-      this.say(`${ink.bold(ink.warn(' shots '))} ${ink.muted(`round ${round.round} · ${shots.length} screenshot${shots.length === 1 ? '' : 's'}`)}`);
+      this.say(`${heading} ${counted}`);
       for (const line of roundListing(shots, ink)) this.say(line);
       this.say('');
       if (!this.split && !this.plain) await this.printThumbnails(shots, run);
       return this.note(round.confirmed ? '' : 'this gate names screenshots that were never sealed — /open looks on cawdev');
     }
     if (words.length === 1 && words[0] === 'all') {
-      return this.note(await this.openShots(shots, from));
+      return this.note(await this.openShots(shots, round));
     }
     if (words.length === 1 && /^\d+$/.test(words[0])) {
       const at = Number(words[0]);
       if (at < 1 || at > shots.length) return this.note(`there is no screenshot ${at} — ${shots.length} in this round`);
-      return this.note(await this.openShots([shots[at - 1]], from));
+      return this.note(await this.openShots([shots[at - 1]], round));
     }
     return this.note(usage);
   }
@@ -6323,8 +6490,8 @@ export class Attached {
         // base64 as visible text and would cut the escape in half.
         this.pending.push(thumbnailEscape(await readFile(copy.path), protocol));
         this.dirty = true;
-      } catch (failure) {
-        this.say(this.ink.muted(`  ${printable(shot.name)}: ${printable(failure.message)}`));
+      } catch (error_) {
+        this.say(this.ink.muted(`  ${printable(shot.name)}: ${printable(error_.message)}`));
       }
     }
   }
@@ -6350,8 +6517,8 @@ export class Attached {
         { method: 'POST', body: { state: 'CANCELLED', summary: 'Cancelled from the terminal.' } },
       );
       this.note('cancelling — the daemon will take the process down');
-    } catch (failure) {
-      this.note(failure.message);
+    } catch (error_) {
+      this.note(error_.message);
     }
     return undefined;
   }
@@ -6386,45 +6553,20 @@ export class Attached {
     if (stopping && live > 0 && !this.confirmQuit) {
       this.confirmQuit = true;
       return this.note(
-        `${live} session${live === 1 ? '' : 's'} running here — press q again to stop the daemon too`,
+        `${live} session${pluralS(live)} running here — press q again to stop the daemon too`,
       );
     }
 
     this.stopped = true;
     // Off the alternate screen before anything is printed, or the goodbye
     // lands on a buffer that vanishes the moment the program exits.
-    if (this.split) {
-      clearInterval(this.split.plannedTimer);
-      const { enteredWatching, mark } = this.split;
-      this.split.screen.release();
-      this.split = null;
-      // What the watched session said while the screen was up goes into the
-      // scrollback, as `leaveSplit` does: the terminal's own search reaches it.
-      const watched = this.watching;
-      if (watched && watched === enteredWatching) {
-        for (const line of (this.lines.get(watched) ?? []).slice(mark.get(watched) ?? 0)) {
-          this.say(this.render(line));
-        }
-      }
-    }
+    if (this.split) this.leaveSplitForQuit();
     try {
       this.client?.destroy();
     } catch {
       // Going anyway.
     }
-    // Anything queued is still somebody's transcript. It goes out before the
-    // footer comes down, not after it.
-    if (this.pending.length) {
-      this.screen.update(this.pending, []);
-      this.pending = [];
-    }
-    this.screen.close();
-    if (!this.plain && process.stdin.isTTY) {
-      // Bracketed paste is the terminal's mode, not ours, and leaving it on
-      // would put `ESC[200~` into the shell somebody pastes into next.
-      process.stdout.write(`${ESC}[?2004l`);
-    }
-    process.stdin.setRawMode?.(false);
+    this.closeScreenForQuit();
 
     if (!this.options.onQuit) {
       for (const line of this.goodbye(stopping)) {
@@ -6445,6 +6587,39 @@ export class Attached {
       this.stopDaemon(this.runner.pid);
     }
     return process.exit(0);
+  }
+
+  /** Quitting from advanced mode: release the screen and print what the watched session said. */
+  leaveSplitForQuit() {
+    clearInterval(this.split.plannedTimer);
+    const { enteredWatching, mark } = this.split;
+    this.split.screen.release();
+    this.split = null;
+    // What the watched session said while the screen was up goes into the
+    // scrollback, as `leaveSplit` does: the terminal's own search reaches it.
+    const watched = this.watching;
+    if (watched && watched === enteredWatching) {
+      for (const line of (this.lines.get(watched) ?? []).slice(mark.get(watched) ?? 0)) {
+        this.say(this.render(line));
+      }
+    }
+  }
+
+  /** Quitting: flush the transcript, take the footer down, give the terminal its modes back. */
+  closeScreenForQuit() {
+    // Anything queued is still somebody's transcript. It goes out before the
+    // footer comes down, not after it.
+    if (this.pending.length) {
+      this.screen.update(this.pending, []);
+      this.pending = [];
+    }
+    this.screen.close();
+    if (!this.plain && process.stdin.isTTY) {
+      // Bracketed paste is the terminal's mode, not ours, and leaving it on
+      // would put `ESC[200~` into the shell somebody pastes into next.
+      process.stdout.write(`${ESC}[?2004l`);
+    }
+    process.stdin.setRawMode?.(false);
   }
 
   /**
@@ -6713,11 +6888,13 @@ export class Attached {
       return [];
     }
     if (this.split?.boardFocus) {
+      const planWord = ink.muted(`plan ${this.split.boardFocus.ref}`);
+      const developWord = ink.muted(`develop ${this.split.boardFocus.ref}`);
       return [
         `${ink.text('←→')} ${ink.muted('column')}`,
         `${ink.text('↑↓')} ${ink.muted('card')}`,
-        `${ink.text('p')} ${ink.muted(`plan ${this.split.boardFocus.ref}`)}`,
-        `${ink.text('d')} ${ink.muted(`develop ${this.split.boardFocus.ref}`)}`,
+        `${ink.text('p')} ${planWord}`,
+        `${ink.text('d')} ${developWord}`,
         `${ink.text('esc/b')} ${ink.muted('back to sessions')}`,
       ];
     }
@@ -6738,17 +6915,22 @@ export class Attached {
         + `${ink.muted('permission')}`);
     }
     if (this.split) {
-      parts.push(`${ink.text('b')} ${ink.muted('board')}`);
-      parts.push(`${ink.text('tab')} ${ink.muted('next card')}`);
-      parts.push(`${ink.text('v')} ${ink.muted('its log')}`);
+      parts.push(
+        `${ink.text('b')} ${ink.muted('board')}`,
+        `${ink.text('tab')} ${ink.muted('next card')}`,
+        `${ink.text('v')} ${ink.muted('its log')}`,
+      );
       if (this.needYou().length) parts.push(`${ink.warn('n')} ${ink.muted('next needing you')}`);
       if (this.commandTarget()?.ended) parts.push(`${ink.text('w')} ${ink.muted('close card')}`);
       parts.push(`${ink.text('d')} ${ink.muted(this.finishedPlan(this.commandTarget())
         ? `develop ${this.commandTarget().view.entryRef}` : 'develop a planned card')}`);
     }
-    parts.push(`${ink.text('x')} ${ink.muted('cancel')}`);
-    parts.push(`${ink.text('c')} ${ink.muted('config')}`);
-    parts.push(`${ink.text('q')} ${ink.muted(this.stopsTheDaemon() ? 'stop' : 'quit')}`);
+    const quitWord = ink.muted(this.stopsTheDaemon() ? 'stop' : 'quit');
+    parts.push(
+      `${ink.text('x')} ${ink.muted('cancel')}`,
+      `${ink.text('c')} ${ink.muted('config')}`,
+      `${ink.text('q')} ${quitWord}`,
+    );
     return parts;
   }
 }

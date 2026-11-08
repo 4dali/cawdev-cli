@@ -21,12 +21,12 @@ export function cardsFrom(text) {
   let parsed;
   try {
     parsed = JSON.parse(text);
-  } catch (failure) {
-    throw new Error(`not JSON: ${failure.message}`);
+  } catch (error_) {
+    throw new Error(`not JSON: ${error_.message}`);
   }
   const cards = Array.isArray(parsed) ? parsed : parsed?.cards;
   if (!Array.isArray(cards)) {
-    throw new Error('expected a list of cards, or an object with a "cards" list');
+    throw new TypeError('expected a list of cards, or an object with a "cards" list');
   }
   if (!cards.length) {
     throw new Error('the file holds no cards');
@@ -80,21 +80,31 @@ export function resultLines(result, slug, ink) {
   const tail = (refused.length ? ink.warn(` · ${refused.length} refused`) : '')
     + (duplicates.length ? ink.muted(` · ${duplicates.length} skipped as duplicates`) : '');
   if (result.dryRun) {
-    lines.push(`  ${ink.text(`${countWords(filed)} would be filed on ${slug}`)}${tail}`);
+    const head = ink.text(`${countWords(filed)} would be filed on ${slug}`);
+    lines.push(`  ${head}${tail}`);
   } else {
-    lines.push(`  ${ink.success(`filed ${countWords(filed)} on ${slug}`)}${tail}`);
+    const head = ink.success(`filed ${countWords(filed)} on ${slug}`);
+    lines.push(`  ${head}${tail}`);
     for (const card of filed) {
       lines.push(`    ${ink.accent(card.ref ?? '?')} ${ink.muted(card.title)}`);
     }
   }
   for (const card of refused) {
-    lines.push(`    ${ink.danger(`#${card.index + 1}`)} ${ink.muted(card.title ?? '(no title)')} — ${card.reason}`);
+    const number = ink.danger(`#${card.index + 1}`);
+    lines.push(`    ${number} ${ink.muted(card.title ?? '(no title)')} — ${card.reason}`);
   }
   for (const card of duplicates) {
     const of = card.ref ? `already ${card.ref}` : `same as #${card.sameAs + 1}`;
-    lines.push(`    ${ink.muted(`#${card.index + 1} ${card.title} — ${of}`)}`);
+    const note = ink.muted(`#${card.index + 1} ${card.title} — ${of}`);
+    lines.push(`    ${note}`);
   }
   return lines;
+}
+
+function withoutTrailingSlashes(path) {
+  let end = path.length;
+  while (end > 0 && path[end - 1] === '/') end--;
+  return path.slice(0, end);
 }
 
 /**
@@ -105,7 +115,7 @@ export function resultLines(result, slug, ink) {
  */
 export function projectFor(projects, cwd, { pathsOf, absolute }) {
   const slugs = Object.keys(projects ?? {});
-  const inside = (path) => cwd === path || cwd.startsWith(`${path.replace(/\/+$/, '')}/`);
+  const inside = (path) => cwd === path || cwd.startsWith(`${withoutTrailingSlashes(path)}/`);
   const here = slugs
     .flatMap((slug) => pathsOf(projects[slug]).map((path) => [slug, absolute(path)]))
     .filter(([, path]) => inside(path))

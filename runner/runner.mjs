@@ -1974,8 +1974,8 @@ async function undoPreparedMerge(cwd, from) {
     }
     await git(cwd, ['reset', '--keep', before]);
     return `the merge commit prepared on ${from.branch} was undone (reset to ${before.slice(0, 7)}), because the run did not start`;
-  } catch (failure) {
-    return couldNot(failure.message);
+  } catch (error_) {
+    return couldNot(error_.message);
   }
 }
 
@@ -2940,35 +2940,39 @@ async function proveFindings({ ask, scanKey, branch, analysedAs, findings }) {
   if (!Array.isArray(findings) || findings.length === 0) return {};
   const fixedKeys = [];
   const stillOpenKeys = [];
-  const enc = encodeURIComponent;
-  const onBranch = analysedAs === 'BRANCH' ? `&branch=${enc(branch)}` : '';
+  const onBranch = analysedAs === 'BRANCH' ? `&branch=${encodeURIComponent(branch)}` : '';
   for (const finding of findings) {
-    const hotspot = finding.type === 'HOTSPOT';
-    let open;
-    if (analysedAs === 'MAIN') {
-      open = hotspot ? await hotspotStillToReview(ask, finding.key) : await issueStillUnresolved(ask, finding.key);
-    } else if (hotspot) {
-      const found = await pagedSearch(ask,
-        `/api/hotspots/search?projectKey=${enc(scanKey)}${finding.path ? `&files=${enc(finding.path)}` : ''}`
-        + `&status=TO_REVIEW${onBranch}`, 'hotspots');
-      open = found.some((each) => each.ruleKey === finding.rule);
-    } else {
-      const component = finding.path ? `${scanKey}:${finding.path}` : scanKey;
-      const query = (parameter) => `/api/issues/search?${parameter}=${enc(component)}`
-        + `&rules=${enc(finding.rule)}&resolved=false${onBranch}`;
-      let found;
-      try {
-        found = await pagedSearch(ask, query('components'), 'issues');
-      } catch (failure) {
-        // Servers before 10.2 know only `componentKeys`.
-        if (!/answered 400/.test(failure.message)) throw failure;
-        found = await pagedSearch(ask, query('componentKeys'), 'issues');
-      }
-      open = finding.lineHash ? found.some((each) => each.hash === finding.lineHash) : found.length > 0;
-    }
+    const open = await findingStillOpen(ask, finding, { scanKey, analysedAs, onBranch });
     (open ? stillOpenKeys : fixedKeys).push(finding.key);
   }
   return { fixedKeys, stillOpenKeys };
+}
+
+/** Whether one finding is still reported: by its key on MAIN, by rule and file on a branch. */
+async function findingStillOpen(ask, finding, { scanKey, analysedAs, onBranch }) {
+  const hotspot = finding.type === 'HOTSPOT';
+  if (analysedAs === 'MAIN') {
+    return hotspot ? hotspotStillToReview(ask, finding.key) : issueStillUnresolved(ask, finding.key);
+  }
+  const enc = encodeURIComponent;
+  if (hotspot) {
+    const files = finding.path ? `&files=${enc(finding.path)}` : '';
+    const found = await pagedSearch(ask,
+      `/api/hotspots/search?projectKey=${enc(scanKey)}${files}&status=TO_REVIEW${onBranch}`, 'hotspots');
+    return found.some((each) => each.ruleKey === finding.rule);
+  }
+  const component = finding.path ? `${scanKey}:${finding.path}` : scanKey;
+  const query = (parameter) => `/api/issues/search?${parameter}=${enc(component)}`
+    + `&rules=${enc(finding.rule)}&resolved=false${onBranch}`;
+  let found;
+  try {
+    found = await pagedSearch(ask, query('components'), 'issues');
+  } catch (error_) {
+    // Servers before 10.2 know only `componentKeys`.
+    if (!/answered 400/.test(error_.message)) throw error_;
+    found = await pagedSearch(ask, query('componentKeys'), 'issues');
+  }
+  return finding.lineHash ? found.some((each) => each.hash === finding.lineHash) : found.length > 0;
 }
 
 /** MAIN: the key is valid. Open while it comes back unresolved; purged (not returned) is fixed. */
@@ -2982,9 +2986,9 @@ async function hotspotStillToReview(ask, key) {
   try {
     const body = await ask(`/api/hotspots/show?hotspot=${encodeURIComponent(key)}`);
     return body.status === 'TO_REVIEW';
-  } catch (failure) {
-    if (/answered 404/.test(failure.message)) return false;
-    throw failure;
+  } catch (error_) {
+    if (/answered 404/.test(error_.message)) return false;
+    throw error_;
   }
 }
 
@@ -3813,15 +3817,43 @@ async function applyHandoff(cwd, branch, handoff) {
 // a map, a merge of a branch that is somewhere else, a question to the host.
 const TOUCHES_THE_TREE = new Set(['STASH', 'COMMIT', 'RESET', 'HANDOFF']);
 
+/**
+ * i285. Whether a Stash, Commit, Reset or Hand off may be done NOW. The console
+ * judged the button when it was pressed; a run may have claimed the checkout
+ * since (a Reset asked on a stranded checkout wiped the run that claimed it
+ * 14 s later). So the answer is taken here, at the moment of the act, from
+ * `heldBy` — and the path is marked in `performingOn` in the same synchronous
+ * step, so the claim loop keeps out while the request runs. No `await` between
+ * the check and the mark.
+ */
 async function performWorkspaceRequest(config, request, afterTheTreeMoved = null) {
-  const cwd = request.path;
-  let ok = false;
-  let result;
-  // R155. Which KIND of failure, on a MERGE. Named apart from the `failure`
-  // that every `catch` in this function binds — the shadowing would compile and
-  // report the wrong thing.
-  let failureKind = null;
+  if (!TOUCHES_THE_TREE.has(request.kind)) {
+    return performWorkspaceRequestNow(config, request, afterTheTreeMoved);
+  }
+  const holder = heldBy(request.path);
+  if (holder !== undefined) {
+    log(`refusing ${request.kind} on ${request.path}: run ${holder} is working there`);
+    await reportWorkspaceRequest(config, request, false,
+      `A run started in this checkout after you asked (run ${holder}), so nothing was changed. `
+      + 'Ask again once that run has finished, if it is still wanted.');
+    return;
+  }
+  performingOn.add(request.path);
+  try {
+    await performWorkspaceRequestNow(config, request, afterTheTreeMoved);
+  } finally {
+    performingOn.delete(request.path);
+  }
+}
 
+/**
+ * Answers one request on the workspace channel: `{ ok, result, failureKind? }`
+ * for `reportWorkspaceRequest`, or null when the handler has already reported
+ * (an INDEX with no skill). `failureKind` is R155's, on a MERGE only — named
+ * apart from the error every `catch` binds, which is `error_`.
+ */
+async function performWorkspaceRequestNow(config, request, afterTheTreeMoved = null) {
+  const cwd = request.path;
   try {
     await access(join(cwd, '.git'));
   } catch {
@@ -3829,261 +3861,301 @@ async function performWorkspaceRequest(config, request, afterTheTreeMoved = null
     return;
   }
 
-  if (request.kind === 'SHOW') {
-    // Staged and unstaged together against HEAD, which is what a person means
-    // by "what is uncommitted here". Untracked files are listed rather than
-    // shown: `git diff` cannot see them, and inlining the whole of a new
-    // node_modules-sized file somebody forgot to ignore helps nobody.
-    try {
-      const status = await git(cwd, ['status', '--porcelain']);
-      const diff = await git(cwd, ['diff', 'HEAD']).catch(() => '');
-      const untracked = await git(cwd, ['ls-files', '--others', '--exclude-standard'])
-        .catch(() => '');
-      const parts = [];
-      if (status) parts.push(status);
-      if (untracked) {
-        parts.push(`--- untracked, not shown ---\n${untracked}`);
-      }
-      if (diff) parts.push(diff);
-      result = parts.length ? parts.join('\n\n') : 'Nothing uncommitted.';
-      ok = true;
-    } catch (failure) {
-      result = failure.message;
-    }
-  } else if (request.kind === 'INDEX') {
-    // R77's map button. The same preparation a skill-enabled run does on its
-    // way in, asked for on its own — because looking at a map should not cost
-    // an agent session, a model, or a branch.
-    //
-    // The skill's row travels on the request, so this daemon does not have to
-    // know what CodeGraph is: the platform says what to run and this runs it,
-    // exactly as `resolveSkills` does at spawn.
-    // R77. The map cawdev shows is refreshed FIRST and unconditionally, because
-    // that is what the button in front of the person says it does. The skill's
-    // own index is a separate thing that a session uses, and a project with no
-    // skill turned on must still be able to redraw its map on demand — which is
-    // the answer to "can I update it when I want".
-    const branch = await git(cwd, ['symbolic-ref', '--short', 'HEAD']).catch(() => 'main');
-    await reportCodeMap(config, request.projectSlug, cwd, null, branch, { force: true })
-      .catch((failure) => log(`  could not refresh the map: ${failure.message}`));
-
-    const skill = request.skill;
-    if (!skill?.key || !skill?.command || !Array.isArray(skill.args)) {
-      // Not a failure any more: the map is what was asked for and the map was
-      // built. A project with no skill on has nothing else to do here.
-      await reportWorkspaceRequest(config, request, true,
-        'The map has been refreshed. No skill is turned on for this project, so there was no '
-          + 'index to build beside it.');
-      return;
-    }
-    log(`  building the ${skill.key} index for ${cwd}, as asked`);
-    try {
-      const local = SKILLS_HERE[skill.key] ?? {};
-      const baseCommit = await git(cwd, ['rev-parse', 'HEAD']).catch(() => null);
-      result = await prepareSkillIndex(config, skill, local, request, cwd, baseCommit);
-      ok = true;
-    } catch (failure) {
-      // Never a throw out of here: the whole point of this channel is that a
-      // machine answers, and a daemon that died mid-request answers nothing.
-      result = failure.message;
-    }
-  } else if (request.kind === 'STASH') {
-    log(`  stashing ${cwd}, as asked`);
-    try {
-      // --include-untracked, because a warning that counted an untracked file
-      // and then left it behind would be a stash that did not do what the
-      // count said it would.
-      const label = request.message?.trim()
-        || `cawdev: stashed from the console at ${new Date().toISOString()}`;
-      const said = await git(cwd, ['stash', 'push', '--include-untracked', '-m', label]);
-      // The name it can be recovered by, said out loud. A stash nobody can find
-      // later has eaten somebody's work.
-      const top = await git(cwd, ['stash', 'list', '-1']).catch(() => '');
-      result = top ? `${said}\n\nRecover it with: git -C ${cwd} stash pop\n${top}` : said;
-      ok = true;
-    } catch (failure) {
-      result = failure.message;
-    }
-  } else if (request.kind === 'COMMIT') {
-    log(`  committing ${cwd}, as asked`);
-    try {
-      await git(cwd, ['add', '-A']);
-      // --no-verify is deliberately NOT passed, for the reason the run action
-      // does not pass it either: a repository's hooks are its own business, and
-      // a commit its own hooks reject should fail here rather than land because
-      // it came from a button.
-      await git(cwd, ['commit', '-m',
-        request.message?.trim() || 'Committed from the cawdev console']);
-      const sha = await git(cwd, ['rev-parse', '--short', 'HEAD']);
-      const subject = await git(cwd, ['log', '-1', '--format=%s']).catch(() => '');
-      result = `${sha} ${subject}`.trim();
-      ok = true;
-    } catch (failure) {
-      result = failure.message;
-    }
-  } else if (request.kind === 'RESET') {
-    log(`  resetting ${cwd}, as asked`);
-    try {
-      result = await resetToOrigin(cwd, request.defaultBranch);
-      ok = true;
-    } catch (failure) {
-      result = failure.message;
-    }
-  } else if (request.kind === 'HANDOFF') {
-    // R148. Package the run's work and free the checkout: the branch goes to
-    // the remote, the uncommitted tree goes to the platform as a patch, and
-    // only THEN is the directory reset — nothing is dropped before it is
-    // somewhere else.
-    log(`  HANDING OFF ${cwd} — asked for from the console`);
-    try {
-      if (!request.runId) {
-        throw new Error('This hand-off names no run, so there is nothing to report it against.');
-      }
-      const branch = (await git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
-      await git(cwd, ['add', '-A']);
-      const patch = await git(cwd, ['diff', '--cached', '--binary']).catch(() => '');
-      const files = (await git(cwd, ['diff', '--cached', '--name-only']).catch(() => ''))
-        .split('\n').filter(Boolean).length;
-      // Unstage again: the tree is untouched until the platform has the patch.
-      await git(cwd, ['reset']).catch(() => null);
-      const baseSha = (await git(cwd, ['rev-parse', 'HEAD'])).trim();
-      let pushed = false;
-      try {
-        await git(cwd, ['push', '-u', 'origin', branch]);
-        pushed = true;
-      } catch (failure) {
-        log(`  could not push ${branch}: ${failure.message.split('\n')[0]}`);
-      }
-      if (patch.length > HANDOFF_PATCH_CAP) {
-        throw new Error(`The uncommitted work is ${Math.round(patch.length / 1024)}kB as a patch, `
-          + 'which is more than a hand-off carries. Commit some of it first.');
-      }
-      await api(config, `/api/runners/${config.runnerId}/runs/${request.runId}/handoff`, {
-        method: 'POST',
-        body: { baseSha, patch: patch || null, files, pushed },
-      });
-      const freed = await resetToOrigin(cwd, request.defaultBranch);
-      result = `Handed off: ${files} uncommitted file(s) saved as a patch on ${baseSha.slice(0, 7)}, `
-        + `branch ${branch} ${pushed ? 'pushed' : 'NOT pushed — push it by hand'}. ${freed}`;
-      ok = true;
-    } catch (failure) {
-      result = failure.message;
-    }
-  } else if (request.kind === 'MERGE') {
-    // R134's button, and the only kind on this channel whose effect is not in
-    // the checkout. `gh pr merge` is a host-side operation: it resolves the
-    // pull request from this clone's remote and touches no working tree, so
-    // several branches merge safely from one directory and nothing here moves.
-    const branch = (request.message ?? '').trim();
-    if (!branch) {
-      result = 'A merge has to name a branch. Nothing was merged.';
-    } else {
-      // R306: whose idea it was. A rule's merge lands with nobody reading
-      // the diff, and the log is where an operator sees that happen.
-      log(`  MERGING ${branch} — ${request.requestedByRule
-        ? `by ${request.requestedByRule}, nobody is reading this diff`
-        : 'asked for from the console'}`);
-      // R261. A sprint's branch lands with a merge commit; every other branch
-      // squashes as it always did. The claim says which.
-      ({ ok, result, failure: failureKind } = await mergePullRequest(cwd, branch, {
-        method: request.mergeMethod ?? null,
-        declared: request.gitHost ?? null,
-      }));
-    }
-  } else if (request.kind === 'TAG') {
-    // R156's release. A read: it asks the HOST whether the tag is there, so it
-    // needs a clone of the repository rather than any particular state of this
-    // working tree, and it changes nothing in either.
-    const version = (request.message ?? '').trim();
-    if (!version) {
-      result = 'A tag check has to name a version. Nothing was checked.';
-    } else {
-      log(`  checking for tag ${version} on the remote`);
-      ({ ok, result } = await tagOnTheRemote(cwd, version));
-    }
-  } else if (request.kind === 'OPEN_PR') {
-    // R261. The first half of a sprint merge: open the pull request from the
-    // sprint's branch to the default — or find the one already there — and
-    // report its URL on the first line. The platform cannot know whether one
-    // exists (it holds no git-host credential), so it always asks this first
-    // and queues the MERGE when this comes back ok. Host-side like MERGE: the
-    // branch is on origin already (CUT_BRANCH put it there and every card
-    // merged into it), so nothing is pushed and no working tree moves.
-    const branch = (request.message ?? '').trim();
-    if (!branch) {
-      result = 'A pull request has to name a branch. Nothing was opened.';
-    } else {
-      const base = request.baseBranch ?? request.defaultBranch ?? 'main';
-      log(`  OPENING a pull request for ${branch} → ${base} — asked for from the console`);
-      // A card's branch may never have left this machine — a session whose
-      // project does not push, which is why somebody is asking for the pull
-      // request by hand. A sprint's is on origin already and this is a no-op.
-      const empty = await nothingToPropose(cwd, branch, base);
-      if (empty) {
-        ok = false;
-        result = empty;
-      }
-      const pushed = empty ? { failed: empty } : await pushIfOriginLacks(cwd, branch);
-      if (pushed.failed) {
-        ok = false;
-        result = pushed.failed;
-      } else {
-        ({ ok, result } = await openPullRequestFor(cwd, {
-          declared: request.gitHost ?? null,
-          branch,
-          base,
-          title: request.title?.trim() || branch,
-          // A sprint's title is its ref and name ("S1 Notifications"); a
-          // card's is "R3 — …" (RunnerController reads either at claim).
-          body: /^S\d+ /.test(request.title ?? '')
-            ? `Opened by cawdev for the sprint branch \`${branch}\` — ${request.title.trim()}.\n\n`
-              + `Merging it lands every card of the sprint on ${base}.`
-            : `Opened by cawdev for \`${branch}\`${request.title ? ` — ${request.title.trim()}` : ''}.`,
-        }));
-        // The URL stays the FIRST line: the platform reads it off there.
-        if (ok && pushed.said) {
-          result = `${result}\n${pushed.said}`;
-        }
-      }
-    }
-  } else if (request.kind === 'CUT_BRANCH') {
-    // R260. Put the sprint's branch on origin, from the default's tip. A branch
-    // already there is a success, not a conflict — the sprint wanted one to
-    // exist, and one does. Touches no working tree: the push names two refs
-    // and this checkout's HEAD is not one of them.
-    const name = (request.message ?? '').trim();
-    if (!name) {
-      result = 'A cut has to name a branch. Nothing was cut.';
-    } else {
-      log(`  cutting ${name} on origin from ${request.defaultBranch || 'main'}`);
-      ({ ok, result } = await cutBranchOnOrigin(cwd, name, request.defaultBranch));
-    }
-  } else if (request.kind === 'CREATE_BRANCH') {
-    // R379. Put a named branch on origin, cut from another branch's tip. Unlike
-    // CUT_BRANCH an existing name is a REFUSAL: the person asked for a new
-    // branch, and one that is already there may be somebody else's work.
-    // Touches no working tree: the push names two refs and HEAD is neither.
-    const name = (request.message ?? '').trim();
-    const from = (request.fromBranch ?? '').trim();
-    if (!name || !from) {
-      result = 'A new branch has to name itself and the branch to cut it from. Nothing was created.';
-    } else {
-      log(`  creating ${name} on origin from ${from} — asked for from the console`);
-      ({ ok, result } = await createBranchOnOrigin(cwd, name, from));
-    }
-  } else {
-    result = `This runner does not know how to ${request.kind}.`;
-  }
+  const handler = WORKSPACE_REQUESTS[request.kind];
+  const outcome = handler
+    ? await handler(config, request, cwd)
+    : { ok: false, result: `This runner does not know how to ${request.kind}.` };
+  if (outcome === null) return;
 
   // R218. The console's row draws the survey, not this answer: report the
   // tree as it is NOW, before saying the request is done, so the row is
   // right the moment the spinner stops. Done or failed — a reset that
   // half-happened has moved the tree too.
   if (afterTheTreeMoved && TOUCHES_THE_TREE.has(request.kind)) {
-    await afterTheTreeMoved().catch((failure) => log(`  could not re-read the checkouts: ${failure.message}`));
+    await afterTheTreeMoved().catch((error_) => log(`  could not re-read the checkouts: ${error_.message}`));
   }
 
-  await reportWorkspaceRequest(config, request, ok, result, failureKind);
+  await reportWorkspaceRequest(config, request, outcome.ok, outcome.result, outcome.failureKind ?? null);
+}
+
+/**
+ * One handler per request kind. Never a throw out of one: the whole point of
+ * this channel is that a machine answers, and a daemon that died mid-request
+ * answers nothing.
+ */
+const WORKSPACE_REQUESTS = {
+  SHOW: showUncommitted,
+  INDEX: buildTheIndex,
+  STASH: stashTheTree,
+  COMMIT: commitTheTree,
+  RESET: resetTheTree,
+  HANDOFF: handOffTheTree,
+  MERGE: mergeTheBranch,
+  TAG: checkTheTag,
+  OPEN_PR: openThePullRequest,
+  CUT_BRANCH: cutTheBranch,
+  CREATE_BRANCH: createTheBranch,
+};
+
+async function showUncommitted(config, request, cwd) {
+  // Staged and unstaged together against HEAD, which is what a person means
+  // by "what is uncommitted here". Untracked files are listed rather than
+  // shown: `git diff` cannot see them, and inlining the whole of a new
+  // node_modules-sized file somebody forgot to ignore helps nobody.
+  try {
+    const status = await git(cwd, ['status', '--porcelain']);
+    const diff = await git(cwd, ['diff', 'HEAD']).catch(() => '');
+    const untracked = await git(cwd, ['ls-files', '--others', '--exclude-standard'])
+      .catch(() => '');
+    const parts = [];
+    if (status) parts.push(status);
+    if (untracked) {
+      parts.push(`--- untracked, not shown ---\n${untracked}`);
+    }
+    if (diff) parts.push(diff);
+    return { ok: true, result: parts.length ? parts.join('\n\n') : 'Nothing uncommitted.' };
+  } catch (error_) {
+    return { ok: false, result: error_.message };
+  }
+}
+
+async function buildTheIndex(config, request, cwd) {
+  // R77's map button. The same preparation a skill-enabled run does on its
+  // way in, asked for on its own — because looking at a map should not cost
+  // an agent session, a model, or a branch.
+  //
+  // The skill's row travels on the request, so this daemon does not have to
+  // know what CodeGraph is: the platform says what to run and this runs it,
+  // exactly as `resolveSkills` does at spawn.
+  // R77. The map cawdev shows is refreshed FIRST and unconditionally, because
+  // that is what the button in front of the person says it does. The skill's
+  // own index is a separate thing that a session uses, and a project with no
+  // skill turned on must still be able to redraw its map on demand — which is
+  // the answer to "can I update it when I want".
+  const branch = await git(cwd, ['symbolic-ref', '--short', 'HEAD']).catch(() => 'main');
+  await reportCodeMap(config, request.projectSlug, cwd, null, branch, { force: true })
+    .catch((error_) => log(`  could not refresh the map: ${error_.message}`));
+
+  const skill = request.skill;
+  if (!skill?.key || !skill?.command || !Array.isArray(skill.args)) {
+    // Not a failure any more: the map is what was asked for and the map was
+    // built. A project with no skill on has nothing else to do here.
+    await reportWorkspaceRequest(config, request, true,
+      'The map has been refreshed. No skill is turned on for this project, so there was no '
+        + 'index to build beside it.');
+    return null;
+  }
+  log(`  building the ${skill.key} index for ${cwd}, as asked`);
+  try {
+    const local = SKILLS_HERE[skill.key] ?? {};
+    const baseCommit = await git(cwd, ['rev-parse', 'HEAD']).catch(() => null);
+    return { ok: true, result: await prepareSkillIndex(config, skill, local, request, cwd, baseCommit) };
+  } catch (error_) {
+    return { ok: false, result: error_.message };
+  }
+}
+
+async function stashTheTree(config, request, cwd) {
+  log(`  stashing ${cwd}, as asked`);
+  try {
+    // --include-untracked, because a warning that counted an untracked file
+    // and then left it behind would be a stash that did not do what the
+    // count said it would.
+    const label = request.message?.trim()
+      || `cawdev: stashed from the console at ${new Date().toISOString()}`;
+    const said = await git(cwd, ['stash', 'push', '--include-untracked', '-m', label]);
+    // The name it can be recovered by, said out loud. A stash nobody can find
+    // later has eaten somebody's work.
+    const top = await git(cwd, ['stash', 'list', '-1']).catch(() => '');
+    return { ok: true, result: top ? `${said}\n\nRecover it with: git -C ${cwd} stash pop\n${top}` : said };
+  } catch (error_) {
+    return { ok: false, result: error_.message };
+  }
+}
+
+async function commitTheTree(config, request, cwd) {
+  log(`  committing ${cwd}, as asked`);
+  try {
+    await git(cwd, ['add', '-A']);
+    // --no-verify is deliberately NOT passed, for the reason the run action
+    // does not pass it either: a repository's hooks are its own business, and
+    // a commit its own hooks reject should fail here rather than land because
+    // it came from a button.
+    await git(cwd, ['commit', '-m',
+      request.message?.trim() || 'Committed from the cawdev console']);
+    const sha = await git(cwd, ['rev-parse', '--short', 'HEAD']);
+    const subject = await git(cwd, ['log', '-1', '--format=%s']).catch(() => '');
+    return { ok: true, result: `${sha} ${subject}`.trim() };
+  } catch (error_) {
+    return { ok: false, result: error_.message };
+  }
+}
+
+async function resetTheTree(config, request, cwd) {
+  log(`  resetting ${cwd}, as asked`);
+  try {
+    return { ok: true, result: await resetToOrigin(cwd, request.defaultBranch) };
+  } catch (error_) {
+    return { ok: false, result: error_.message };
+  }
+}
+
+async function handOffTheTree(config, request, cwd) {
+  // R148. Package the run's work and free the checkout: the branch goes to
+  // the remote, the uncommitted tree goes to the platform as a patch, and
+  // only THEN is the directory reset — nothing is dropped before it is
+  // somewhere else.
+  log(`  HANDING OFF ${cwd} — asked for from the console`);
+  try {
+    if (!request.runId) {
+      throw new Error('This hand-off names no run, so there is nothing to report it against.');
+    }
+    const branch = (await git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
+    await git(cwd, ['add', '-A']);
+    const patch = await git(cwd, ['diff', '--cached', '--binary']).catch(() => '');
+    const files = (await git(cwd, ['diff', '--cached', '--name-only']).catch(() => ''))
+      .split('\n').filter(Boolean).length;
+    // Unstage again: the tree is untouched until the platform has the patch.
+    await git(cwd, ['reset']).catch(() => null);
+    const baseSha = (await git(cwd, ['rev-parse', 'HEAD'])).trim();
+    let pushed = false;
+    try {
+      await git(cwd, ['push', '-u', 'origin', branch]);
+      pushed = true;
+    } catch (error_) {
+      log(`  could not push ${branch}: ${error_.message.split('\n')[0]}`);
+    }
+    if (patch.length > HANDOFF_PATCH_CAP) {
+      throw new Error(`The uncommitted work is ${Math.round(patch.length / 1024)}kB as a patch, `
+        + 'which is more than a hand-off carries. Commit some of it first.');
+    }
+    await api(config, `/api/runners/${config.runnerId}/runs/${request.runId}/handoff`, {
+      method: 'POST',
+      body: { baseSha, patch: patch || null, files, pushed },
+    });
+    const freed = await resetToOrigin(cwd, request.defaultBranch);
+    const pushedWords = pushed ? 'pushed' : 'NOT pushed — push it by hand';
+    return {
+      ok: true,
+      result: `Handed off: ${files} uncommitted file(s) saved as a patch on ${baseSha.slice(0, 7)}, `
+        + `branch ${branch} ${pushedWords}. ${freed}`,
+    };
+  } catch (error_) {
+    return { ok: false, result: error_.message };
+  }
+}
+
+async function mergeTheBranch(config, request, cwd) {
+  // R134's button, and the only kind on this channel whose effect is not in
+  // the checkout. `gh pr merge` is a host-side operation: it resolves the
+  // pull request from this clone's remote and touches no working tree, so
+  // several branches merge safely from one directory and nothing here moves.
+  const branch = (request.message ?? '').trim();
+  if (!branch) {
+    return { ok: false, result: 'A merge has to name a branch. Nothing was merged.' };
+  }
+  // R306: whose idea it was. A rule's merge lands with nobody reading
+  // the diff, and the log is where an operator sees that happen.
+  const by = request.requestedByRule
+    ? `by ${request.requestedByRule}, nobody is reading this diff`
+    : 'asked for from the console';
+  log(`  MERGING ${branch} — ${by}`);
+  // R261. A sprint's branch lands with a merge commit; every other branch
+  // squashes as it always did. The claim says which.
+  const merged = await mergePullRequest(cwd, branch, {
+    method: request.mergeMethod ?? null,
+    declared: request.gitHost ?? null,
+  });
+  return { ok: merged.ok, result: merged.result, failureKind: merged.failure };
+}
+
+async function checkTheTag(config, request, cwd) {
+  // R156's release. A read: it asks the HOST whether the tag is there, so it
+  // needs a clone of the repository rather than any particular state of this
+  // working tree, and it changes nothing in either.
+  const version = (request.message ?? '').trim();
+  if (!version) {
+    return { ok: false, result: 'A tag check has to name a version. Nothing was checked.' };
+  }
+  log(`  checking for tag ${version} on the remote`);
+  const { ok, result } = await tagOnTheRemote(cwd, version);
+  return { ok, result };
+}
+
+/** The pull request's body: a sprint's title is its ref and name ("S1 Notifications"), a card's is "R3 — …". */
+function pullRequestBody(request, branch, base) {
+  if (/^S\d+ /.test(request.title ?? '')) {
+    return `Opened by cawdev for the sprint branch \`${branch}\` — ${request.title.trim()}.\n\n`
+      + `Merging it lands every card of the sprint on ${base}.`;
+  }
+  const named = request.title ? ` — ${request.title.trim()}` : '';
+  return `Opened by cawdev for \`${branch}\`${named}.`;
+}
+
+async function openThePullRequest(config, request, cwd) {
+  // R261. The first half of a sprint merge: open the pull request from the
+  // sprint's branch to the default — or find the one already there — and
+  // report its URL on the first line. The platform cannot know whether one
+  // exists (it holds no git-host credential), so it always asks this first
+  // and queues the MERGE when this comes back ok. Host-side like MERGE: the
+  // branch is on origin already (CUT_BRANCH put it there and every card
+  // merged into it), so nothing is pushed and no working tree moves.
+  const branch = (request.message ?? '').trim();
+  if (!branch) {
+    return { ok: false, result: 'A pull request has to name a branch. Nothing was opened.' };
+  }
+  const base = request.baseBranch ?? request.defaultBranch ?? 'main';
+  log(`  OPENING a pull request for ${branch} → ${base} — asked for from the console`);
+  // A card's branch may never have left this machine — a session whose
+  // project does not push, which is why somebody is asking for the pull
+  // request by hand. A sprint's is on origin already and this is a no-op.
+  const empty = await nothingToPropose(cwd, branch, base);
+  const pushed = empty ? { failed: empty } : await pushIfOriginLacks(cwd, branch);
+  if (pushed.failed) return { ok: false, result: pushed.failed };
+  const opened = await openPullRequestFor(cwd, {
+    declared: request.gitHost ?? null,
+    branch,
+    base,
+    title: request.title?.trim() || branch,
+    body: pullRequestBody(request, branch, base),
+  });
+  // The URL stays the FIRST line: the platform reads it off there.
+  if (opened.ok && pushed.said) {
+    return { ok: true, result: `${opened.result}\n${pushed.said}` };
+  }
+  return { ok: opened.ok, result: opened.result };
+}
+
+async function cutTheBranch(config, request, cwd) {
+  // R260. Put the sprint's branch on origin, from the default's tip. A branch
+  // already there is a success, not a conflict — the sprint wanted one to
+  // exist, and one does. Touches no working tree: the push names two refs
+  // and this checkout's HEAD is not one of them.
+  const name = (request.message ?? '').trim();
+  if (!name) {
+    return { ok: false, result: 'A cut has to name a branch. Nothing was cut.' };
+  }
+  log(`  cutting ${name} on origin from ${request.defaultBranch || 'main'}`);
+  const { ok, result } = await cutBranchOnOrigin(cwd, name, request.defaultBranch);
+  return { ok, result };
+}
+
+async function createTheBranch(config, request, cwd) {
+  // R379. Put a named branch on origin, cut from another branch's tip. Unlike
+  // CUT_BRANCH an existing name is a REFUSAL: the person asked for a new
+  // branch, and one that is already there may be somebody else's work.
+  // Touches no working tree: the push names two refs and HEAD is neither.
+  const name = (request.message ?? '').trim();
+  const from = (request.fromBranch ?? '').trim();
+  if (!name || !from) {
+    return {
+      ok: false,
+      result: 'A new branch has to name itself and the branch to cut it from. Nothing was created.',
+    };
+  }
+  log(`  creating ${name} on origin from ${from} — asked for from the console`);
+  const { ok, result } = await createBranchOnOrigin(cwd, name, from);
+  return { ok, result };
 }
 
 function reportWorkspaceRequest(config, request, ok, result, failure = null) {
@@ -4114,6 +4186,11 @@ function reportWorkspaceRequest(config, request, ok, result, failure = null) {
  * `afterTheTreeMoved` (R218) is the daemon's own beat: awaited after a request
  * that changed a tree, before that request is reported finished, so the
  * platform holds the tree as it now is by the time the console hears "done".
+ *
+ * i285. A request that touches the tree is judged against `heldBy` when it is
+ * PERFORMED, not when it was asked: a run may have claimed the checkout in
+ * between. `performingOn` keeps the claim loop out of a path while such a
+ * request runs.
  */
 function watchWorkspaceRequests(config, { afterTheTreeMoved = null } = {}) {
   // Read on EVERY request, never captured once: a checkout cloned on demand
@@ -4558,7 +4635,8 @@ function mergeabilityWaitMs() {
   return Number.isFinite(configured) && configured > 0 ? configured : 5000;
 }
 
-async function mergePullRequest(cwd, branch, { method = null, declared = null } = {}) {
+// i291: `method` has no default on purpose. A `null` default makes SonarJS type it as always-null and flag the MERGE_COMMIT check below as always false (S3403). It is 'MERGE_COMMIT' for a sprint's merge (R261) and absent for every other.
+async function mergePullRequest(cwd, branch, { method, declared = null } = {}) {
   const { adapter } = await hostOf(cwd, declared);
   const url = await findPullRequest(cwd, branch, { declared }).catch(() => null);
   if (!url || url.includes('/compare/')) {
@@ -6683,6 +6761,9 @@ const ink = painter();
  */
 const taken = new Map();
 
+/** i285: paths a tree-touching workspace request is acting on right now. */
+const performingOn = new Set();
+
 /**
  * Runs we have already said we are leaving queued.
  *
@@ -6734,6 +6815,8 @@ function heldWorkspaces() {
   // discarded — with no child and no claim, but with somebody's half-written
   // branch in it. Resetting it for the next run is how that work is lost.
   for (const path of told.heldWorkspaces) held.add(path);
+  // i285. A Stash, Commit, Reset or Hand off in progress speaks for its path.
+  for (const path of performingOn) held.add(path);
   return held;
 }
 
@@ -7001,7 +7084,7 @@ async function startRun(config, offered, workspace, source = null) {
   let lifecycle = [];
   // R604. The stages a refused SHOW walks again, and the comments of the latest
   // refused round when this walk begins after one.
-  let showWalk = { rework: [], comments: null };
+  let showWalk;
   let shield = null;
   // R155. What `git merge` did before anything was spawned, on a MERGE run.
   let merge = null;
@@ -7657,8 +7740,8 @@ async function walkLifecycle(config, run, runToken, cwd, baseCommit, workspace, 
         let sealed;
         try {
           sealed = await uploadShots(config, run, cwd);
-        } catch (refused) {
-          const why = `The SHOW stage could not hand over its screenshots: ${refused.message}`;
+        } catch (error_) {
+          const why = `The SHOW stage could not hand over its screenshots: ${error_.message}`;
           log(`  ${why}`);
           await reportStage(config, run, 'SHOW', 'report', { state: 'FAILED', outcome: why });
           await finish(config, run, 'FAILED', why);
@@ -7862,8 +7945,9 @@ async function strayChanges(before, cwd) {
 
 function strayLine(stray) {
   const shown = stray.slice(0, 10).map((path) => `\`${path}\``).join(', ');
+  const more = stray.length > 10 ? ` and ${stray.length - 10} more` : '';
   return `The SHOW stage changed the checkout outside \`.cawdev/shots/\`: ${shown}`
-    + `${stray.length > 10 ? ` and ${stray.length - 10} more` : ''}. SHOW may only write its screenshots; `
+    + `${more}. SHOW may only write its screenshots; `
     + 'build output that is not gitignored counts too (add it to .gitignore). Nothing was shown.';
 }
 
@@ -11246,6 +11330,14 @@ async function main() {
             skipped += 1;
             continue;
           }
+        }
+        // i285. `held` was read before the awaits above; a Stash, Commit, Reset
+        // or Hand off may have started on this path since. No `await` from here
+        // to `taken.set`, so the two check-and-mark pairs exclude each other.
+        if (workspace && performingOn.has(workspace)) {
+          noteQueued(offered.run, `waiting for ${workspace}: a Stash, Commit, Reset or Hand off asked from the console is being done there`);
+          skipped += 1;
+          continue;
         }
         if (workspace) {
           held.add(workspace);

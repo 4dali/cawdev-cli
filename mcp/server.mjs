@@ -115,9 +115,9 @@ async function api(config, path, { method = 'GET', body } = {}) {
       },
       body: body ? JSON.stringify(body) : undefined,
     });
-  } catch (failure) {
+  } catch (error_) {
     throw new CawdevError(
-      `Could not reach cawdev at ${config.url} (${failure.message}). ` +
+      `Could not reach cawdev at ${config.url} (${error_.message}). ` +
         'Is it running? roadmap_where shows which URL this server is using and where it read it.',
     );
   }
@@ -218,6 +218,83 @@ function askTimeoutSeconds() {
   // pending path.
   const configured = Number(process.env.CAWDEV_ASK_TIMEOUT_SECONDS);
   return Number.isFinite(configured) && configured > 0 ? configured : 600;
+}
+
+// --- setting a question aside — R630 ---------------------------------------
+//
+// An agent that stops waiting on a question and carries on leaves the run
+// reading WAITING_ON_USER over a working session. So after any ask or await
+// times out, a short timer starts here; if the agent calls await again on the
+// same id the timer is cancelled with no network call (the normal path), and
+// if it does anything else — another tool, or nothing for about a minute — the
+// question is set aside with a separate POST. Never inside the GET long-poll.
+
+/** How long after a timeout the agent has to call await again before it counts as moved on. */
+function setAsideGraceMs() {
+  const configured = Number(process.env.CAWDEV_SET_ASIDE_GRACE_SECONDS);
+  return (Number.isFinite(configured) && configured > 0 ? configured : 75) * 1000;
+}
+
+/** key `q:<id>` or `g:<id>` -> { config, path, timer, fired, sending } */
+const asides = new Map();
+
+/** The set-aside calls never throw: a finished run's token 401s and the tool result must survive. */
+async function callAside(entry, method, config = entry.config) {
+  try {
+    // Bounded: a hung platform must not hold up tools that never touch the network.
+    await Promise.race([
+      api(config, `${entry.path}/set-aside`, { method }),
+      new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('timed out')), 5000).unref?.();
+      }),
+    ]);
+  } catch (error_) {
+    process.stderr.write(`cawdev-mcp: ${method} set-aside failed: ${error_.message}\n`);
+  }
+}
+
+function scheduleAside(config, project, runId, kind, id) {
+  const key = `${kind}:${id}`;
+  const existing = asides.get(key);
+  if (existing) clearTimeout(existing.timer);
+  const path =
+    kind === 'q'
+      ? `/api/projects/${project}/runs/${runId}/questions/${id}`
+      : `/api/projects/${project}/runs/${runId}/question-groups/${id}`;
+  const entry = { config, path, timer: null, fired: false, sending: null };
+  entry.timer = setTimeout(() => void fireAside(entry), setAsideGraceMs());
+  entry.timer.unref?.();
+  asides.set(key, entry);
+}
+
+function fireAside(entry, config = entry.config) {
+  if (entry.fired) return entry.sending;
+  clearTimeout(entry.timer);
+  entry.fired = true;
+  entry.sending = callAside(entry, 'POST', config);
+  return entry.sending;
+}
+
+/** The agent moved on: set aside everything pending now, except one key it is returning to. */
+async function flushAsides(config, exceptKey) {
+  const pending = [];
+  for (const [key, entry] of asides) {
+    if (key !== exceptKey) pending.push(fireAside(entry, config));
+  }
+  await Promise.all(pending);
+}
+
+/** The agent called await again: cancel a pending timer, or take back a set-aside already sent. */
+async function resumeAside(key, config) {
+  const entry = asides.get(key);
+  if (!entry) return;
+  asides.delete(key);
+  if (!entry.fired) {
+    clearTimeout(entry.timer);
+    return;
+  }
+  await entry.sending;
+  await callAside(entry, 'DELETE', config);
 }
 
 /**
@@ -380,8 +457,8 @@ const TOOLS = [
               `\n    owner's role there: ${project.ownerRole}`,
           );
         }
-      } catch (failure) {
-        lines.push(`the platform refused: ${failure.message}`);
+      } catch (error_) {
+        lines.push(`the platform refused: ${error_.message}`);
       }
       return lines.filter((line) => line !== '').join('\n');
     },
@@ -1611,10 +1688,12 @@ const TOOLS = [
       if (answered) {
         return renderAnswer(answered);
       }
+      scheduleAside(config, project, runId, 'q', asked.id);
       return (
         `Nobody has answered yet. The run is WAITING_ON_USER and the question is in their ` +
         `inbox.\n\nCall await_answer with question_id ${asked.id} to keep waiting. Do not ` +
-        `guess an answer and carry on — you asked because the decision was theirs.`
+        `guess an answer and carry on — you asked because the decision was theirs. If you do ` +
+        `not call it within about a minute, the question is set aside.`
       );
     },
   },
@@ -1669,10 +1748,12 @@ const TOOLS = [
       if (answered) {
         return renderRound(asked, answered);
       }
+      scheduleAside(config, project, runId, 'g', asked.id);
       return (
         `The round is unanswered. The run is WAITING_ON_USER and the questions are in their ` +
         `inbox under "${asked.title}".\n\nCall await_group with group_id ${asked.id} to keep ` +
-        `waiting. Do not guess the answers and carry on — you asked because they were theirs.`
+        `waiting. Do not guess the answers and carry on — you asked because they were theirs. ` +
+        `If you do not call it within about a minute, the round is set aside.`
       );
     },
   },
@@ -1700,7 +1781,8 @@ const TOOLS = [
       if (answered) {
         return renderRound(null, answered);
       }
-      return `Still unfinished. Call await_group again with group_id ${args.group_id} to keep waiting. If you carry on instead, the round stays in their inbox — and the run reads as waiting on them — until this stage ends; then it is closed, and an answer given after that is refused.`;
+      scheduleAside(config, project, runId, 'g', args.group_id);
+      return `Still unfinished. Call await_group again with group_id ${args.group_id} to keep waiting. If you carry on instead, the round is set aside: the run stops reading as waiting on them, and it leaves their inbox. An answer they give before this stage ends is still recorded, but you see it only by calling await_group again. When the stage ends, the round is closed and a later answer is refused.`;
     },
   },
 
@@ -1781,7 +1863,8 @@ const TOOLS = [
       if (answered) {
         return renderAnswer(answered);
       }
-      return `Still nothing. Call await_answer again with question_id ${args.question_id} to keep waiting. If you carry on instead, the question stays in their inbox — and the run reads as waiting on them — until this stage ends; then it is closed, and an answer given after that is refused.`;
+      scheduleAside(config, project, runId, 'q', args.question_id);
+      return `Still nothing. Call await_answer again with question_id ${args.question_id} to keep waiting. If you carry on instead, the question is set aside: the run stops reading as waiting on them, and it leaves their inbox. An answer they give before this stage ends is still recorded, but you see it only by calling await_answer again. When the stage ends, the question is closed and a later answer is refused.`;
     },
   },
 
@@ -1958,9 +2041,9 @@ async function decide(config, args) {
     });
 
     return await answerOf(config, project, runId, asked.id, input);
-  } catch (failure) {
+  } catch (error_) {
     return deny(
-      `cawdev could not be asked whether this is allowed (${failure.message}). Treating that as ` +
+      `cawdev could not be asked whether this is allowed (${error_.message}). Treating that as ` +
         `no. If this persists, report blocked rather than retrying.`,
     );
   }
@@ -2803,15 +2886,26 @@ async function handle(message) {
       }
       // Configuration is re-read here, per call, on purpose. See readConfig.
       const config = await readConfig();
+      // R630: anything the agent does but wait again on a question says it moved on.
+      const args = params.arguments ?? {};
+      if (tool.name === 'await_answer' && args.question_id) {
+        await resumeAside(`q:${args.question_id}`, config);
+        await flushAsides(config, `q:${args.question_id}`);
+      } else if (tool.name === 'await_group' && args.group_id) {
+        await resumeAside(`g:${args.group_id}`, config);
+        await flushAsides(config, `g:${args.group_id}`);
+      } else {
+        await flushAsides(config);
+      }
       try {
         const text = await tool.handler(config, params.arguments ?? {});
         return reply(id, { content: [{ type: 'text', text }] });
-      } catch (failure) {
+      } catch (error_) {
         // A refusal is a *result*, not a transport error: the agent should read
         // it, understand which rule it hit, and try something else — not see
         // the tool call itself fail.
         return reply(id, {
-          content: [{ type: 'text', text: failure.message }],
+          content: [{ type: 'text', text: error_.message }],
           isError: true,
         });
       }

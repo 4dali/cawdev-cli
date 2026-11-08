@@ -360,9 +360,9 @@ function plainKeys(text) {
   const keys = [];
   for (let at = 0; at < text.length;) {
     if (text[at] === ESC) {
-      const sequence = /^\x1b(\[[0-9;?]*[a-zA-Z~]|O[A-Z]|.)?/.exec(text.slice(at));
-      keys.push(sequence[0]);
-      at += sequence[0].length;
+      const tail = /^(\[[0-9;?]*[a-zA-Z~]|O[A-Z]|.)?/.exec(text.slice(at + 1))[0];
+      keys.push(ESC + tail);
+      at += 1 + tail.length;
       continue;
     }
     keys.push(text[at]);

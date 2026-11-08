@@ -582,8 +582,9 @@ export function parseNew(words, { projects = [] } = {}) {
   }
   const text = wordsText(args);
   if (!text) {
-    return { error: kind === 'ask' ? 'ask what? /new ask <question>'
-      : `${kind} what? /new ${kind} R3${kind === 'plan+dev' ? ' R5' : `, or /new ${kind} <the task in words>`}` };
+    if (kind === 'ask') return { error: 'ask what? /new ask <question>' };
+    const example = kind === 'plan+dev' ? ' R5' : `, or /new ${kind} <the task in words>`;
+    return { error: `${kind} what? /new ${kind} R3${example}` };
   }
   // A card is written R3 and an issue i3 — EntryRef's spelling; a bare number
   // is a roadmap card, as it is everywhere else. Commas only part references:
@@ -655,7 +656,8 @@ export function batchStartedLines(asked, outcome, slug, agent = null) {
     lines.push(`building ${refs.join(', ')} ${where}, a branch each, queued on this machine`);
   }
   for (const card of outcome?.refused ?? []) {
-    lines.push(`skipped ${card.ref ?? `#${card.entryNumber}`}: ${card.reason}`);
+    const name = card.ref ?? `#${card.entryNumber}`;
+    lines.push(`skipped ${name}: ${card.reason}`);
   }
   return lines;
 }
@@ -821,6 +823,13 @@ function stripBoards(width, cards, projects = null) {
     };
   });
 
+  const shown = fitBoards(boards, width);
+  shareWidths(shown, width);
+  return { slugs, shown, hiddenProjects: boards.length - shown.length };
+}
+
+/** Drops what does not fit, empty columns first, then `GIVES_WAY`, then whole projects; returns the boards kept. */
+function fitBoards(boards, width) {
   // What fits: every column at MIN_COLUMN, a space between two columns and a
   // rule between two projects.
   const need = (list) => list.reduce((sum, board) => sum + board.columns.length * (MIN_COLUMN + 1), 0)
@@ -829,24 +838,33 @@ function stripBoards(width, cards, projects = null) {
     board.columns = board.columns.filter((each) => each !== column);
     if (column.cards.length) board.hidden.push(column);
   };
-  if (need(boards) > width) {
-    for (const board of boards) {
-      for (const column of [...board.columns]) {
-        if (!column.cards.length && board.columns.length > 1) drop(board, column);
-      }
-    }
-  }
+  if (need(boards) > width) dropEmptyColumns(boards, drop);
   for (const status of GIVES_WAY) {
     if (need(boards) <= width) break;
-    for (const board of boards) {
-      const column = board.columns.find((each) => each.status === status);
-      if (column && board.columns.length > 1) drop(board, column);
-    }
+    dropColumnOf(boards, status, drop);
   }
   const shown = [...boards];
   while (shown.length > 1 && need(shown) > width) shown.pop();
-  const hiddenProjects = boards.length - shown.length;
+  return shown;
+}
 
+function dropEmptyColumns(boards, drop) {
+  for (const board of boards) {
+    for (const column of [...board.columns]) {
+      if (!column.cards.length && board.columns.length > 1) drop(board, column);
+    }
+  }
+}
+
+function dropColumnOf(boards, status, drop) {
+  for (const board of boards) {
+    const column = board.columns.find((each) => each.status === status);
+    if (column && board.columns.length > 1) drop(board, column);
+  }
+}
+
+/** Sets each shown column's and board's `width`. */
+function shareWidths(shown, width) {
   // Widths: what is left after the gaps, shared by column, the remainder
   // going to the first columns so the rule lines never move by one.
   const columnCount = shown.reduce((sum, board) => sum + board.columns.length, 0);
@@ -860,7 +878,6 @@ function stripBoards(width, cards, projects = null) {
     }
     board.width = board.columns.reduce((sum, column) => sum + column.width, 0) + board.columns.length - 1;
   }
-  return { slugs, shown, hiddenProjects };
 }
 
 /**
@@ -900,6 +917,35 @@ export function moveInStrip(columns, focus, dCol = 0, dRow = 0) {
     rowAt = (rowAt + dRow + count) % count;
   }
   return { slug: columns[colAt].slug, ref: columns[colAt].cards[rowAt].ref };
+}
+
+/** The first card a column shows: its window walks with the focus when it overflows. */
+function windowStart(column, cardRows, focusedAt, atEnd) {
+  if (column.cards.length <= cardRows) return 0;
+  if (cardRows === 1) return Math.max(0, focusedAt);
+  if (atEnd) return column.cards.length - cardRows;
+  return focusedAt >= 0 ? Math.max(0, focusedAt - (cardRows - 2)) : 0;
+}
+
+/** One cell of the strip: a column's card on `row`, its `+N more`, or its dash. */
+function stripCell(column, { row, cardRows, focusedAt, focus }, ink) {
+  const overflow = column.cards.length > cardRows;
+  const atEnd = overflow && focusedAt === column.cards.length - 1 && cardRows > 1;
+  const start = windowStart(column, cardRows, focusedAt, atEnd);
+  const last = row === cardRows - 1;
+  if (overflow && last && !atEnd && !(cardRows === 1 && focusedAt >= 0)) {
+    return ink.muted(`+${column.cards.length - (start + cardRows - 1)} more`);
+  }
+  const card = column.cards[start + row];
+  if (card) {
+    const chosen = focusedAt >= 0 && card.ref === focus?.ref;
+    let mark = ' ';
+    if (chosen) mark = ink.bold(ink.accent('❯'));
+    else if (card.live) mark = ink.accent('●');
+    const title = chosen ? ink.bold(ink.text(card.title ?? '')) : (card.title ?? '');
+    return `${mark}${refInk(card, ink)(card.ref)} ${title}`;
+  }
+  return row === 0 && !column.cards.length ? ink.muted(' —') : '';
 }
 
 /**
@@ -949,8 +995,7 @@ export function roadmapStrip(width, maxRows, cards, ink, projects = null, focus 
     return padVisible(ellipsed(segment, board.width), board.width);
   }).join(ink.muted(' │ '));
 
-  const lines = [];
-  lines.push(lineOf((board, b) => {
+  const headerLine = lineOf((board, b) => {
     const counts = board.folded.filter(([, n]) => n).map(([word, n]) => `${n} ${word}`);
     const lost = board.hidden.map((column) => `${column.label.toLowerCase()} ${column.cards.length} hidden`);
     const more = b === shown.length - 1 && hiddenProjects
@@ -959,39 +1004,22 @@ export function roadmapStrip(width, maxRows, cards, ink, projects = null, focus 
     // shipped work before it loses the fact that a column is missing.
     const tail = [...lost, ...more, ...counts].join(' · ');
     return `${ink.bold(board.slug)}${tail ? ink.muted(` · ${tail}`) : ''}`;
-  }));
-  lines.push(lineOf((board) => board.columns.map((column) => {
+  });
+  const columnLine = lineOf((board) => board.columns.map((column) => {
     const active = Boolean(focus && board.slug === focus.slug
       && column.cards.some((card) => card.ref === focus.ref));
     const paintLabel = hueOf(column.status, ink);
     const head = active ? ink.strong(paintLabel(column.label)) : paintLabel(column.label);
     return padVisible(clip(`${head} ${ink.muted(String(column.cards.length))}`,
       column.width), column.width);
-  }).join(' ')));
+  }).join(' '));
+  const lines = [headerLine, columnLine];
   for (let row = 0; row < cardRows; row++) {
     lines.push(lineOf((board) => board.columns.map((column) => {
       const focusedAt = focus && board.slug === focus.slug
         ? column.cards.findIndex((card) => card.ref === focus.ref)
         : -1;
-      const overflow = column.cards.length > cardRows;
-      const atEnd = overflow && focusedAt === column.cards.length - 1 && cardRows > 1;
-      const start = !overflow ? 0
-        : cardRows === 1 ? Math.max(0, focusedAt)
-          : atEnd ? column.cards.length - cardRows
-            : focusedAt >= 0 ? Math.max(0, focusedAt - (cardRows - 2)) : 0;
-      const last = row === cardRows - 1;
-      let cell = '';
-      if (overflow && last && !atEnd && !(cardRows === 1 && focusedAt >= 0)) {
-        cell = ink.muted(`+${column.cards.length - (start + cardRows - 1)} more`);
-      } else if (column.cards[start + row]) {
-        const card = column.cards[start + row];
-        const chosen = focusedAt >= 0 && card.ref === focus.ref;
-        const mark = chosen ? ink.bold(ink.accent('❯')) : card.live ? ink.accent('●') : ' ';
-        const title = chosen ? ink.bold(ink.text(card.title ?? '')) : (card.title ?? '');
-        cell = `${mark}${refInk(card, ink)(card.ref)} ${title}`;
-      } else if (row === 0 && !column.cards.length) {
-        cell = ink.muted(' —');
-      }
+      const cell = stripCell(column, { row, cardRows, focusedAt, focus }, ink);
       return padVisible(ellipsed(cell, column.width), column.width);
     }).join(' ')));
   }

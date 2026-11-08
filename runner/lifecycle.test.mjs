@@ -477,6 +477,24 @@ test('a run stopped by the usage limit is not then failed by the walk', async (t
 // --- R305: what each stage cost, and the run as their sum ---------------------
 
 /** Waits for the daemon to have filed a usage reading on a stage. */
+/**
+ * The RUN's own reading (a usage report with no stage). It is sent after the
+ * stage's, so a test that waited for the stage and then read the run raced it:
+ * under the whole suite's load (sonar.sh runs every test with coverage) the
+ * run's line had not landed yet.
+ */
+async function untilRunUsage(platform, timeout = 25000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const run = platform.usage.find((each) => !each.stage);
+    if (run) {
+      return run;
+    }
+    await new Promise((done) => setTimeout(done, 150));
+  }
+  return undefined;
+}
+
 async function untilStageUsage(platform, stage, count = 1, timeout = 25000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
@@ -568,7 +586,7 @@ test('a claim that already carries tokens is the base the first stage adds to', 
   });
 
   assert.ok(await untilStageUsage(platform, 'PLAN'), said());
-  const first = platform.usage.find((each) => !each.stage);
+  const first = await untilRunUsage(platform);
   assert.ok(first, JSON.stringify(platform.usage));
   assert.equal(first.tokensIn, 1100, JSON.stringify(first));
   assert.equal(first.tokensOut, 57, JSON.stringify(first));
@@ -599,7 +617,8 @@ test('a run walked again in a fresh session adds to what its stage rows already 
   const stage = platform.usage.find((each) => each.stage === 'PLAN');
   assert.equal(stage.tokensIn, 1100, JSON.stringify(stage));
   assert.equal(stage.tokensOut, 57, JSON.stringify(stage));
-  const run = platform.usage.find((each) => !each.stage);
+  const run = await untilRunUsage(platform);
+  assert.ok(run, JSON.stringify(platform.usage));
   assert.equal(run.tokensIn, 1100, JSON.stringify(run));
 });
 

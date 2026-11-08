@@ -47,6 +47,9 @@ test('the worst WHOLE window wins; a per-model window never counts', () => {
   assert.equal(worst.percent, 81);
   assert.equal(worstWindow([]), null);
   assert.equal(worstWindow(undefined), null);
+  const tied = [{ window: 'FIVE_HOUR', percent: 90 }, { window: 'WEEKLY', percent: 90 }];
+  assert.equal(worstWindow(tied), tied[0]);
+  assert.equal(worstWindow([{ window: 'WEEKLY', percent: 5 }]).percent, 5);
 });
 
 test('inWords', () => {

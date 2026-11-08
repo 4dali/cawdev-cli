@@ -9,7 +9,9 @@
 // CAWDEV_ADMIN_PASSWORD), because starting a run is a person's act — an agent
 // cannot start another agent, so this test cannot bootstrap itself from a token.
 
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -123,12 +125,24 @@ await asRunner(`/api/projects/${project}/runs/${runId}/transition`, { state: 'RU
 
 // --- the agent's side, over real stdio ---------------------------------------
 
+// i285: `report done` refuses unless the run's branch is checked out in the
+// session's checkout. Give the server one: a throwaway repository on the
+// branch, one commit, no remote, so nothing is left to commit or push.
+const checkout = mkdtempSync(join(tmpdir(), 'cawdev-smoke-'));
+const inCheckout = (...args) => execFileSync('git',
+  ['-c', 'user.name=smoke', '-c', 'user.email=smoke@cawdev.test', ...args],
+  { cwd: checkout, stdio: 'ignore' });
+inCheckout('init', '-q');
+inCheckout('commit', '-q', '--allow-empty', '-m', 'smoke');
+inCheckout('checkout', '-q', '-b', `r${entry.number}-smoke`);
+
 const server = spawn(process.execPath, [join(here, 'server.mjs')], {
   stdio: ['pipe', 'pipe', 'inherit'],
   env: {
     ...process.env,
     CAWDEV_URL: BASE,
     CAWDEV_TOKEN: claimed.runToken,
+    CAWDEV_WORKSPACE: checkout,
     // Short, so the pending path can be exercised without waiting ten minutes.
     CAWDEV_ASK_TIMEOUT_SECONDS: '3',
   },

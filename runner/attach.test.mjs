@@ -8,7 +8,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { clip, sshNeedsAPerson, stripAnsi, visibleWidth, wrap } from './attach.mjs';
+import { clip, questionState, sshNeedsAPerson, stripAnsi, visibleWidth, wrap } from './attach.mjs';
 
 const RED = '\x1b[31m';
 const OFF = '\x1b[0m';
@@ -55,4 +55,11 @@ test('a clone ssh refused to ask about is told apart from any other failure', ()
   assert.equal(sshNeedsAPerson('Host key verification failed.'), true);
   assert.equal(sshNeedsAPerson('fatal: repository not found'), false);
   assert.equal(sshNeedsAPerson(undefined), false);
+});
+
+test('a question the session carried on without is not offered in the terminal (R630)', () => {
+  const setAside = { id: 'a', answered: false, setAside: true };
+  const open = { id: 'b', answered: false, setAside: false };
+  assert.equal(questionState([setAside], 'me@x.test'), null);
+  assert.equal(questionState([setAside, open], 'me@x.test').question.id, 'b');
 });

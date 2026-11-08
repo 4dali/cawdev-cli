@@ -224,6 +224,20 @@ test('the moment a development finishes: the robot carries the branch to ▶ rev
   assert.equal(devDoneRobotLines(40, 3, { still: true }, ink).length, 3);
 });
 
+test('the dev-done sign is green on the top row at every card height', () => {
+  const paint = painter(1);
+  const green = paint.success('x').split('x')[0];
+  assert.notEqual(green, '', 'success opens with an escape at this depth');
+  for (const rows of [3, 2, 1]) {
+    const lines = devDoneRobotLines(40, rows, { since: 200 }, paint);
+    assert.equal(lines.length, rows);
+    const signed = lines.filter((line) => stripAnsi(line).includes('✓ built · /pr'));
+    assert.equal(signed.length, 1, `one sign at ${rows} rows`);
+    assert.equal(signed[0], lines[0], `the sign is on the first drawn row at ${rows} rows`);
+    lines.forEach((line, i) => assert.equal(line.includes(green), i === 0, `green only on row 0 at ${rows} rows (row ${i})`));
+  }
+});
+
 test('nothing built: the robot walks in empty-handed, amber, shrugs six ticks in every thirty, and the sign says how to go on', () => {
   const paint = painter(3);
   const at = (since) => nothingBuiltRobotLines(50, 3, { since, ref: 'R598' }, ink);

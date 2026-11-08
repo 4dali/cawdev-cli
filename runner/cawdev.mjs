@@ -592,8 +592,8 @@ export async function runImport(args, ink, { cwd = process.cwd(), say = (line) =
   if (!path) {
     throw new Error('Name the file: cawdev import <file.json> [--project <slug>] [--dry-run]');
   }
-  const cards = cardsFrom(await readFile(resolve(cwd, expandHome(path)), 'utf8').catch((failure) => {
-    throw new Error(`Could not read ${path}: ${failure.message}`);
+  const cards = cardsFrom(await readFile(resolve(cwd, expandHome(path)), 'utf8').catch((error_) => {
+    throw new Error(`Could not read ${path}: ${error_.message}`);
   }));
 
   const configPath = await findConfig(args, process.env, cwd);
@@ -609,7 +609,8 @@ export async function runImport(args, ink, { cwd = process.cwd(), say = (line) =
   const status = valueOf(args, '--status') ?? undefined;
   const allowDuplicates = args.includes('--allow-duplicates');
 
-  say(`  ${ink.muted(`${path}: ${cards.length} card${cards.length === 1 ? '' : 's'}, checking against ${slug}…`)}`);
+  const checking = `${path}: ${cards.length} card${cards.length === 1 ? '' : 's'}, checking against ${slug}…`;
+  say(`  ${ink.muted(checking)}`);
   const checked = await importCards(session, slug, cards, { dryRun: true, status, allowDuplicates });
   for (const line of resultLines(checked, slug, ink)) say(line);
   if (args.includes('--dry-run') || !checked.filed?.length) {

@@ -68,8 +68,8 @@ export async function localCopy(view, { dir, fetchBytes }) {
   for (const part of parts) {
     level = join(level, part);
     await requireNotALink(level);
-    await mkdir(level, { mode: 0o700 }).catch((failure) => {
-      if (failure.code !== 'EEXIST') throw failure;
+    await mkdir(level, { mode: 0o700 }).catch((error_) => {
+      if (error_.code !== 'EEXIST') throw error_;
     });
     await requireNotALink(level);
   }
@@ -90,9 +90,9 @@ export async function localCopy(view, { dir, fetchBytes }) {
   try {
     await writeFile(partial, bytes, { mode: 0o600, flag: 'wx' });
     await rename(partial, path);
-  } catch (failure) {
+  } catch (error_) {
     await rm(partial, { force: true });
-    throw failure;
+    throw error_;
   }
   return { path, downloaded: true };
 }
@@ -116,10 +116,20 @@ export function openerFor(platform) {
 export function printable(text, { lines = false } = {}) {
   const plain = stripAnsi(String(text ?? ''))
     .replace(/[\u2028\u2029]/g, lines ? '\n' : ' ')
-    .replace(lines ? /[\t]/g : /[\t\n\r]/g, ' ')
+    .replace(lines ? /\t/g : /[\t\n\r]/g, ' ')
     .replace(lines ? /[\x00-\x08\x0b-\x1f\x7f-\x9f]/g : /[\x00-\x1f\x7f-\x9f]/g, '');
   // Bidirectional controls: a name that reads one way and means another.
   return plain.replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '');
+}
+
+function numberedNote(line) {
+  if (line[0] !== '#') return null;
+  let end = 1;
+  while (end < line.length && line[end] >= '0' && line[end] <= '9') end += 1;
+  if (end === 1) return null;
+  let rest = line.slice(end).trimStart();
+  if (rest !== '' && ':—-'.includes(rest[0])) rest = rest.slice(1).trimStart();
+  return [line, line.slice(1, end), rest];
 }
 
 /**
@@ -137,7 +147,7 @@ export function parseComments(text, shots) {
   for (const raw of String(text ?? '').split('\n')) {
     const line = raw.trim();
     if (!line) continue;
-    const mine = /^#(\d+)\s*[:—-]?\s*(.*)$/.exec(line);
+    const mine = numberedNote(line);
     if (!mine) {
       reasons.push(line);
       continue;
@@ -176,8 +186,10 @@ export function showGate(approval) {
   }
 }
 
+const PLAIN_INK = { muted: (text) => text };
+
 /** The numbered lines of a round, for the scrollback or a window. */
-export function roundListing(shots, ink = { muted: (text) => text }) {
+export function roundListing(shots, ink = PLAIN_INK) {
   return shots.map((shot, at) => {
     const caption = shot.caption ? ` — ${printable(shot.caption)}` : '';
     const html = isImage(shot) ? '' : ink.muted(' (html — opens on cawdev)');

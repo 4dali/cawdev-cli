@@ -17,7 +17,7 @@ export function worstWindow(limits) {
   if (!whole.length) {
     return null;
   }
-  return whole.reduce((worst, each) => (each.percent > worst.percent ? each : worst));
+  return whole.reduce((worst, each) => (each.percent > worst.percent ? each : worst), whole[0]);
 }
 
 /** `1h 20m` · `12m` · `under a minute`. */

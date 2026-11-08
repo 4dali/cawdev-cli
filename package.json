@@ -1,6 +1,6 @@
 {
   "name": "cawdev-cli",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "cawdev's terminal client and runner daemon — zero dependencies, on purpose",
   "type": "module",
   "bin": {

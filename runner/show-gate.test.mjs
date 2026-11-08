@@ -364,7 +364,11 @@ test('/shots prints inline thumbnails only in a terminal that draws them, and ne
     process.env.TERM_PROGRAM = 'iTerm.app';
     const drawn = atShow();
     await command(drawn.ui, '/shots');
-    assert.equal(drawn.ui.pending.filter((line) => line.startsWith('\x1b]1337;File=inline=1')).length, 3);
+    // Each thumbnail is a file written and read back: wait for the third rather than two ticks,
+    // which a busy CI machine outran (v1.2.3's first release run saw 2 of 3).
+    const thumbnails = () => drawn.ui.pending.filter((line) => line.startsWith('\x1b]1337;File=inline=1')).length;
+    await settleUntil(() => thumbnails() === 3);
+    assert.equal(thumbnails(), 3);
 
     process.env.TERM_PROGRAM = 'Apple_Terminal';
     const plain = atShow();
