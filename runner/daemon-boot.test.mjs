@@ -226,6 +226,12 @@ test('SIGHUP re-reads acceptsRulesFromConsole and agentCommands without a restar
   });
 
   await firstMessage(socketPathFor(`${RUNNER}-hup`));
+  // R596's race again: the hello can arrive before the first heartbeat, and
+  // `seen` is written before the heartbeat's body is read, so wait on the body.
+  const first = Date.now() + 5000;
+  while (Date.now() < first && platform.heartbeats.length === 0) {
+    await new Promise((done) => setTimeout(done, 100));
+  }
   assert.equal(platform.heartbeats.at(-1)?.acceptsConsoleRules, false);
 
   // The operator edits the file this daemon booted from, the way

@@ -2,7 +2,7 @@
  * What this terminal remembers about how you like to work — beside history.mjs
  * and in its shape: one file under ~/.cawdev, keyed by the platform's URL, 0600.
  *
- * One preference so far: the agent `/new` asks for when a command names none
+ * The agent `/new` asks for when a command names none
  * (`/agent codex`). Kept here and not on the platform, because it is a choice
  * about THIS terminal — the project's default and your account's live in the
  * console, and this sits in front of them without changing either.
@@ -10,7 +10,7 @@
  * @author Claude Opus 5.5 (Claude Code)
  * @author Moez Ben MBarka
  */
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -37,8 +37,17 @@ export async function loadPrefs(url) {
   return mine && typeof mine === 'object' ? mine : {};
 }
 
+/** One write at a time: two saves that both read before either wrote would lose one of them. */
+let writing = Promise.resolve();
+
 /** Merges `changes` into this platform's preferences; a null value removes the key. */
-export async function savePrefs(url, changes) {
+export function savePrefs(url, changes) {
+  const mine = writing.then(() => write(url, changes));
+  writing = mine.catch(() => undefined);
+  return mine;
+}
+
+async function write(url, changes) {
   const all = await readAll();
   const mine = { ...(all[key(url)] ?? {}) };
   for (const [name, value] of Object.entries(changes)) {
@@ -47,6 +56,10 @@ export async function savePrefs(url, changes) {
   }
   all[key(url)] = mine;
   await mkdir(dirname(prefsFile()), { recursive: true, mode: 0o700 });
-  await writeFile(prefsFile(), `${JSON.stringify(all, null, 2)}\n`, { mode: 0o600 });
-  await chmod(prefsFile(), 0o600).catch(() => undefined);
+  // Written beside and renamed over: a read that lands mid-write would find
+  // an empty file, and every preference would read as unset.
+  const beside = `${prefsFile()}.${process.pid}.tmp`;
+  await writeFile(beside, `${JSON.stringify(all, null, 2)}\n`, { mode: 0o600 });
+  await chmod(beside, 0o600).catch(() => undefined);
+  await rename(beside, prefsFile());
 }

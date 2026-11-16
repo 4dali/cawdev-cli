@@ -460,11 +460,56 @@ for printing into the scrollback still holds, and this mode is something you
 ask for rather than the default. On the way out, what the watched session said
 meanwhile is laid into the scrollback, so nothing was lost by watching it here.
 
-**The roadmap runs across the top, grouped by project** — Considering,
-Planned and In development side by side, one line per card, read again every
-thirty seconds. **`b`** (or **`/board`**) puts the focus into the roadmap
+**Several projects are a tab each.** A machine showing more than one project
+draws a tab bar on the top three rows: `0 All`, then one numbered tab per
+project, between two rules; the one under them is heavy under the open tab.
+
+```
+─────────────────────────────────────────────────────────────────────────────────────
+ 0 All ◆1 ●3   1 saasng ◆1 ●2   2 ngsign ●1   3 cawdev    4 docs         t then 0–9
+─────────────────────────────────────────────━━━━━━━━━━──────────────────────────────
+cawdev · 1 backlog
+Considering 2                    Planned 1                    In development 1
+ R631 Passkeys on Android         R630 Set aside the test f…  ●R624 Advanced mode is…
+```
+
+- **`t`, then the tab's number.** `0` is All, `1`–`9` the projects in the
+  order they are served; after `t`, another `t`, `tab` or `→` steps to the next
+  tab and `shift+tab` or `←` to the previous, and any other key lets go.
+  **`/tab 2`**, `/tab saasng`, `/tab all`, `/tab next|prev` do the same from
+  the line. It is a chord on a plain letter because nothing else arrives
+  everywhere: `ctrl+1` is not a byte a terminal sends (most send the bare
+  digit, which is a session card here), `ctrl+tab` belongs to the terminal's
+  own tabs, and a `ctrl+` prefix is a multiplexer's already (Zellij takes
+  `ctrl+t`, tmux `ctrl+b`). `ctrl+t` starts the chord too where nothing takes
+  it first, a terminal that reports `ctrl+2` and `ctrl+tab` (xterm's
+  modifyOtherKeys, the kitty keyboard protocol) gets them in one press, and
+  `[` / `]` step for who has them under a finger (`split.mjs`, `tabMove`).
+- **A project's tab is that project alone**: its roadmap at the full width, its
+  session cards, and its project for `/new`, `/card`, `/import`, `/view R3`
+  and `d` — none of them asks "which project?" there, the tab being a choice
+  already made. Card numbers (`1`–`9`, `/view 2`) are the tab's.
+- **`All` has no columns**: one line a project (`saasng  5 considering · 2
+  planned · 1 in development · 4 backlog  ◆1 ●2`) over the session cards of
+  every project. `b` asks for a project's tab first.
+- **A tab's two counts are its sessions**: `◆` waiting on a person, `●`
+  running. The prompt's `N need you` counts every tab, and `n` / `N` go to the
+  next session that needs you wherever it is, opening its tab. A request on
+  another tab never takes the screen by itself, and the prompt never talks to
+  a session whose project is not on screen.
+- Tabs that do not fit give way from the ends, counted (`‹2`, `3›`); the open
+  one is always drawn. The open tab is remembered (`prefs.mjs`, `tab`) and
+  kept by `/reload`. One project shown is no bar at all.
+
+Before the tabs every project had its three columns side by side: three
+projects on 160 columns were nine columns of seventeen characters, and past
+that columns and then whole projects were dropped.
+
+**The roadmap runs across the top** — Considering, Planned and In development
+side by side, one line per card, read again every thirty seconds. An empty
+column keeps eighteen columns and the ones holding cards share the rest. **`b`** (or **`/board`**) puts the focus into the roadmap
 strip (`❯` marks the focused card and an overflowing column scrolls with it):
-`←`/`→` (or `h`/`l`) step across columns and projects, `↑`/`↓` (or `j`/`k`)
+`←`/`→` (or `h`/`l`) step across the columns, `↑`/`↓` (or `j`/`k`)
 step through the column's cards, and a preview panel directly below the strip
 shows the focused card's **full untruncated title and description** (read on
 demand from `GET /api/projects/:slug/roadmap/:ref` and cached, scrolled with
@@ -564,7 +609,7 @@ was a manual session on a `task-…` branch with no card, which never reached
 the board and was never told to commit. A card reference on its own is that card; anything
 else is the task in words. **The project is always asked** — a list of what
 this machine serves — unless the command names it with `@project`, or
-advanced mode is narrowed to ONE project (`/projects`), which is a choice
+advanced mode is narrowed to ONE project (`/projects`, or a project's tab), which is a choice
 already made rather than a guess. Never guessed from the focused window, nor
 from a machine serving just one, since a session on the wrong project is a
 card planned or a branch cut in the wrong repository. `/new dev` alone and `d` list the planned cards and the confirmed issues of every project,
@@ -607,8 +652,8 @@ next restart, because `projects` is read at boot.
 **Which projects it shows is yours to pick.** `/advanced-mode` on a machine
 serving several projects opens a picker with every one ticked — space (or a
 digit) ticks and unticks, `a` all or none, enter confirms — and only the
-projects ticked are drawn: their windows, their roadmap on top, and the ones
-`/new` asks between. `/advanced-mode @saasng @ngsign` names them and asks
+projects ticked get a tab (above): their windows, their roadmap, and the ones
+`/new` asks between on `All`. `/advanced-mode @saasng @ngsign` names them and asks
 nothing; `/projects` asks again from inside the mode; `/reload` keeps the
 pick. A prompt never talks to a session of a project that is not shown.
 

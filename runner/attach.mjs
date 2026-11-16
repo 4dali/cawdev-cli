@@ -62,7 +62,7 @@ import {
 import { clip, keyList, padVisible, painter, stripAnsi, visibleWidth, wrap } from '../lib/ansi.mjs';
 import { restartNeededFor } from '../lib/runner-config.mjs';
 import {
-  BOARD_COLUMNS, PROMPT_ROWS, SplitScreen, boardPreviewLines, moveInStrip, readerFrame, stripColumns, tabsLine, visibleSessions, actionsFor, composeFrame,
+  BOARD_COLUMNS, PROMPT_ROWS, SplitScreen, boardPreviewLines, moveInStrip, projectTabs, projectsOverview, readerFrame, stepTab, stripColumns, tabMove, TAB_CHORDS, tabsLine, visibleSessions, actionsFor, composeFrame,
   batchStartedLines, carriesOnHere, builtNothing, cardLines, columnOf, cardTitleFor, commandWords, wordsText, subtitleFor, agentModelFor, wordWrap, isAutoCheckout, isPullRequest, parseNew, roadmapStrip, sessionTag, titleFor,
   windowLines, showWaitingLine, advancedBlocker,
 } from './split.mjs';
@@ -971,6 +971,7 @@ const COMMANDS = [
   ['/continue', 'pick a failed or stopped session back up on this machine — the console\'s Carry on'],
   ['/clean', 'remove the git lock a crash left in a stopped session\'s checkout (index.lock: File exists), then /continue'],
   ['/projects', 'which projects advanced mode shows — tick one or several'],
+  ['/tab', 'advanced mode: open a project\'s tab — /tab saasng · /tab 2 · /tab all · t then its number'],
   ['/board', 'focus advanced mode\'s roadmap strip (b too): arrows browse cards and show their full title and description'],
   ['/refresh', "read the cards and their statuses from cawdev again — advanced mode's roadmap"],
   ['/open', "open the session's pull request in your browser — on a finished plan, its card and plan; on one waiting for you or at SHOW, its page on cawdev"],
@@ -1318,6 +1319,8 @@ export class Attached {
     // `/agent`'s choice, from last time — see prefs.mjs.
     const prefs = await loadPrefs(this.session.url).catch(() => ({}));
     this.agent = prefs.agent ?? null;
+    // The tab advanced mode was left on, opened again where it still exists.
+    this.lastTab = typeof prefs.tab === 'string' ? prefs.tab : null;
     // The rain is off unless asked for (`/matrix on`); the spinner and the
     // robots move either way.
     this.matrix = prefs.matrix === true;
@@ -1641,7 +1644,14 @@ export class Attached {
   }
 
   current() {
-    return this.runs.find((run) => run.id === this.watching) ?? null;
+    const run = this.runs.find((each) => each.id === this.watching) ?? null;
+    // Advanced mode never talks to a session of a project that is not on
+    // screen — one left out by `/projects`, or on another project's tab.
+    if (run?.projectSlug && this.split && (this.split.projects || this.activeTab())
+        && !this.shownProjects().includes(run.projectSlug)) {
+      return null;
+    }
+    return run;
   }
 
   /** Switch which session is printing, and lay its history in. */
@@ -1964,6 +1974,18 @@ export class Attached {
       this.confirming = null;
     }
 
+    if (this.split && this.tabProjects().length > 1) {
+      // `t` then a tab's number (or `t` again / tab / an arrow to step) — `tabMove`.
+      const chord = this.tabChord === true;
+      this.tabChord = false;
+      if (!chord && TAB_CHORDS.includes(key)) {
+        this.tabChord = true;
+        return this.note('tab: 0 All · 1–9 a project · t or ← → steps · esc lets go');
+      }
+      const move = tabMove(key, chord);
+      if (move) return this.moveTab(move);
+      if (chord) return this.note('');
+    }
     if (this.split?.boardFocus && this.mode === 'keys') {
       return this.onBoardKey(key);
     }
@@ -3285,6 +3307,15 @@ export class Attached {
       }
       case 'projects':
         return this.askSplitProjects();
+      case 'tab': {
+        // `/tab saasng` (or `@saasng`), `/tab 2`, `/tab all`, `/tab next|prev`; bare is next.
+        const word = (rest[0] ?? 'next').replace(/^@/, '');
+        if (word === 'next' || word === 'prev') {
+          return this.switchTab(stepTab(this.tabProjects(), this.activeTab(), word === 'next' ? 1 : -1));
+        }
+        if (/^\d$/.test(word)) return this.moveTab({ to: Number(word) });
+        return this.switchTab(word.toLowerCase() === 'all' ? null : word);
+      }
       case 'board': {
         const want = onOffWord(rest[0]);
         return this.toggleBoard(want);
@@ -3572,11 +3603,18 @@ export class Attached {
     return sessionTag(n, meta);
   }
 
-  /** The sessions that get a window: every one seen, less those closed. */
-  windows() {
+  /**
+   * The sessions that get a window: every one seen, less those closed, of the
+   * projects advanced mode shows — and, on a project's tab, of that project
+   * alone. `everyTab` is for what is said ACROSS tabs: the counts on the tab
+   * bar, how many need you, and `n` going to the next of them.
+   */
+  windows({ everyTab = false } = {}) {
     const only = this.split?.projects;
+    const tab = everyTab ? null : this.activeTab();
     return [...this.sessions.values()].filter((meta) => !this.closed.has(meta.id)
-      && (!only || only.has(meta.projectSlug)));
+      && (!only || only.has(meta.projectSlug))
+      && (!tab || meta.projectSlug === tab));
   }
 
   /** The projects this machine serves that cawdev still has — see `gone`. */
@@ -3584,10 +3622,100 @@ export class Attached {
     return (this.runner?.projects ?? []).filter((slug) => !this.gone.has(slug));
   }
 
-  /** The projects on screen: advanced mode's pick, else every one served here. */
-  shownProjects() {
+  /**
+   * The projects advanced mode has a TAB for: its pick (`/projects`), else
+   * every one served here. One project is no tab bar at all.
+   */
+  tabProjects() {
     const served = this.servedProjects();
     return this.split?.projects ? served.filter((slug) => this.split.projects.has(slug)) : served;
+  }
+
+  /**
+   * The project whose tab is open, or null on `All` — and null whenever the
+   * slug kept is no longer one of the tabs (deleted in the console, unticked
+   * in `/projects`), so a stale tab can never hide every session.
+   */
+  activeTab() {
+    const tab = this.split?.tab ?? null;
+    if (!tab) return null;
+    const tabs = this.tabProjects();
+    return tabs.length > 1 && tabs.includes(tab) ? tab : null;
+  }
+
+  /**
+   * The projects ON SCREEN: the open tab's one project, else every project
+   * that has a tab. What the roadmap strip draws and what `/new`, `/card`,
+   * `/view R3` and `d` choose among — so on a project's tab none of them asks
+   * "which project?", the tab being a choice already made.
+   */
+  shownProjects() {
+    const tab = this.activeTab();
+    return tab ? [tab] : this.tabProjects();
+  }
+
+  /** Each tab's two counts, and All's: sessions waiting on a person, sessions running. */
+  tabCounts() {
+    const waiting = new Set(this.needYou().map((meta) => meta.id));
+    const counts = {};
+    const all = { waiting: 0, running: 0 };
+    for (const meta of this.windows({ everyTab: true })) {
+      if (meta.ended) continue;
+      const mine = counts[meta.projectSlug] ??= { waiting: 0, running: 0 };
+      const which = waiting.has(meta.id) ? 'waiting' : 'running';
+      mine[which] += 1;
+      all[which] += 1;
+    }
+    return { counts, all };
+  }
+
+  /** A `tabMove`: to the tab of that number (0 is All), or a step round the ring. */
+  moveTab(move) {
+    const tabs = this.tabProjects();
+    if (move.step) return this.switchTab(stepTab(tabs, this.activeTab(), move.step));
+    if (move.to > tabs.length) return this.note(`no tab ${move.to} — 0 to ${Math.min(9, tabs.length)}`);
+    return this.switchTab(move.to === 0 ? null : tabs[move.to - 1]);
+  }
+
+  /** The open tab, kept for the next `/advanced-mode` and the next launch (prefs.mjs). */
+  rememberTab(tab) {
+    this.split.tab = tab;
+    this.lastTab = tab;
+    void savePrefs(this.session.url, { tab }).catch(() => undefined);
+  }
+
+  /**
+   * `t` then a number, and `/tab`: open a project's tab, or `All` (null). The focus
+   * goes to a session that is on the tab — the one most recently looked at —
+   * and the board focus to the tab's own cards, or back to the sessions when
+   * it has none. Remembered across launches (prefs.mjs, `tab`).
+   */
+  switchTab(target) {
+    if (!this.split) return this.note('tabs are in advanced mode — /advanced-mode starts it');
+    const tabs = this.tabProjects();
+    if (tabs.length < 2) return this.note('one project here — no tabs to switch');
+    if (target && !tabs.includes(target)) {
+      return this.note(`no tab for ${target} — ${tabs.join(', ')} · /projects picks them`);
+    }
+    this.rememberTab(target ?? null);
+    const windows = this.windows();
+    if (!windows.some((meta) => meta.id === this.split.focus)) {
+      const recent = (this.split.recent ?? []).find((id) => windows.some((meta) => meta.id === id));
+      this.split.focus = recent ?? windows[0]?.id ?? null;
+    }
+    if (this.split.focus && this.runs.some((run) => run.id === this.split.focus)) {
+      this.watching = this.split.focus;
+    }
+    const browsing = Boolean(this.split.boardFocus);
+    this.split.boardFocus = null;
+    this.split.lastBoardFocus = null;
+    this.split.boardScroll = 0;
+    this.dirty = true;
+    if (browsing && this.split.tab
+        && stripColumns(this.split.screen.width, this.cards, this.shownProjects()).length) {
+      return void this.toggleBoard(true);
+    }
+    return this.note('');
   }
 
   /** The session a command like /pr is about: the focused window, else the one watched. */
@@ -3652,8 +3780,8 @@ export class Attached {
    */
   leaveHiddenWatch() {
     const watched = this.sessions.get(this.watching);
-    const only = this.split?.projects;
-    if (watched && only && !only.has(watched.projectSlug) && this.split.focus) {
+    const narrowed = this.split?.projects || this.activeTab();
+    if (watched && narrowed && !this.shownProjects().includes(watched.projectSlug) && this.split.focus) {
       this.watching = this.split.focus;
     }
   }
@@ -3662,10 +3790,12 @@ export class Attached {
   focusProjects(slugs) {
     if (!this.split) return this.enterSplit(slugs);
     this.split.projects = new Set(slugs);
+    // A tab whose project was unticked is gone, and so is the bar with one left.
+    if (!this.activeTab()) this.split.tab = null;
     if (!this.windows().some((meta) => meta.id === this.split.focus)) {
       this.split.focus = this.windows()[0]?.id ?? null;
     }
-    if (this.split.boardFocus && !this.split.projects.has(this.split.boardFocus.slug)) {
+    if (this.split.boardFocus && !this.shownProjects().includes(this.split.boardFocus.slug)) {
       this.leaveBoard();
     }
     this.leaveHiddenWatch();
@@ -3687,6 +3817,8 @@ export class Attached {
       screen,
       // The projects this mode shows; null is every one this machine serves.
       projects: shown,
+      // The project whose tab is open; null is All. Read through `activeTab`.
+      tab: this.lastTab ?? null,
       focus: null,
       boardFocus: null,
       lastBoardFocus: null,
@@ -3711,6 +3843,9 @@ export class Attached {
       + ' · /new starts a session · /projects picks what is shown · /advanced-mode leaves'));
     if (shown) {
       this.say(this.ink.muted(`showing ${[...shown].join(', ')}`));
+    }
+    if (this.tabProjects().length > 1) {
+      this.say(this.ink.muted('a tab per project — t then its number opens one · 0 is All, every project at a glance'));
     }
     this.dirty = true;
     return undefined;
@@ -3759,7 +3894,7 @@ export class Attached {
 
   /** The sessions whose card waits on a person, in card order. */
   needYou() {
-    return this.windows().filter((meta) => {
+    return this.windows({ everyTab: true }).filter((meta) => {
       const run = this.runs.find((each) => each.id === meta.id);
       return Boolean(run && (this.showOn(run) || this.pendingOn(run) || this.askingOn(run)));
     });
@@ -3769,11 +3904,19 @@ export class Attached {
   focusNeedsYou(step) {
     const waiting = this.needYou();
     if (!waiting.length) return this.note('nothing needs you');
-    const windows = this.windows();
+    // Across tabs: a session waiting on another project's tab is the reason
+    // its tab says `◆`, and `n` is how it is reached.
+    const windows = this.windows({ everyTab: true });
     const from = windows.findIndex((meta) => meta.id === this.split.focus);
     for (let i = 1; i <= windows.length; i++) {
       const meta = windows[(from + step * i + windows.length * i) % windows.length];
-      if (waiting.includes(meta)) return this.focusWindow(meta.id);
+      if (!waiting.includes(meta)) continue;
+      const tab = this.activeTab();
+      if (tab && meta.projectSlug !== tab) {
+        this.rememberTab(meta.projectSlug);
+        if (this.split.boardFocus) this.leaveBoard();
+      }
+      return this.focusWindow(meta.id);
     }
     return undefined;
   }
@@ -3797,6 +3940,9 @@ export class Attached {
     }
     if (!want) {
       return this.leaveBoard();
+    }
+    if (this.tabProjects().length > 1 && !this.activeTab()) {
+      return this.note('the board is on a project\'s tab — t then its number, then b');
     }
     const width = this.split.screen.width;
     let columns = stripColumns(width, this.cards, this.shownProjects());
@@ -3992,7 +4138,7 @@ export class Attached {
     const keys = [
       ['enter', 'prompt the focused card'], ['tab ⇧tab 1–9', 'next / previous / pick a card'],
       ['n N', 'next / previous card needing you'], ['v', 'its log'],
-      ['b', 'the board: ←→ ↑↓ p d esc'], ['↑↓ PgUp PgDn G', 'scroll the log, G follows the end'],
+      ['t 0–9', 'a project\'s tab, 0 is All'], ['t t', 'the next tab'], ['b', 'the board: ←→ ↑↓ p d esc'], ['↑↓ PgUp PgDn G', 'scroll the log, G follows the end'],
       ['ctrl+f', 'find in the log'], ['r', 'fold the roadmap'], ['d', 'develop a planned card'],
       ['a y s Y', 'answer · permission'], ['x x', 'cancel the running session'],
       ['w', 'close the ended card'], ['c', 'config'], ['L', 'runs'], ['?', 'this window'], ['q', 'quit'],
@@ -4001,7 +4147,7 @@ export class Attached {
       ['/new', 'plan · dev · ask'], ['/view  v', 'read a session'], ['/board  b', 'the roadmap'],
       ['/continue /pr', 'carry on · open the PR'], ['/open', 'on cawdev'], ['/export', 'log to scrollback'],
       ['/simple', 'the scrollback terminal'], ['/matrix', 'the rain, off by default'],
-      ['/projects /refresh', 'the roadmap'], ['/agent', 'which agent'], ['/quit  q', 'leave'],
+      ['/projects /tab', 'which projects · which tab'], ['/refresh', 'the roadmap'], ['/agent', 'which agent'], ['/quit  q', 'leave'],
       ['/close N|all', 'close ended cards'],
     ];
     const half = Math.max(20, Math.floor((width - 4) / 2));
@@ -4074,7 +4220,12 @@ export class Attached {
     // The roadmap across the top: as tall as its fullest column needs, never
     // more than a third of the screen, and never so tall that no window fits
     // under it — a short terminal drops it before it drops the sessions.
-    const stripRoom = Math.min(Math.max(4, Math.floor(height / 3)), height - promptRows - CARD_MIN_HEIGHT);
+    // Several projects: a tab each (`projectTabs`), three rows above the strip
+    // — the tabs between two rules — out of its room, plus the rows they cost.
+    const tabSlugs = this.tabProjects();
+    const bar = tabSlugs.length > 1 ? 3 : 0;
+    const tab = this.activeTab();
+    const stripRoom = Math.min(Math.max(4, Math.floor(height / 3)) + bar, height - promptRows - CARD_MIN_HEIGHT);
     if (this.split.boardFocus) {
       this.split.boardFocus = moveInStrip(
         stripColumns(width, this.cards, this.shownProjects()),
@@ -4086,10 +4237,29 @@ export class Attached {
     // A rule under it, from the strip's own room: the roadmap is the board and
     // the windows are the sessions, and without it the strip's last card line
     // ran straight into the first window's border.
-    const stripLines = stripRoom >= 4
-      ? [...roadmapStrip(width, stripRoom - 1, this.cards, ink, this.shownProjects(), this.split.boardFocus),
-        ink.muted('─'.repeat(width))]
-      : [];
+    const tally = bar ? this.tabCounts() : null;
+    const barLines = bar ? projectTabs(width, [
+      { slug: null, label: 'All', ...tally.all },
+      ...tabSlugs.map((slug) => ({ slug, ...(tally.counts[slug] ?? {}) })),
+    ], tab, ink) : [];
+    // On All there are no columns: a line a project (`projectsOverview`).
+    const overview = Boolean(bar) && !tab;
+    const boardRows = stripRoom - 1 - bar;
+    let stripLines = [];
+    if (boardRows >= (overview ? 1 : 3)) {
+      stripLines = [
+        ...barLines,
+        ...(overview
+          ? projectsOverview(width, boardRows, this.cards, ink, tabSlugs, tally.counts)
+          : roadmapStrip(width, boardRows, this.cards, ink, this.shownProjects(), this.split.boardFocus)),
+        ink.muted('─'.repeat(width)),
+      ];
+    } else if (bar && stripRoom >= 1) {
+      // Too short for the board: the tabs stay, or nothing would say which
+      // project's sessions these are.
+      // The tabs before their rules, when there is not room for all three.
+      stripLines = stripRoom >= 3 ? barLines : barLines.slice(1, 1 + stripRoom);
+    }
     const strip = stripLines.length <= Math.max(0, stripRoom) ? stripLines.length : 0;
 
     // When focus is in the roadmap strip (`b` / `/board`), a preview box
@@ -4322,7 +4492,7 @@ export class Attached {
     // be asking somebody to repeat the choice they made on entering — this is
     // not the guess the question exists to prevent (a machine serving one
     // project, or the focused window), it is a choice already stated.
-    const shown = this.split?.projects ? this.shownProjects() : [];
+    const shown = this.split?.projects || this.activeTab() ? this.shownProjects() : [];
     if (shown.length === 1 && !words.some((word) => word.startsWith('@'))) {
       words = [...words, `@${shown[0]}`];
     }
@@ -4528,7 +4698,7 @@ export class Attached {
     }
     const served = this.servedProjects();
     const shown = this.shownProjects();
-    const slug = named ?? (this.split?.projects && shown.length === 1 ? shown[0] : null);
+    const slug = named ?? ((this.split?.projects || this.activeTab()) && shown.length === 1 ? shown[0] : null);
     if (named && !served.includes(named)) {
       this.note(`this machine does not serve ${named} — ${served.join(', ') || 'no project'}`);
       return;
@@ -6712,6 +6882,7 @@ export class Attached {
     return {
       advanced: Boolean(this.split),
       projects: this.split?.projects ? [...this.split.projects] : null,
+      tab: this.split?.tab ?? null,
       focus: this.split?.focus ?? null,
       watching: this.watching,
       showLog: this.showLog,
@@ -6741,6 +6912,7 @@ export class Attached {
     this.showLog = state.showLog === true;
     if (state.advanced && !this.plain) {
       this.enterSplit(Array.isArray(state.projects) ? state.projects : null);
+      if (typeof state.tab === 'string') this.split.tab = state.tab;
       if (state.focus && this.sessions.has(state.focus)) {
         this.split.focus = state.focus;
       }
@@ -6916,6 +7088,7 @@ export class Attached {
     }
     if (this.split) {
       parts.push(
+        ...(this.tabProjects().length > 1 ? [`${ink.text('t 0–9')} ${ink.muted('project tab')}`] : []),
         `${ink.text('b')} ${ink.muted('board')}`,
         `${ink.text('tab')} ${ink.muted('next card')}`,
         `${ink.text('v')} ${ink.muted('its log')}`,

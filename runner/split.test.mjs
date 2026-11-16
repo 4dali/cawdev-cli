@@ -13,9 +13,9 @@ import { test } from 'node:test';
 import { painter, stripAnsi, visibleWidth } from '../lib/ansi.mjs';
 import { Attached } from './attach.mjs';
 import { History } from './input.mjs';
-import { loadPrefs } from './prefs.mjs';
+import { loadPrefs, savePrefs } from './prefs.mjs';
 import {
-  MIN_ZONE_WIDTH, PROMPT_ROWS, actionsFor, batchStartedLines, boardPreviewLines, branchForTask, carriesOnHere, composeFrame, moveInStrip, parseNew,
+  MIN_ZONE_WIDTH, PROMPT_ROWS, projectTabs, projectsOverview, stepTab, tabMove, TAB_CHORDS, actionsFor, batchStartedLines, boardPreviewLines, branchForTask, carriesOnHere, composeFrame, moveInStrip, parseNew,
   roadmapStrip, builtNothing, commandWords, wordsText, stripColumns, subtitleFor, cardTitleFor, modelLabel, agentModelFor, sessionTag, splitLayout, tabsLine, tailOf, titleFor, toneFor, visibleSessions, windowLines,
   readerFrame, wordsIn, advancedBlocker,
 } from './split.mjs';
@@ -769,7 +769,11 @@ test('/refresh reads the cards again; a project that cannot be read does not bla
   assert.match(ui.status, /1 could not be read/);
   assert.match(ui.pending.map(stripAnsi).join('\n'), /could not read the roadmap of ngsign: No project ngsign/);
   ui.flush();
-  assert.match(ui.split.screen.last.slice(0, 6).map(stripAnsi).join('\n'), /Considering 2/);
+  assert.match(ui.split.screen.last.slice(0, 6).map(stripAnsi).join('\n'), /saasng +2 considering · 1 planned/,
+    'two projects: All says it in a line');
+  ui.onKey(']');
+  ui.flush();
+  assert.match(ui.split.screen.last.slice(0, 6).map(stripAnsi).join('\n'), /Considering 2/, "and saasng's tab in columns");
   clearInterval(ui.split.plannedTimer);
 });
 
@@ -2381,4 +2385,231 @@ test('? opens the key table over the whole screen and esc closes it; the key lin
 test('a window footer given as rows draws every row', () => {
   const lines = windowLines({ top: 0, left: 0, width: 20, height: 6 }, { body: ['x'], footer: ['aaa', 'bbb'] }, painter(0)).map(stripAnsi);
   assert.ok(lines.some((l) => l.includes('aaa')) && lines.some((l) => l.includes('bbb')));
+});
+
+// --- several projects: a tab each ------------------------------------------------
+
+const TABS = [
+  { slug: null, label: 'All', waiting: 1, running: 3 },
+  { slug: 'saasng', waiting: 1, running: 2 },
+  { slug: 'ngsign', running: 1 },
+  { slug: 'quiet' },
+];
+
+test('the tab bar: numbered tabs with their two counts, and a rule heavy under the open one', () => {
+  for (const width of [60, 100, 200]) {
+    const lines = projectTabs(width, TABS, 'saasng', ink);
+    assert.deepEqual(lines.map(visibleWidth), [width, width, width]);
+  }
+  const [above, line, rule] = projectTabs(100, TABS, 'saasng', ink).map(stripAnsi);
+  assert.match(above, /^─{100}$/, 'a rule above the tabs');
+  assert.match(line, /^ 0 All ◆1 ●3 + 1 saasng ◆1 ●2 + 2 ngsign ●1 + 3 quiet /);
+  assert.match(line, /t then 0–9 $/, 'how a tab is reached, at the right end');
+  assert.match(rule, /^─+━+─+$/);
+  assert.equal(rule.indexOf('━'), line.indexOf(' 1 saasng '), 'the heavy part starts under the open tab');
+  assert.equal(rule.match(/━+/)[0].length, ' 1 saasng '.length, 'and is as wide as its name');
+  assert.match(stripAnsi(projectTabs(100, TABS, null, ink)[2]), /^━{7}─/, 'null is All');
+  assert.match(projectTabs(100, TABS, 'saasng', painter(3))[1], /\x1b\[7m/, 'and reversed where there is colour');
+});
+
+test('tabs that do not fit give way from the ends, counted, and the open one is always drawn', () => {
+  const many = [{ slug: null, label: 'All' }, ...'abcdefgh'.split('').map((c) => ({ slug: `project-${c}` }))];
+  const [, line, rule] = projectTabs(50, many, 'project-e', ink).map(stripAnsi);
+  assert.equal(visibleWidth(line), 50);
+  assert.match(line, / 5 project-e /);
+  assert.match(line, /^ ‹\d/, 'how many are off to the left');
+  assert.match(line, /\d› /, 'and to the right');
+  assert.doesNotMatch(line, /project-a|project-h/);
+  assert.equal(rule.indexOf('━'), line.indexOf(' 5 project-e '));
+  const first = stripAnsi(projectTabs(50, many, null, ink)[1]);
+  assert.match(first, /^ 0 All /);
+  assert.doesNotMatch(first, /‹/, 'nothing lost on the side the open tab is on');
+});
+
+test('t then a number is a tab; ctrl+digit and ctrl+tab too, where a terminal reports them', () => {
+  assert.equal(tabMove('2'), null, 'a bare digit is a session card');
+  assert.deepEqual(tabMove('2', true), { to: 2 });
+  assert.deepEqual(tabMove('0', true), { to: 0 });
+  assert.deepEqual([tabMove('\t', true), tabMove(`${ESC}[C`, true), tabMove('t', true), tabMove('\x14', true)],
+    [{ step: 1 }, { step: 1 }, { step: 1 }, { step: 1 }]);
+  assert.deepEqual([tabMove(`${ESC}[Z`, true), tabMove(`${ESC}[D`, true)], [{ step: -1 }, { step: -1 }]);
+  assert.equal(tabMove('x', true), null);
+  assert.equal(tabMove('\t'), null, 'tab alone is the next card');
+  assert.deepEqual(TAB_CHORDS, ['t', '\x14'], 'a plain key first: Zellij takes ctrl+t, tmux ctrl+b');
+  assert.deepEqual([tabMove(`${ESC}[27;5;50~`), tabMove(`${ESC}[50;5u`)], [{ to: 2 }, { to: 2 }], 'ctrl+2, both spellings');
+  assert.deepEqual([tabMove(`${ESC}[27;5;9~`), tabMove(`${ESC}[9;6u`)], [{ step: 1 }, { step: -1 }], 'ctrl+tab, ctrl+shift+tab');
+  assert.deepEqual([tabMove(']'), tabMove('[')], [{ step: 1 }, { step: -1 }]);
+});
+
+test('] and [ walk a ring that starts at All', () => {
+  const slugs = ['saasng', 'ngsign'];
+  assert.equal(stepTab(slugs, null, 1), 'saasng');
+  assert.equal(stepTab(slugs, 'saasng', 1), 'ngsign');
+  assert.equal(stepTab(slugs, 'ngsign', 1), null);
+  assert.equal(stepTab(slugs, null, -1), 'ngsign');
+  assert.equal(stepTab(slugs, 'gone', 1), 'saasng', 'a tab that is gone counts as All');
+});
+
+test('All is a line a project: its columns as counts, its backlog, its sessions', () => {
+  const cards = [...SAASNG, card('saasng', 'BACKLOG', 20, 'Later'), card('ngsign', 'PLANNED', 1, 'Reply option')];
+  const lines = projectsOverview(100, 6, cards, ink, ['saasng', 'ngsign', 'quiet'], { saasng: { waiting: 1, running: 2 } })
+    .map(stripAnsi);
+  assert.equal(lines.length, 3);
+  assert.equal(lines.every((line) => visibleWidth(line) === 100), true);
+  assert.match(lines[0], /^ saasng  1 considering · 1 planned · 4 in development · 1 backlog  ◆1 ●2/);
+  assert.match(lines[1], /^ ngsign  0 considering · 1 planned · 0 in development/);
+  assert.match(lines[2], /^ quiet   0 considering/, 'names padded so the counts line up');
+  const short = projectsOverview(100, 2, cards, ink, ['saasng', 'ngsign', 'quiet']).map(stripAnsi);
+  assert.deepEqual([short.length, /\+2 more projects — each has a tab/.test(short[1])], [2, true]);
+});
+
+/** A client serving three projects, a session in two of them, advanced mode on every one. */
+async function tabbed(replies = {}) {
+  const made = client(replies);
+  const { ui } = made;
+  ui.runner = { id: 'runner-1', name: 'laptop', projects: ['saasng', 'ngsign', 'quiet'] };
+  ui.onEvent({ type: 'runs', runs: [PLAN, DEV, SIGN] });
+  await ui.runCommand('/advanced-mode');
+  ui.onKey('\r');
+  await settle();
+  return made;
+}
+const SIGN = { id: 'run-sign', projectSlug: 'ngsign', label: 'Reply option', profile: 'CODE', state: 'running' };
+const frameOf = (ui) => {
+  ui.flush();
+  return ui.split.screen.last.map(stripAnsi);
+};
+
+test('several projects open on All: the tab bar, a line a project, every session', async () => {
+  const { ui } = await tabbed({
+    'GET /api/projects/saasng/roadmap?brief=true': () => [{ ref: 'R1', title: 'Offline mode', status: 'CONSIDERING' }],
+  });
+  const frame = frameOf(ui);
+  assert.match(frame[0], /^─+$/, 'a rule above the tabs');
+  assert.match(frame[1], /^ 0 All ●3 + 1 saasng ●2 + 2 ngsign ●1 + 3 quiet /);
+  assert.match(frame[2], /^━{7}─+$/, 'a rule under the tabs, heavy under All');
+  assert.match(frame[3], /^ saasng  1 considering · 0 planned · 0 in development  ●2/);
+  assert.match(frame[4], /^ ngsign /);
+  assert.doesNotMatch(frame.slice(0, 8).join('\n'), /Considering \d/, 'no columns on All');
+  assert.equal(ui.windows().length, 3);
+  assert.match(frame.join('\n'), /t 0–9 project tab/, 'the key line says how');
+  ui.onKey('b');
+  assert.match(ui.status, /the board is on a project's tab/);
+  assert.equal(ui.split.boardFocus, null);
+  clearInterval(ui.split.plannedTimer);
+});
+
+test('t then its number opens a project\'s tab: its columns at the full width, its sessions alone, and /new asks no project', async () => {
+  const { ui, calls } = await tabbed({
+    'GET /api/projects/ngsign/roadmap?brief=true': () => [
+      { ref: 'R4', title: 'A title nine columns in a hundred would cut', status: 'PLANNED' },
+    ],
+    'POST /api/projects/ngsign/roadmap': () => ({ ref: 'R5', number: 5, title: 'reply option' }),
+  });
+  ui.onKey('t');
+  assert.match(ui.status, /tab: 0 All · 1–9 a project/);
+  ui.onKey('1');
+  assert.equal(ui.activeTab(), 'saasng');
+  assert.deepEqual(ui.windows().map((meta) => meta.id), ['run-plan', 'run-dev']);
+  ui.onKey('2');
+  assert.equal(ui.activeTab(), 'saasng', 'the chord is one key long: a digit after it is a card again');
+  assert.equal(ui.split.focus, 'run-dev');
+  ui.onKey('t');
+  ui.onKey('x');
+  assert.equal(ui.activeTab(), 'saasng', 'any other key lets go of it');
+  ui.onKey('t');
+  ui.onKey('7');
+  assert.match(ui.status, /no tab 7 — 0 to 3/);
+  ui.onKey(`${ESC}[27;5;50~`);
+  assert.equal(ui.activeTab(), 'ngsign', 'ctrl+2 in one press, where the terminal says so');
+  assert.deepEqual(ui.shownProjects(), ['ngsign']);
+  assert.deepEqual(ui.windows().map((meta) => meta.id), ['run-sign']);
+  assert.equal(ui.split.focus, 'run-sign', 'the focus follows onto the tab');
+  assert.equal(ui.watching, 'run-sign', 'and so does the prompt');
+  const frame = frameOf(ui);
+  assert.equal(frame[2].indexOf('━'), frame[1].indexOf(' 2 ngsign '), 'the rule is heavy under the open tab');
+  assert.match(frame[3], /^ngsign/);
+  assert.match(frame.slice(0, 8).join('\n'), /R4 A title nine columns in a hundred would cut/);
+  assert.doesNotMatch(frame.join('\n'), /Push notifications|Payments/, "saasng's sessions are on saasng's tab");
+
+  await ui.runCommand('/new dev reply option');
+  await settle();
+  assert.notEqual(ui.select?.kind, 'project', 'the tab is the project');
+  assert.deepEqual(calls.filter((call) => call.method === 'POST').map((call) => call.path),
+    ['/api/projects/ngsign/roadmap', '/api/projects/ngsign/runs']);
+
+  // b browses this tab's cards, and a switch takes the board along or lets go of it.
+  ui.onKey('b');
+  await settle();
+  assert.deepEqual(ui.split.boardFocus, { slug: 'ngsign', ref: 'R4' });
+  ui.onKey('t');
+  ui.onKey('\t');
+  assert.equal(ui.activeTab(), 'quiet', 't tab steps, from the board too');
+  assert.equal(ui.split.boardFocus, null, 'quiet has no card to stand on');
+  assert.equal(ui.split.focus, null);
+  assert.equal(ui.current(), null, 'no prompt to a session of a project that is not on screen');
+  ui.onKey('t');
+  ui.onKey('t');
+  assert.equal(ui.activeTab(), null, 'round to All');
+  ui.onKey('t');
+  ui.onKey(`${ESC}[Z`);
+  assert.equal(ui.activeTab(), 'quiet');
+  ui.onKey('\x14');
+  ui.onKey('0');
+  assert.equal(ui.activeTab(), null, '0 is All; ctrl+t starts it too, where nothing takes it first');
+  ui.onKey('i');
+  ui.onKey('t');
+  ui.onKey('1');
+  assert.equal(ui.activeTab(), null, 'on a line being typed, t is a letter');
+  assert.equal(ui.input.line.text, 't1');
+  ui.onKey(ESC);
+  clearInterval(ui.split.plannedTimer);
+});
+
+test('a session waiting on another tab is counted on its tab, and n goes there', async () => {
+  const { ui } = await tabbed();
+  await ui.runCommand('/tab ngsign');
+  ui.needYou = () => [ui.sessions.get('run-dev')];
+  const frame = frameOf(ui);
+  assert.match(frame[1], / 1 saasng ◆1 ●1 + 2 ngsign ●1/);
+  assert.match(frame.join('\n'), /1 need you/, 'said from any tab');
+  ui.onKey('n');
+  assert.equal(ui.activeTab(), 'saasng');
+  assert.equal(ui.split.focus, 'run-dev');
+  clearInterval(ui.split.plannedTimer);
+});
+
+test('/tab names one; the tab is remembered, and a tab whose project went is All', async () => {
+  const { ui } = await tabbed();
+  await ui.runCommand('/tab @saasng');
+  assert.equal(ui.activeTab(), 'saasng');
+  await ui.runCommand('/tab 2');
+  assert.equal(ui.activeTab(), 'ngsign', 'by its number');
+  await ui.runCommand('/tab @saasng');
+  await ui.runCommand('/tab nowhere');
+  assert.match(ui.status, /no tab for nowhere/);
+  assert.equal(ui.activeTab(), 'saasng');
+  await until(async () => (await loadPrefs('http://localhost:8091')).tab === 'saasng');
+  assert.equal((await loadPrefs('http://localhost:8091')).tab, 'saasng');
+  assert.equal(ui.reloadState().tab, 'saasng');
+
+  // Left and entered again: where it was.
+  clearInterval(ui.split.plannedTimer);
+  await ui.runCommand('/advanced-mode off');
+  await ui.runCommand('/advanced-mode');
+  ui.onKey('\r');
+  assert.equal(ui.activeTab(), 'saasng');
+
+  // /projects without it: the tab is gone, and with one project so is the bar.
+  await ui.runCommand('/projects');
+  ui.onKey('a');
+  ui.onKey('2');
+  ui.onKey('\r');
+  assert.equal(ui.activeTab(), null);
+  assert.deepEqual(ui.shownProjects(), ['ngsign']);
+  assert.match(frameOf(ui)[0], /^ngsign/, 'one project: no tab bar');
+  await ui.runCommand('/tab all');
+  assert.match(ui.status, /one project here/);
+  clearInterval(ui.split.plannedTimer);
+  await savePrefs('http://localhost:8091', { tab: null });
 });

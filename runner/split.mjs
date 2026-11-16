@@ -863,16 +863,30 @@ function dropColumnOf(boards, status, drop) {
   }
 }
 
-/** Sets each shown column's and board's `width`. */
+/**
+ * Sets each shown column's and board's `width`. An EMPTY column keeps
+ * `MIN_COLUMN` — room for its label and its dash — and the columns holding
+ * cards share what that frees: a third of the screen under "Considering 0"
+ * was a title cut short in the column beside it.
+ */
 function shareWidths(shown, width) {
   // Widths: what is left after the gaps, shared by column, the remainder
   // going to the first columns so the rule lines never move by one.
-  const columnCount = shown.reduce((sum, board) => sum + board.columns.length, 0);
+  const columns = shown.flatMap((board) => board.columns);
   const gaps = shown.reduce((sum, board) => sum + board.columns.length - 1, 0) + (shown.length - 1) * 3;
-  const base = Math.max(1, Math.floor((width - gaps) / columnCount));
-  let extra = Math.max(0, width - gaps - base * columnCount);
+  const even = Math.max(1, Math.floor((width - gaps) / columns.length));
+  const filled = columns.filter((column) => column.cards.length);
+  const lean = filled.length && filled.length < columns.length && even > MIN_COLUMN;
+  const takers = lean ? filled : columns;
+  const kept = lean ? (columns.length - filled.length) * MIN_COLUMN : 0;
+  const base = Math.max(1, Math.floor((width - gaps - kept) / takers.length));
+  let extra = Math.max(0, width - gaps - kept - base * takers.length);
   for (const board of shown) {
     for (const column of board.columns) {
+      if (!takers.includes(column)) {
+        column.width = MIN_COLUMN;
+        continue;
+      }
       column.width = base + (extra > 0 ? 1 : 0);
       if (extra > 0) extra -= 1;
     }
@@ -1024,6 +1038,182 @@ export function roadmapStrip(width, maxRows, cards, ink, projects = null, focus 
     }).join(' ')));
   }
   return lines.map((line) => padVisible(clip(line, width), width));
+}
+
+// --- several projects: one tab each ----------------------------------------------
+
+/** How a tab is reached, said at the right end of the tab bar while it fits. */
+const TABS_HINT = 't then 0–9';
+
+/** A tab's two counts: sessions waiting on a person, and sessions running. */
+function tabBadges({ waiting = 0, running = 0 }, ink) {
+  return [waiting ? ink.warn(`◆${waiting}`) : '', running ? ink.success(`●${running}`) : ''].filter(Boolean).join(' ');
+}
+
+/**
+ * The tab bar of advanced mode when it shows several projects: `0 All`, then
+ * one numbered tab per project, between two rules — THREE rows of exactly
+ * `width` columns. The rule above sets the bar off from the terminal's own
+ * top edge (a multiplexer's tab line sits right there); the one under it
+ * separates the tabs from what they show.
+ *
+ * WHY TABS. The strip used to give every project its three columns side by
+ * side, so three projects on a 160-column terminal were nine columns of
+ * seventeen characters, and past that whole columns and then whole projects
+ * were dropped. One project on screen at a time gives each column the width a
+ * title needs; what the other projects are doing is said here, in two counts
+ * a tab: `◆2` sessions waiting on a person, `●1` running.
+ *
+ * THE NUMBER IS THE KEY: `t` then the digit (`tabMove`). All is 0 and the
+ * projects are 1 to 9 in the order they are served; a tenth has no number and
+ * is stepped to.
+ *
+ * The open tab is reversed AND the rule under it is heavy (`━` under the tab,
+ * `─` elsewhere), because reverse video is the one attribute a theme may draw
+ * as nothing. Tabs that do not fit give way from the ends, furthest from the
+ * open one first, and each end says how many it lost (`‹2`, `3›`) — never a
+ * tab cut in half.
+ *
+ * @param tabs `[{ slug, label?, waiting?, running? }]`; `slug: null` is All
+ * @param active the open tab's slug, null for All
+ * @returns `[rule above, tabs, rule under]`
+ */
+export function projectTabs(width, tabs, active, ink) {
+  const isOpen = (tab) => (tab.slug ?? null) === (active ?? null);
+  const names = tabs.map((tab, n) => {
+    const label = tab.label ?? tab.slug ?? 'All';
+    const text = ` ${n <= 9 ? `${n} ` : ''}${label} `;
+    return isOpen(tab)
+      ? ink.reverse(ink.bold(text))
+      : `${ink.muted(text.slice(0, text.length - label.length - 1))}${ink.text(`${label} `)}`;
+  });
+  const cells = tabs.map((tab, n) => `${names[n]}${tabBadges(tab, ink)}`);
+  const widths = cells.map(visibleWidth);
+  const gap = 2;
+  const span = (from, to) => widths.slice(from, to + 1).reduce((sum, each) => sum + each, 0) + (to - from) * gap;
+
+  const at = Math.max(0, tabs.findIndex(isOpen));
+  let from = 0;
+  let to = tabs.length - 1;
+  if (span(from, to) > width) {
+    // Outwards from the open tab, right first, with room kept at each end
+    // for the count of what is not drawn.
+    const END = 4;
+    from = at;
+    to = at;
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const [nextFrom, nextTo] of [[from, to + 1], [from - 1, to]]) {
+        if (nextFrom < 0 || nextTo >= tabs.length) continue;
+        const ends = (nextFrom > 0 ? END : 0) + (nextTo < tabs.length - 1 ? END : 0);
+        if (span(nextFrom, nextTo) + ends <= width) {
+          [from, to] = [nextFrom, nextTo];
+          grew = true;
+        }
+      }
+    }
+  }
+  const before = from > 0 ? ink.muted(` ‹${from} `.padEnd(4)) : '';
+  const after = to < tabs.length - 1 ? ink.muted(` ${tabs.length - 1 - to}›`.padStart(4)) : '';
+  const line = `${before}${cells.slice(from, to + 1).join(' '.repeat(gap))}${after}`;
+  const room = width - visibleWidth(line);
+  const hint = room >= TABS_HINT.length + 3
+    ? `${' '.repeat(room - TABS_HINT.length - 1)}${ink.muted(TABS_HINT)} ` : '';
+
+  // The rule, heavy under the open tab's name: where it starts and how wide.
+  const left = Math.min(width, visibleWidth(before) + (at > from ? span(from, at - 1) + gap : 0));
+  const under = Math.min(width - left, visibleWidth(names[at]));
+  const rule = `${ink.muted('─'.repeat(left))}${ink.bold(ink.accent('━'.repeat(under)))}`
+    + ink.muted('─'.repeat(Math.max(0, width - left - under)));
+  return [ink.muted('─'.repeat(width)), padVisible(clip(`${line}${hint}`, width), width), rule];
+}
+
+/**
+ * The first key of the tab chord: a plain `t`, and `ctrl+t` for who has it.
+ * Only where keys are commands — on a line being typed a `t` is a letter.
+ */
+export const TAB_CHORDS = ['t', '\x14'];
+
+/**
+ * What a key means for the tabs: `{ to: n }` (0 is All), `{ step: ±1 }`, or
+ * null when it is not about them.
+ *
+ * WHY A CHORD, AND WHY A PLAIN LETTER. `ctrl+1` is not a byte a terminal
+ * sends: most send the bare digit, a few something else entirely, and
+ * `ctrl+tab` is taken by the terminal for its own tabs. `[` and `]` are two
+ * modifiers deep on most keyboards that are not US ones. And a `ctrl+` prefix
+ * of our own is somebody else's already: Zellij takes `ctrl+t` (and p, n, s,
+ * o, g, h, q), tmux `ctrl+b`, screen `ctrl+a`. A key with NO modifier reaches
+ * the program through all of them, so it is `t` and then the tab's number, or
+ * `t` again / `tab` / an arrow to step. Where a terminal does report
+ * `ctrl+digit` and `ctrl+tab` (xterm's modifyOtherKeys, the kitty protocol:
+ * `ESC[27;5;49~`, `ESC[49;5u`), those work in one press as well. `[` and `]`
+ * are kept for who has them.
+ *
+ * @param chord whether a `TAB_CHORDS` key was the one before this one
+ */
+export function tabMove(key, chord = false) {
+  const reported = /^\x1b\[(?:27;([56]);(\d+)~|(\d+);([56])u)$/.exec(key);
+  if (reported) {
+    const code = Number(reported[2] ?? reported[3]);
+    const shifted = (reported[1] ?? reported[4]) === '6';
+    if (code === 9) return { step: shifted ? -1 : 1 };
+    if (code >= 48 && code <= 57 && !shifted) return { to: code - 48 };
+    return null;
+  }
+  if (key === ']') return { step: 1 };
+  if (key === '[') return { step: -1 };
+  if (!chord) return null;
+  if (/^[0-9]$/.test(key)) return { to: Number(key) };
+  if (['\t', ...TAB_CHORDS, `${ESC}[C`, `${ESC}OC`, 'l'].includes(key)) return { step: 1 };
+  if ([`${ESC}[Z`, `${ESC}[D`, `${ESC}OD`, 'h'].includes(key)) return { step: -1 };
+  return null;
+}
+
+/**
+ * The `All` tab's top: no columns, ONE LINE A PROJECT — its name, what is on
+ * its board by column (and its backlog), and its sessions' two counts. It
+ * answers "where is there something to do" across every project; a project's
+ * cards are on its own tab, at the full width.
+ *
+ * Between one and `maxRows` lines of exactly `width` columns. More projects
+ * than rows end in `+N more projects`, like a column of cards does.
+ *
+ * @param sessions `{ [slug]: { waiting, running } }`
+ */
+export function projectsOverview(width, maxRows, cards, ink, projects = null, sessions = {}) {
+  const slugs = projects?.length ? [...projects] : [...new Set(cards.map((card) => card.slug))];
+  if (!slugs.length) {
+    return [padVisible(ink.muted(' no project here yet — the roadmap shows here'), width)];
+  }
+  const nameWidth = Math.min(24, Math.max(...slugs.map((slug) => slug.length)));
+  const rows = slugs.map((slug) => {
+    const mine = cards.filter((card) => card.slug === slug);
+    const counts = BOARD_COLUMNS.map(([status, label]) => {
+      const n = inColumn(mine, status).length;
+      const text = `${n} ${label.toLowerCase()}`;
+      return n ? hueOf(status, ink)(text) : ink.muted(text);
+    });
+    const backlog = mine.filter((card) => card.status === 'BACKLOG').length;
+    if (backlog) counts.push(ink.muted(`${backlog} backlog`));
+    const name = ink.bold(padVisible(clip(slug, nameWidth), nameWidth));
+    return ` ${name}  ${counts.join(ink.muted(' · '))}  ${tabBadges(sessions[slug] ?? {}, ink)}`;
+  });
+  const room = Math.max(1, maxRows);
+  const lines = rows.length > room
+    ? [...rows.slice(0, room - 1), ink.muted(` +${rows.length - (room - 1)} more projects — each has a tab`)]
+    : rows;
+  return lines.map((line) => padVisible(clip(line, width), width));
+}
+
+/**
+ * The tab `step` away from `active` among `slugs`, All (null) being the first
+ * of the ring: `]` from the last project is All again.
+ */
+export function stepTab(slugs, active, step) {
+  const ring = [null, ...slugs];
+  const at = Math.max(0, ring.indexOf(active ?? null));
+  return ring[(at + step + ring.length * Math.abs(step)) % ring.length];
 }
 
 /**
